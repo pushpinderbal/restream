@@ -1,0 +1,32 @@
+FROM oven/bun:1.4.0 AS frontend
+WORKDIR /build/web
+COPY web/package.json web/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY web/ ./
+RUN bun run build
+
+FROM golang:1.27-alpine3.24 AS backend
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /restream ./cmd/restream
+
+FROM alpine:3.24
+LABEL org.opencontainers.image.title="Restream" \
+    org.opencontainers.image.description="A shared browser player for Stalker IPTV portals" \
+    org.opencontainers.image.source="https://github.com/pushpinderbal/restream" \
+    org.opencontainers.image.licenses="MIT"
+RUN apk add --no-cache ffmpeg ca-certificates tzdata \
+    && mkdir -p /data /app/web \
+    && chown 10001:10001 /data
+COPY --from=backend /restream /app/restream
+COPY --from=frontend /build/web/dist/ /app/web/
+COPY LICENSE /app/
+ENV LISTEN_ADDR=:8080 DATA_DIR=/data WEB_DIR=/app/web
+WORKDIR /app
+USER 10001:10001
+EXPOSE 8080
+VOLUME /data
+ENTRYPOINT ["/app/restream"]

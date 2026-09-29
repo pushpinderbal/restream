@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+/data/
+/bin/
+/web/node_modules/
+/web/dist/
+/web/test-results/
+/web/playwright-report/
+*.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+*.tsbuildinfo

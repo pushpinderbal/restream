@@ -1,0 +1,36 @@
+{
+  "name": "restream-web",
+  "private": true,
+  "version": "1.0.0",
+  "license": "MIT",
+  "packageManager": "bun@1.4.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bunx --bun vite --host 0.0.0.0",
+    "build": "bunx --bun tsc -b && bunx --bun vite build",
+    "preview": "bunx --bun vite preview --host 0.0.0.0",
+    "test:browser": "node node_modules/@playwright/test/cli.js test"
+  },
+  "dependencies": {
+    "@radix-ui/react-dialog": "1.1.23",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "hls.js": "1.6.13",
+    "lucide-react": "1.48.0",
+    "radix-ui": "1.6.7",
+    "react": "19.1.1",
+    "react-dom": "19.1.1",
+    "tailwind-merge": "3.7.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.55.1",
+    "@types/react": "19.1.13",
+    "@types/react-dom": "19.1.9",
+    "@vitejs/plugin-react": "4.7.0",
+    "prettier": "3.6.2",
+    "typescript": "5.9.2",
+    "vite": "6.4.3",
+    "@tailwindcss/vite": "4.3.3",
+    "tailwindcss": "4.3.3"
+  }
+}
