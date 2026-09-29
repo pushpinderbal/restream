@@ -1,0 +1,13 @@
+services:
+  restream:
+    # image: ghcr.io/pushpinderbal/restream:latest
+    build: .
+    ports:
+      - "8080:8080"
+    env_file: .env
+    volumes:
+      - restream-data:/data
+    restart: unless-stopped
+    stop_grace_period: 20s
+volumes:
+  restream-data:

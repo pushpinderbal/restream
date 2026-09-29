@@ -1,0 +1,39 @@
+[tools]
+bun = "1.4.0"
+go = "1.27"
+node = "26.8.1"
+
+[tasks.frontend]
+description = "Build the frontend"
+dir = "web"
+run = ["bun install --frozen-lockfile", "bun run build"]
+
+[tasks.build]
+description = "Build the Docker image"
+run = "docker build -t ghcr.io/pushpinderbal/restream:latest ."
+
+[tasks.up]
+description = "Pull and start the container"
+run = ["docker compose pull", "docker compose up -d"]
+
+[tasks.down]
+description = "Stop the container"
+run = "docker compose down"
+
+[tasks.logs]
+description = "Follow container logs"
+run = "docker compose logs -f"
+
+[tasks.test]
+description = "Run Go tests against the simulated portal"
+run = "go test ./..."
+
+[tasks."test:browser"]
+description = "Run browser workflow tests"
+dir = "web"
+run = ["bun install --frozen-lockfile", "node node_modules/@playwright/test/cli.js install chromium", "bun run test:browser"]
+
+[tasks."test:playback"]
+description = "Run FFmpeg-to-browser integration test"
+depends = ["frontend"]
+run = ["cd web && node node_modules/@playwright/test/cli.js install chromium", "RESTREAM_BROWSER_TESTS=1 go test ./internal/app -run TestPortalToBrowserPlayback -v"]
