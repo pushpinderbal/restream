@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+data
+bin
+web/node_modules
+web/dist
+web/test-results
+web/playwright-report
+**/*_test.go
+
+web/*.tsbuildinfo
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/*.log
