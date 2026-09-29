@@ -27,11 +27,7 @@ jobs:
 
       - name: Run mise test tasks
         shell: bash
-        run: |
-          set -euo pipefail
-          for task in test test:browser test:playback; do
-            mise run "$task"
-          done
+        run: mise run test
 
   publish:
     name: Build and publish image
