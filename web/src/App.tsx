@@ -68,6 +68,14 @@ const SettingsPage = lazy(() =>
   })),
 );
 
+function hasMediaSource() {
+  return (
+    "MediaSource" in window ||
+    "ManagedMediaSource" in window ||
+    "WebKitMediaSource" in window
+  );
+}
+
 type Tab = "live" | "movie" | "series";
 type PlaybackSelection = { item: Item; title: Item };
 type EpisodeDestination = {
@@ -1564,6 +1572,7 @@ function PlaybackPlayer({
   const seekVersion = useRef(0);
   const seekingRef = useRef(false);
   const pendingPlayUrlRef = useRef<string | null>(null);
+  const pollSessionRef = useRef<(() => void) | null>(null);
   const attachedUrlRef = useRef<string | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const clearMediaRef = useRef<(() => void) | null>(null);
@@ -1601,6 +1610,8 @@ function PlaybackPlayer({
     let alive = true;
     let timer: number | undefined;
     let heartbeat: number | undefined;
+    let pollBusy = false;
+    let pollRequested = false;
     let currentId: string | null = null;
     let postStarted = false;
     let postDone = false;
@@ -1623,6 +1634,7 @@ function PlaybackPlayer({
       stopped = true;
       releaseKeepalive = keepalive;
       alive = false;
+      pollSessionRef.current = null;
       clearMediaRef.current?.();
       if (timer) clearTimeout(timer);
       if (heartbeat) clearInterval(heartbeat);
@@ -1638,6 +1650,9 @@ function PlaybackPlayer({
     };
     releasedRef.current = false;
     pendingPlayUrlRef.current = null;
+    // Download the decoder while the provider and FFmpeg prepare the stream.
+    // Browsing alone does not load it; native-only browsers do not need it.
+    if (hasMediaSource()) void import("hls.js").catch(() => {});
     setSession(null);
     setPlaybackUrl("");
     setError("");
@@ -1673,11 +1688,14 @@ function PlaybackPlayer({
             return;
           }
           const poll = () => {
+            if (timer) clearTimeout(timer);
             if (!alive || releasedRef.current) return;
             if (seekingRef.current) {
               timer = window.setTimeout(poll, 300);
               return;
             }
+            if (pollBusy) return;
+            pollBusy = true;
             const version = seekVersion.current;
             void request<Session>(
               `/api/sessions/${encodeURIComponent(value.id)}`,
@@ -1704,12 +1722,21 @@ function PlaybackPlayer({
                 if (alive) setError(message(cause));
               })
               .finally(() => {
+                pollBusy = false;
+                const delay = pollRequested
+                  ? 0
+                  : latestSession.current?.state === "starting"
+                    ? 300
+                    : 2000;
+                pollRequested = false;
                 if (alive && !releasedRef.current)
-                  timer = window.setTimeout(
-                    poll,
-                    latestSession.current?.state === "starting" ? 300 : 2000,
-                  );
+                  timer = window.setTimeout(poll, delay);
               });
+          };
+          pollSessionRef.current = () => {
+            if (timer) clearTimeout(timer);
+            if (pollBusy) pollRequested = true;
+            else timer = window.setTimeout(poll, 0);
           };
           timer = window.setTimeout(poll, 300);
           heartbeat = window.setInterval(() => {
@@ -1758,7 +1785,6 @@ function PlaybackPlayer({
     if (!element || !playbackUrl || !isPresent || viewerFinished) return;
     let disposed = false;
     let hls: Hls | undefined;
-    let nativeHls = !!element.canPlayType("application/vnd.apple.mpegurl");
     const clearMedia = () => {
       if (disposed) return;
       disposed = true;
@@ -1777,20 +1803,28 @@ function PlaybackPlayer({
     element.pause();
     element.removeAttribute("src");
     element.load();
-    const startHls = (position = activeItem.kind === "live" ? -1 : 0) => {
+    const startNative = () => {
+      if (element.canPlayType("application/vnd.apple.mpegurl"))
+        element.src = playbackUrl;
+      else {
+        setBuffering(false);
+        setError("This browser does not support HLS playback.");
+      }
+    };
+    const startHls = () => {
       void import("hls.js")
         .then(({ default: Hls }) => {
           // The player may close or switch sources while the chunk is loading.
           if (disposed) return;
           if (!Hls.isSupported()) {
-            setError("This browser does not support HLS playback.");
+            startNative();
             return;
           }
           hls = new Hls({
             enableWorker: true,
             // The ESM distribution requires an explicit worker URL.
             workerPath: hlsWorkerUrl,
-            startPosition: position,
+            startPosition: activeItem.kind === "live" ? -1 : 0,
             maxBufferLength: 30,
             maxMaxBufferLength: 30,
             backBufferLength: 30,
@@ -1819,30 +1853,16 @@ function PlaybackPlayer({
         });
     };
     const onMediaError = () => {
-      if (disposed) return;
-      if (nativeHls) {
-        // canPlayType reports general support, not support for this stream.
-        // Chrome's native HLS rejects some streams that HLS.js can decode.
-        nativeHls = false;
-        const position = element.currentTime;
-        const shouldPlay =
-          pendingPlayUrlRef.current === playbackUrl || !element.paused;
-        element.pause();
-        element.removeAttribute("src");
-        element.load();
-        setPlaying(false);
-        setBuffering(true);
-        setError("");
-        if (shouldPlay) pendingPlayUrlRef.current = playbackUrl;
-        startHls(activeItem.kind === "live" ? -1 : position);
-      } else if (latestSession.current?.state === "ready") {
-        setError("The video could not be played.");
-      }
+      // HLS.js owns its error recovery; native-only playback has no decoder.
+      if (disposed || hls) return;
+      queueMicrotask(clearMedia);
+      setBuffering(false);
+      setError("The video could not be played.");
     };
     element.addEventListener("error", onMediaError);
-    // Keep native playback lightweight, with a decoder fallback if it fails.
-    if (nativeHls) element.src = playbackUrl;
-    else startHls();
+    // Prefer HLS.js. Native support claims do not guarantee stream compatibility.
+    if (hasMediaSource()) startHls();
+    else startNative();
     return () => {
       clearMedia();
       if (clearMediaRef.current === clearMedia) clearMediaRef.current = null;
@@ -1963,6 +1983,7 @@ function PlaybackPlayer({
     } finally {
       setSeeking(false);
       seekingRef.current = false;
+      if (sessionId.current === id) pollSessionRef.current?.();
     }
   };
   const togglePlay = async () => {
@@ -1981,6 +2002,7 @@ function PlaybackPlayer({
         setError("Playback could not start. Try pressing play again.");
       }
     } else {
+      pendingPlayUrlRef.current = null;
       element.pause();
       setPlaybackFeedback({ id: ++feedbackSequence.current, action: "pause" });
     }
