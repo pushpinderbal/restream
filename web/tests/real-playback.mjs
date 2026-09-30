@@ -12,16 +12,6 @@ const browser = await chromium.launch({
 });
 
 const page = await browser.newPage();
-// Exercise our JS decoder and worker even on Chromium versions with native HLS.
-// Workflow tests cover the native selection and media lifecycle separately.
-await page.addInitScript(() => {
-  const canPlayType = HTMLMediaElement.prototype.canPlayType;
-  HTMLMediaElement.prototype.canPlayType = function (type) {
-    return type === "application/vnd.apple.mpegurl"
-      ? ""
-      : canPlayType.call(this, type);
-  };
-});
 page.on("console", (message) => {
   if (message.type() === "error" || message.type() === "warning")
     console.log(`Browser ${message.type()}: ${message.text()}`);
@@ -108,7 +98,7 @@ const progressing = () => {
   );
 };
 
-async function checkNativePlayback(failNative = false) {
+async function checkNativePlayback() {
   const nativePage = await browser.newPage();
   const supported = await nativePage.evaluate(
     () =>
@@ -123,6 +113,15 @@ async function checkNativePlayback(failNative = false) {
     await nativePage.close();
     return;
   }
+  // Emulate a native-only browser while retaining Chrome's real HLS decoder.
+  await nativePage.addInitScript(() => {
+    for (const name of [
+      "MediaSource",
+      "ManagedMediaSource",
+      "WebKitMediaSource",
+    ])
+      Reflect.deleteProperty(window, name);
+  });
   let nativeSeeks = 0;
   const nativeErrors = [];
   const workers = new Set();
@@ -133,10 +132,7 @@ async function checkNativePlayback(failNative = false) {
   nativePage.on("pageerror", (error) => nativeErrors.push(error.message));
   nativePage.on("request", (request) => {
     if (/\/api\/sessions\/[^/]+\/seek$/.test(request.url())) nativeSeeks++;
-    if (
-      !failNative &&
-      /\/assets\/hls(?:[.-])/.test(new URL(request.url()).pathname)
-    )
+    if (/\/assets\/hls(?:[.-])/.test(new URL(request.url()).pathname))
       nativeErrors.push("Native playback loaded the JS decoder");
   });
   nativePage.on("response", async (response) => {
@@ -151,26 +147,10 @@ async function checkNativePlayback(failNative = false) {
     await nativePage.goto(`${baseURL}/?section=movie`);
     await nativePage.getByRole("button", { name: "Open Test movie" }).click();
     await nativePage.getByRole("button", { name: "Play", exact: true }).click();
-    if (failNative) {
-      await expect(nativePage.locator("video")).toHaveAttribute(
-        "src",
-        /\/api\/streams\//,
-      );
-      // Simulate a stream-specific native decode failure, then decode the
-      // real FFmpeg output through HLS.js in the same session.
-      await nativePage.locator("video").evaluate((video) => {
-        video.dispatchEvent(new Event("error"));
-      });
-    }
     await nativePage.waitForFunction(progressing, undefined, {
       timeout: 15000,
     });
     const source = (await nativePage.evaluate(videoState)).src;
-    if (failNative) {
-      if (!source.startsWith("blob:"))
-        throw new Error("Native failure did not attach the HLS decoder");
-      await expect.poll(() => workers.size).toBe(1);
-    }
     const nativeArea = nativePage.locator(".playback-area");
     await nativeArea.hover();
     await nativePage
@@ -246,7 +226,7 @@ async function checkNativePlayback(failNative = false) {
     );
     if (nativeErrors.length) throw new Error(nativeErrors.join("\n"));
     console.log(
-      `${failNative ? "Native HLS fallback" : "Native HLS"} decodes, pauses, seeks locally within its media window, resumes after a server seek, and releases playback`,
+      `Native-only HLS decodes, pauses, seeks locally within its media window, resumes after a server seek, and releases playback`,
     );
   } finally {
     await nativePage.close();
@@ -276,6 +256,15 @@ try {
   await play.waitFor({ timeout: 30000 });
   const started = Date.now();
   await play.click();
+  await page.waitForFunction(
+    () => {
+      const video = document.querySelector("video");
+      return video && video.getVideoPlaybackQuality().totalVideoFrames > 0;
+    },
+    undefined,
+    { timeout: 15000 },
+  );
+  const firstFrameMs = Date.now() - started;
   await page
     .waitForFunction(progressing, undefined, { timeout: 15000 })
     .catch(async (error) => {
@@ -291,11 +280,9 @@ try {
       throw error;
     });
   const decoded = await page.evaluate(videoState);
-  const nativeHls = await page
-    .locator("video")
-    .evaluate((video) => !!video.canPlayType("application/vnd.apple.mpegurl"));
+  if (!decoded.src.startsWith("blob:"))
+    throw new Error("HLS.js was not preferred over advertised native support");
   if (
-    !nativeHls &&
     ![...activeWorkers].some((worker) =>
       /\/assets\/hls\.worker-/.test(worker.url()),
     )
@@ -305,7 +292,7 @@ try {
     `Buffered ${await checkBufferWindow()}s; decoding worker active: ${activeWorkers.size}`,
   );
   console.log(
-    `Decoded HLS ${decoded.width}x${decoded.height}; first progressing frame in ${Date.now() - started}ms`,
+    `Decoded HLS ${decoded.width}x${decoded.height}; first decoded frame observed in ${firstFrameMs}ms`,
   );
 
   const persistentVideo = await page.locator("video").elementHandle();
@@ -399,6 +386,7 @@ try {
       response.request().method() === "POST",
     { timeout: 5000 },
   );
+  const seekStarted = Date.now();
   await page.mouse.click(
     bounds.x + bounds.width * 0.9,
     bounds.y + bounds.height / 2,
@@ -415,7 +403,9 @@ try {
   const afterSeek = await page.evaluate(videoState);
   if (afterSeek.paused || afterSeek.width === 0)
     throw new Error("Playback did not resume after timeline seek");
-  console.log("Timeline seek decoded new HLS generation");
+  console.log(
+    `Timeline seek resumed decoded playback in ${Date.now() - seekStarted}ms`,
+  );
   await checkBufferWindow();
   await page.setViewportSize({ width: 390, height: 844 });
   await area.hover({ position: { x: 70, y: 40 } });
@@ -541,7 +531,6 @@ try {
   if (browserErrors.length) throw new Error(browserErrors.join("\n"));
   console.log("Leaving player released stream slot; no browser errors");
   await checkNativePlayback();
-  await checkNativePlayback(true);
 } finally {
   for (const id of sessionIds) {
     await fetch(`${baseURL}/api/sessions/${encodeURIComponent(id)}`, {
