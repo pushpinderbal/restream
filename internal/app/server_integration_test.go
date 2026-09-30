@@ -194,7 +194,7 @@ func TestHTTPUnconfiguredAndValidation(t *testing.T) {
 		t.Fatal(status)
 	}
 	status, _ = request(t, ts.URL, "POST", "/api/refresh", "")
-	if status != 404 {
+	if status != 503 {
 		t.Fatal(status)
 	}
 	status, _ = request(t, ts.URL, "GET", "/api/unknown", "")

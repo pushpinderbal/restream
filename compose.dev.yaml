@@ -1,0 +1,50 @@
+name: restream-dev
+
+services:
+  restream:
+    build:
+      context: .
+      target: runtime
+    env_file: .env
+    volumes:
+      - restream-dev-data:/data
+    stop_grace_period: 20s
+    develop:
+      watch:
+        - action: rebuild
+          path: ./cmd
+        - action: rebuild
+          path: ./internal
+          ignore:
+            - "**/*_test.go"
+        - action: rebuild
+          path: ./go.mod
+        - action: rebuild
+          path: ./go.sum
+        - action: rebuild
+          path: ./Dockerfile
+
+  web:
+    image: oven/bun:1.4.0
+    working_dir: /app
+    command: ["sh", "-c", "bun install --frozen-lockfile && exec bun run dev -- --port 5173 --strictPort"]
+    environment:
+      RESTREAM_API_TARGET: http://restream:8080
+      RESTREAM_WATCH_POLLING: "true"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./web:/app
+      - restream-dev-node-modules:/app/node_modules
+    depends_on:
+      - restream
+    develop:
+      watch:
+        - action: restart
+          path: ./web/package.json
+        - action: restart
+          path: ./web/bun.lock
+
+volumes:
+  restream-dev-data:
+  restream-dev-node-modules:

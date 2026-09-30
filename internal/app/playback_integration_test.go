@@ -52,7 +52,10 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 		case "get_profile":
 			data = map[string]any{"id": 1}
 		case "get_all_channels":
-			data = map[string]any{"data": []any{map[string]any{"id": "1", "name": "Test live", "cmd": "private-live-command"}}}
+			data = map[string]any{"data": []any{
+				map[string]any{"id": "1", "name": "Test live", "cmd": "private-live-command"},
+				map[string]any{"id": "3", "name": "Test live two", "cmd": "private-second-live-command"},
+			}}
 		case "get_genres":
 			data = []any{}
 		case "get_categories":

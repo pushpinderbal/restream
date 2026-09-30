@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import Hls from "hls.js";
 import {
   AnimatePresence,
@@ -7,7 +14,9 @@ import {
   motion,
 } from "motion/react";
 import {
-  ArrowLeft,
+  AudioLines,
+  Infinity as InfinityIcon,
+  Radio,
   Clapperboard,
   ChevronLeft,
   ChevronRight,
@@ -15,16 +24,14 @@ import {
   ListFilter,
   MonitorPlay,
   Play,
-  Maximize2,
-  Pause,
-  Volume2,
-  VolumeX,
-  X,
+  Settings,
 } from "lucide-react";
+import { SettingsPage, type RefreshTarget } from "./components/settings-page";
+import { PlayerControls } from "./components/player-controls";
 import { Button } from "./components/ui/button";
 import { Skeleton } from "./components/ui/skeleton";
 import { BeamSearch } from "./components/spectrumui/beam-search";
-import { SkeletonReveal } from "./components/spectrumui/skeleton-reveal";
+import { Artwork } from "./components/artwork";
 import { Spinner } from "./components/spectrumui/spinner-dependencies";
 import {
   Select,
@@ -55,6 +62,7 @@ function locationSelection() {
     category: params.get("category") || "*",
     search: params.get("search") || "",
     item: params.get("item") || "",
+    settings: params.get("view") === "settings",
   };
 }
 function writeLocation(
@@ -63,8 +71,11 @@ function writeLocation(
   search: string,
   replace = false,
   item = "",
+  settings = false,
 ) {
   const url = new URL(window.location.href);
+  if (settings) url.searchParams.set("view", "settings");
+  else url.searchParams.delete("view");
   if (tab === "live") url.searchParams.delete("section");
   else url.searchParams.set("section", tab);
   if (category === "*") url.searchParams.delete("category");
@@ -79,6 +90,7 @@ const sections = [
   { id: "live" as Tab, label: "Live TV", icon: MonitorPlay },
   { id: "movie" as Tab, label: "Movies", icon: Film },
   { id: "series" as Tab, label: "Series", icon: Clapperboard },
+  { id: "settings" as const, label: "Settings", icon: Settings },
 ];
 const noRoom =
   "No room available. All streaming slots are in use. Try again when someone stops watching.";
@@ -88,23 +100,10 @@ function formatTime(value: string) {
     ? ""
     : date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
-function formatDuration(seconds: number) {
-  if (!Number.isFinite(seconds)) return "0:00";
-  const value = Math.max(0, Math.floor(seconds));
-  return `${Math.floor(value / 3600) ? `${Math.floor(value / 3600)}:` : ""}${String(Math.floor(value / 60) % 60).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
-}
 function message(error: unknown) {
   return error instanceof Error
     ? error.message
     : "Something went wrong. Please try again.";
-}
-function epgFor(programs: Program[], now: number) {
-  const current = programs.find(
-    (program) =>
-      Date.parse(program.start) <= now && now < Date.parse(program.end),
-  );
-  const next = programs.find((program) => Date.parse(program.start) > now);
-  return { current, next };
 }
 function normalizeSearch(text: string) {
   return text
@@ -114,51 +113,22 @@ function normalizeSearch(text: string) {
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim();
 }
-function Artwork({ item, className = "" }: { item: Item; className?: string }) {
-  const [failed, setFailed] = useState(false);
-  const [loaded, setLoaded] = useState(false);
-  useEffect(() => {
-    setFailed(false);
-    setLoaded(false);
-  }, [item.image, item.id]);
-  return (
-    <SkeletonReveal
-      loading={!loaded}
-      className="artwork-reveal"
-      revealDuration={320}
-      skeleton={<span className="artwork-skeleton" />}
-    >
-      <img
-        className={className}
-        loading="lazy"
-        src={
-          !failed && item.image
-            ? item.image
-            : `/artwork-${item.kind === "live" ? "live" : "title"}.svg`
-        }
-        alt=""
-        onLoad={() => setLoaded(true)}
-        onError={() => {
-          setLoaded(false);
-          setFailed(true);
-        }}
-      />
-    </SkeletonReveal>
-  );
-}
-
 function BrandMark() {
   return (
     <span className="brand-mark" aria-hidden="true">
-      <span />
-      <span />
-      <span />
+      <InfinityIcon size={34} strokeWidth={1.8} />
     </span>
   );
 }
 
 function App() {
   const [status, setStatus] = useState<Status | null>(null);
+  const [statusError, setStatusError] = useState("");
+  const [statusCheckedAt, setStatusCheckedAt] = useState<number | null>(null);
+  const statusLoaded = useRef(false);
+  const [settingsOpen, setSettingsOpen] = useState(
+    () => locationSelection().settings,
+  );
   const [liveItems, setLiveItems] = useState<Item[]>([]);
   const [programs, setPrograms] = useState<Program[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -178,10 +148,18 @@ function App() {
   const [selected, setSelected] = useState<Item | null>(null);
   const [selectedId, setSelectedId] = useState(() => locationSelection().item);
   const [detailError, setDetailError] = useState("");
+  const [livePlaybackRequested, setLivePlaybackRequested] = useState(false);
   const opener = useRef<HTMLButtonElement | null>(null);
+  const playbackTransition = useRef<Promise<void>>(Promise.resolve());
+  const expandedArea = useRef<HTMLElement | null>(null);
+  const scrolledExpansion = useRef("");
+  const selectionRef = useRef(selectedId);
+  selectionRef.current = selectedId;
+  const [catalogGrid, setCatalogGrid] = useState<HTMLDivElement | null>(null);
+  const [gridColumns, setGridColumns] = useState(1);
   const libraryScroll = useRef(0);
   const categoryRail = useRef<HTMLDivElement | null>(null);
-  const loadSentinel = useRef<HTMLDivElement | null>(null);
+  const [loadSentinel, setLoadSentinel] = useState<HTMLDivElement | null>(null);
   const browseAbort = useRef<AbortController | null>(null);
   const browseGeneration = useRef(0);
   const searchPending = useRef(false);
@@ -197,41 +175,62 @@ function App() {
       .then((value) => {
         if (alive) {
           setStatus(value);
-          if (!value.configured) setLoading(false);
+          statusLoaded.current = true;
+          setStatusError("");
+          setStatusCheckedAt(Date.now());
+          if (!value.configured) {
+            setLoading(false);
+            setError("");
+          }
         }
       })
       .catch((cause) => {
         if (alive) {
-          setError(message(cause));
-          setLoading(false);
+          setStatusError(message(cause));
+          if (!statusLoaded.current) {
+            setError(message(cause));
+            setLoading(false);
+          }
         }
       });
-    const interval = window.setInterval(() => {
-      void request<Status>("/api/status")
-        .then((value) => {
-          if (alive) setStatus(value);
-        })
-        .catch(() => {});
-    }, 10000);
+    const interval = window.setInterval(
+      () => {
+        void request<Status>("/api/status")
+          .then((value) => {
+            if (alive) {
+              setStatus(value);
+              statusLoaded.current = true;
+              setStatusError("");
+              setStatusCheckedAt(Date.now());
+            }
+          })
+          .catch((cause) => {
+            if (alive) setStatusError(message(cause));
+          });
+      },
+      settingsOpen || status?.refreshing ? 2000 : 10000,
+    );
     const clock = window.setInterval(() => setNow(Date.now()), 30000);
     return () => {
       alive = false;
       clearInterval(interval);
       clearInterval(clock);
     };
-  }, []);
+  }, [settingsOpen, status?.refreshing]);
   useEffect(() => {
     const restore = () => {
       const next = locationSelection();
       searchPending.current = false;
       setTab(next.tab);
+      setSettingsOpen(next.settings);
       setCategory(next.category);
       setSearch(next.search);
       setDebouncedSearch(next.search);
+      if (selectionRef.current !== next.item) setLivePlaybackRequested(false);
       setSelectedId(next.item);
       setSelected((old) => (old?.id === next.item ? old : null));
       window.requestAnimationFrame(() =>
-        window.scrollTo({ top: next.item ? 0 : libraryScroll.current }),
+        window.scrollTo({ top: libraryScroll.current }),
       );
     };
     window.addEventListener("popstate", restore);
@@ -282,7 +281,7 @@ function App() {
     };
   }, [status?.configured, status?.catalogUpdatedAt, status?.epgUpdatedAt]);
   useEffect(() => {
-    if (!searchPending.current || selectedId) return;
+    if (!searchPending.current) return;
     if (tab !== "live") {
       browseGeneration.current++;
       browseAbort.current?.abort();
@@ -296,10 +295,17 @@ function App() {
       searchPending.current = false;
       setDebouncedSearch(search.trim());
       setSearchRevision((value) => value + 1);
-      writeLocation(tab, category, search.trim(), true);
+      writeLocation(
+        tab,
+        category,
+        search.trim(),
+        true,
+        selectedId,
+        settingsOpen,
+      );
     }, 400);
     return () => clearTimeout(timer);
-  }, [search, tab, category, selectedId]);
+  }, [search, tab, category, selectedId, settingsOpen]);
 
   const fetchPage = useCallback(
     (page: number, generation: number, pagesToLoad = 3) => {
@@ -379,12 +385,22 @@ function App() {
     fetchPage,
   ]);
 
+  useEffect(() => {
+    if (!catalogGrid) return;
+    const measure = () =>
+      setGridColumns(
+        getComputedStyle(catalogGrid).gridTemplateColumns.split(" ").length ||
+          1,
+      );
+    const observer = new ResizeObserver(measure);
+    measure();
+    observer.observe(catalogGrid);
+    return () => observer.disconnect();
+  }, [catalogGrid]);
+
   const liveCategories = useMemo(
     () => categories.filter((value) => value.kind === "live"),
     [categories],
-  );
-  const currentCategory = categories.find(
-    (value) => value.kind === tab && value.id === category,
   );
   const liveSearchIndex = useMemo(
     () => liveItems.map((item) => ({ item, name: normalizeSearch(item.name) })),
@@ -411,6 +427,11 @@ function App() {
   );
   const items = tab === "live" ? filteredLive : browseItems;
   const shownItems = tab === "live" ? items.slice(0, visibleCount) : items;
+  // Keep the selected tile available as its close control when search filters it out.
+  const displayedItems =
+    selected && !shownItems.some((item) => item.id === selected.id)
+      ? [selected, ...shownItems]
+      : shownItems;
   const epgByChannel = useMemo(() => {
     const grouped = new Map<string, Program[]>();
     for (const program of programs) {
@@ -422,7 +443,22 @@ function App() {
       list.sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
     return grouped;
   }, [programs]);
+  const currentPrograms = useMemo(() => {
+    const current = new Map<string, Program>();
+    for (const [channelId, schedule] of epgByChannel) {
+      const program = schedule.find(
+        (value) =>
+          Date.parse(value.start) <= now && now < Date.parse(value.end),
+      );
+      if (program?.title.trim()) current.set(channelId, program);
+    }
+    return current;
+  }, [epgByChannel, now]);
+  const onLivePlaybackChange = useCallback((active: boolean) => {
+    setLivePlaybackRequested(active);
+  }, []);
   const selectCategory = (nextTab: Tab, nextCategory = "*") => {
+    setSettingsOpen(false);
     searchPending.current = false;
     writeLocation(nextTab, nextCategory, "");
     setTab(nextTab);
@@ -432,7 +468,41 @@ function App() {
     setVisibleCount(72);
     setSelected(null);
     setSelectedId("");
+    setLivePlaybackRequested(false);
   };
+  const navigateSection = (next: Tab | "settings") => {
+    if (next === "settings") {
+      if (settingsOpen) return;
+      libraryScroll.current = window.scrollY;
+      writeLocation(tab, category, search, false, selectedId, true);
+      setSettingsOpen(true);
+      window.scrollTo({ top: 0 });
+    } else if (settingsOpen && next === tab) {
+      writeLocation(tab, category, search, false, selectedId);
+      setSettingsOpen(false);
+      window.requestAnimationFrame(() =>
+        window.scrollTo({ top: libraryScroll.current }),
+      );
+    } else selectCategory(next);
+  };
+  const checkStatus = useCallback(async () => {
+    try {
+      const next = await request<Status>("/api/status");
+      setStatus(next);
+      setStatusError("");
+      setStatusCheckedAt(Date.now());
+    } catch (cause) {
+      setStatusError(message(cause));
+      throw cause;
+    }
+  }, []);
+  const forceRefresh = useCallback(
+    async (target: RefreshTarget) => {
+      await jsonRequest("/api/refresh", "POST", { target });
+      await checkStatus();
+    },
+    [checkStatus],
+  );
   const updateStatus = useCallback(() => {
     void request<Status>("/api/status")
       .then(setStatus)
@@ -441,11 +511,17 @@ function App() {
   const closePlayer = useCallback(() => {
     setSelected(null);
     setSelectedId("");
+    setLivePlaybackRequested(false);
     setDetailError("");
+    scrolledExpansion.current = "";
     writeLocation(tab, category, search, true);
     window.requestAnimationFrame(() => {
-      window.scrollTo({ top: libraryScroll.current });
-      opener.current?.focus({ preventScroll: true });
+      const target = opener.current?.isConnected
+        ? opener.current
+        : document.querySelector<HTMLInputElement>(".header-search input");
+      if (opener.current?.isConnected)
+        opener.current.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      target?.focus({ preventScroll: true });
     });
   }, [tab, category, search]);
   const sectionCategories = useMemo(
@@ -477,13 +553,14 @@ function App() {
     return () => window.cancelAnimationFrame(frame);
   }, [tab, category]);
   useEffect(() => {
-    const target = loadSentinel.current;
-    if (!target || selectedId || browseLoading || browseError) return;
+    const target = loadSentinel;
+    if (!target || browseLoading || browseError) return;
     const hasNext = tab === "live" ? items.length > visibleCount : hasMore;
     if (!hasNext) return;
+    let active = true;
     const observer = new IntersectionObserver(
       ([entry]) => {
-        if (!entry.isIntersecting) return;
+        if (!active || !entry.isIntersecting) return;
         if (tab === "live")
           setVisibleCount((count) => Math.min(count + 72, items.length));
         else fetchPage(browsePage + 1, browseGeneration.current, 2);
@@ -491,8 +568,12 @@ function App() {
       { rootMargin: "900px 0px" },
     );
     observer.observe(target);
-    return () => observer.disconnect();
+    return () => {
+      active = false;
+      observer.disconnect();
+    };
   }, [
+    loadSentinel,
     browseError,
     browseLoading,
     browsePage,
@@ -503,13 +584,106 @@ function App() {
     tab,
     visibleCount,
   ]);
+  const openTitle = (item: Item, element?: HTMLButtonElement) => {
+    if (selectedId === item.id) {
+      if (element) closePlayer();
+      else
+        expandedArea.current?.scrollIntoView({
+          block: "nearest",
+          behavior: "smooth",
+        });
+      return;
+    }
+    if (element) opener.current = element;
+    libraryScroll.current = window.scrollY;
+    scrolledExpansion.current = "";
+    searchPending.current = false;
+    setDetailError("");
+    setSelected(item);
+    setSelectedId(item.id);
+    writeLocation(tab, category, search, false, item.id);
+  };
+  const selectedIndex = displayedItems.findIndex(
+    (item) => item.id === selectedId,
+  );
+  const rowEnd =
+    selectedIndex < 0
+      ? -1
+      : Math.min(
+          displayedItems.length - 1,
+          Math.ceil((selectedIndex + 1) / gridColumns) * gridColumns - 1,
+        );
+  const inlineDetails = (
+    <AnimatePresence mode="wait" initial={false}>
+      {selectedId && (
+        <motion.section
+          key={selectedId}
+          ref={expandedArea}
+          id="inline-title-details"
+          className="inline-expansion"
+          aria-label="Expanded title"
+          style={{ order: rowEnd * 2 + 1 }}
+          initial={{ height: 0, opacity: 0 }}
+          animate={{ height: "auto", opacity: 1 }}
+          exit={{ height: 0, opacity: 0 }}
+          transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+          onAnimationComplete={() => {
+            if (
+              selectionRef.current !== selectedId ||
+              scrolledExpansion.current === selectedId
+            )
+              return;
+            scrolledExpansion.current = selectedId;
+            expandedArea.current?.scrollIntoView({
+              block: "nearest",
+              behavior: "smooth",
+            });
+            const focusTarget =
+              expandedArea.current?.querySelector<HTMLElement>(
+                ".playback-area",
+              ) || expandedArea.current?.querySelector<HTMLElement>("h1");
+            focusTarget?.focus({ preventScroll: true });
+          }}
+        >
+          {selected ? (
+            <PlayerPage
+              key={`${selected.kind}:${selected.id}`}
+              item={selected}
+              programs={epgByChannel.get(selected.id) || []}
+              now={now}
+              autoPlay={selected.kind === "live" && livePlaybackRequested}
+              onLivePlaybackChange={onLivePlaybackChange}
+              onSessionChange={updateStatus}
+              transitionRef={playbackTransition}
+            />
+          ) : detailError ? (
+            <div className="inline-detail-state" role="alert">
+              <h2>Couldn’t open this title</h2>
+              <p>{detailError}</p>
+            </div>
+          ) : (
+            <div className="inline-detail-state inline-loading" role="status">
+              <Spinner size="medium" className="app-spinner" />
+              Opening title…
+            </div>
+          )}
+        </motion.section>
+      )}
+    </AnimatePresence>
+  );
   return (
     <MotionConfig reducedMotion="user">
       <div className="app-shell">
+        <div className="page-backdrop" aria-hidden="true">
+          <span className="galaxy-stars galaxy-stars-far" />
+          <span className="galaxy-stars galaxy-stars-near" />
+        </div>
         <a className="skip-link" href="#main-content">
           Skip to content
         </a>
-        <header className="site-header">
+        <header
+          className={`site-header${settingsOpen ? " settings-header" : ""}`}
+        >
           <div className="header-inner">
             <div className="brand">
               <BrandMark />
@@ -519,14 +693,17 @@ function App() {
               <nav className="top-navigation" aria-label="Library">
                 {sections.map((section) => {
                   const Icon = section.icon;
-                  const active = tab === section.id;
+                  const active =
+                    section.id === "settings"
+                      ? settingsOpen
+                      : !settingsOpen && tab === section.id;
                   return (
                     <button
                       key={section.id}
                       type="button"
                       className={active ? "active" : ""}
                       aria-current={active ? "page" : undefined}
-                      onClick={() => selectCategory(section.id)}
+                      onClick={() => navigateSection(section.id)}
                     >
                       {active && (
                         <motion.span
@@ -546,215 +723,166 @@ function App() {
                 })}
               </nav>
             </LayoutGroup>
+            {!settingsOpen && (
+              <BeamSearch
+                className="header-search"
+                theme="dark"
+                colorVariant="mono"
+                value={search}
+                ariaLabel={`Search ${tab === "live" ? "channels" : "titles"}`}
+                placeholder={`Search ${tab === "live" ? "channels" : tab === "movie" ? "movies" : "series"}`}
+                onChange={(value) => {
+                  searchPending.current = true;
+                  setSearch(value);
+                  setVisibleCount(72);
+                }}
+              />
+            )}
             <div className="header-status" aria-live="polite">
               {status?.configured && (
-                <span className="stream-count">
-                  {status.activeStreams} / {status.maxStreams} streams active
+                <span
+                  className={`stream-activity ${status.activeStreams > 0 || status.refreshing ? "active" : "idle"} ${status.activeStreams >= status.maxStreams ? "at-capacity" : ""}`}
+                  role="img"
+                  tabIndex={0}
+                  aria-label={`${status.activeStreams} of ${status.maxStreams} streams in use${status.refreshing ? "; updating library" : ""}`}
+                  title={`${status.activeStreams} of ${status.maxStreams} streams in use${status.refreshing ? " · Updating library" : ""}`}
+                >
+                  <AudioLines size={27} aria-hidden="true" />
                 </span>
-              )}
-              {status?.refreshing && (
-                <span className="refreshing">Updating library…</span>
               )}
             </div>
           </div>
         </header>
         <div className="library-layout">
           <main id="main-content" className="main-content">
-            {selectedId ? (
-              selected ? (
-                <PlayerPage
-                  key={`${selected.kind}:${selected.id}`}
-                  item={selected}
-                  programs={epgByChannel.get(selected.id) || []}
-                  now={now}
-                  onClose={closePlayer}
-                  onSessionChange={updateStatus}
-                />
-              ) : detailError ? (
+            {settingsOpen && (
+              <SettingsPage
+                status={status}
+                statusError={statusError}
+                checkedAt={statusCheckedAt}
+                onRefresh={forceRefresh}
+              />
+            )}
+            <div hidden={settingsOpen} className="library-content">
+              {loading ? (
+                <div
+                  className="loading-library"
+                  role="status"
+                  aria-label="Loading your library"
+                >
+                  <Skeleton className="h-9 w-56" />
+                  <Skeleton className="h-20 w-full" />
+                  <Skeleton className="h-20 w-full" />
+                </div>
+              ) : !status?.configured && !error ? (
+                <div className="state-card state-block" role="status">
+                  <h2>Restream is awaiting setup</h2>
+                  <p>
+                    Ask your administrator to finish setting up the library.
+                  </p>
+                </div>
+              ) : error ? (
                 <div className="state-card state-block" role="alert">
-                  <h2>Couldn’t open this title</h2>
-                  <p>{detailError}</p>
-                  <Button onClick={closePlayer}>Back to library</Button>
+                  <h2>Couldn’t load the library</h2>
+                  <p>{error}</p>
+                  <Button
+                    className="button-primary"
+                    onClick={() => window.location.reload()}
+                  >
+                    Try again
+                  </Button>
                 </div>
               ) : (
-                <div className="loading-library inline-loading" role="status">
-                  <Spinner size="medium" className="app-spinner" />
-                  Opening title…
-                </div>
-              )
-            ) : loading ? (
-              <div
-                className="loading-library"
-                role="status"
-                aria-label="Loading your library"
-              >
-                <Skeleton className="h-9 w-56" />
-                <Skeleton className="h-20 w-full" />
-                <Skeleton className="h-20 w-full" />
-              </div>
-            ) : !status?.configured && !error ? (
-              <div className="state-card state-block" role="status">
-                <h2>Restream is awaiting setup</h2>
-                <p>Ask your administrator to finish setting up the library.</p>
-              </div>
-            ) : error ? (
-              <div className="state-card state-block" role="alert">
-                <h2>Couldn’t load the library</h2>
-                <p>{error}</p>
-                <Button
-                  className="button-primary"
-                  onClick={() => window.location.reload()}
-                >
-                  Try again
-                </Button>
-              </div>
-            ) : (
-              <AnimatePresence mode="wait" initial={false}>
-                <motion.div
-                  key={tab}
-                  className="section-view"
-                  initial={{ opacity: 0, y: 8, filter: "blur(3px)" }}
-                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                  exit={{ opacity: 0, y: -5, filter: "blur(2px)" }}
-                  transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
-                >
-                  {status?.error && (
-                    <div className="notice" role="alert">
-                      {status.error}
-                    </div>
-                  )}
-                  <section className="catalog-hero">
-                    <div className="hero-orb hero-orb-one" />
-                    <div className="hero-orb hero-orb-two" />
-                    <div className="catalog-summary">
-                      <p className="eyebrow">BROWSE</p>
-                      <h1>
-                        {currentCategory?.name ||
-                          sections.find((value) => value.id === tab)?.label}
-                      </h1>
-                      <p>
-                        {tab === "live"
-                          ? `${items.length} live channels available`
-                          : `${items.length} titles loaded${browseLoading ? " · Loading more…" : ""}`}
-                      </p>
-                    </div>
-                    <BeamSearch
-                      className="catalog-search"
-                      theme="dark"
-                      colorVariant="colorful"
-                      value={search}
-                      ariaLabel={`Search ${tab === "live" ? "channels" : "titles"}`}
-                      placeholder={`Search ${tab === "live" ? "channels" : tab === "movie" ? "movies" : "series"}`}
-                      onChange={(value) => {
-                        searchPending.current = true;
-                        setSearch(value);
-                        setVisibleCount(72);
-                      }}
-                    />
-                  </section>
-                  <div
-                    className={`category-browser ${categoryRailOpen ? "open" : ""}`}
+                <AnimatePresence mode="wait" initial={false}>
+                  <motion.div
+                    key={tab}
+                    className="section-view"
+                    initial={{ opacity: 0, y: 8, filter: "blur(3px)" }}
+                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                    exit={{ opacity: 0, y: -5, filter: "blur(2px)" }}
+                    transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
                   >
-                    <div className="category-browser-toolbar">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon-sm"
-                        className="category-filter-toggle"
-                        aria-expanded={categoryRailOpen}
-                        aria-controls="category-filter-panel"
-                        aria-label={
-                          categoryRailOpen
-                            ? "Close category filters"
-                            : "Open category filters"
-                        }
-                        onClick={() => setCategoryRailOpen((open) => !open)}
-                      >
-                        <ListFilter aria-hidden="true" />
-                      </Button>
-                    </div>
-                    <AnimatePresence initial={false}>
-                      {categoryRailOpen && (
-                        <motion.div
-                          id="category-filter-panel"
-                          className="category-filter-panel"
-                          initial={{ height: 0, opacity: 0, y: -6 }}
-                          animate={{ height: "auto", opacity: 1, y: 0 }}
-                          exit={{ height: 0, opacity: 0, y: -6 }}
-                          transition={{
-                            duration: 0.28,
-                            ease: [0.22, 1, 0.36, 1],
-                          }}
+                    {status?.error && (
+                      <div className="notice" role="alert">
+                        {status.error}
+                      </div>
+                    )}
+                    <div
+                      className={`category-browser ${categoryRailOpen ? "open" : ""}`}
+                    >
+                      <div className="category-browser-toolbar">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          className="category-filter-toggle"
+                          aria-expanded={categoryRailOpen}
+                          aria-controls="category-filter-panel"
+                          aria-label={
+                            categoryRailOpen
+                              ? "Close category filters"
+                              : "Open category filters"
+                          }
+                          onClick={() => setCategoryRailOpen((open) => !open)}
                         >
-                          <BeamSearch
-                            autoFocus
-                            className="category-beam-search"
-                            theme="dark"
-                            colorVariant="colorful"
-                            value={categorySearch}
-                            ariaLabel="Search categories"
-                            placeholder="Search categories"
-                            onChange={setCategorySearch}
-                          />
-                          <div className="category-rail-shell">
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon-sm"
-                              className="category-scroll-button"
-                              aria-label="Previous categories"
-                              onClick={() =>
-                                categoryRail.current?.scrollBy({
-                                  left: -320,
-                                  behavior: "smooth",
-                                })
-                              }
-                            >
-                              <ChevronLeft />
-                            </Button>
-                            <LayoutGroup id={`category-selector-${tab}`}>
-                              <nav
-                                key={tab}
-                                ref={categoryRail}
-                                className="category-rail"
-                                aria-label={`${sections.find((value) => value.id === tab)?.label} categories`}
+                          <ListFilter aria-hidden="true" />
+                        </Button>
+                      </div>
+                      <AnimatePresence initial={false}>
+                        {categoryRailOpen && (
+                          <motion.div
+                            id="category-filter-panel"
+                            className="category-filter-panel"
+                            initial={{ height: 0, opacity: 0, y: -6 }}
+                            animate={{ height: "auto", opacity: 1, y: 0 }}
+                            exit={{ height: 0, opacity: 0, y: -6 }}
+                            transition={{
+                              duration: 0.28,
+                              ease: [0.22, 1, 0.36, 1],
+                            }}
+                          >
+                            <BeamSearch
+                              autoFocus
+                              className="category-beam-search"
+                              theme="dark"
+                              colorVariant="colorful"
+                              value={categorySearch}
+                              ariaLabel="Search categories"
+                              placeholder="Search categories"
+                              onChange={setCategorySearch}
+                            />
+                            <div className="category-rail-shell">
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-sm"
+                                className="category-scroll-button"
+                                aria-label="Previous categories"
+                                onClick={() =>
+                                  categoryRail.current?.scrollBy({
+                                    left: -320,
+                                    behavior: "smooth",
+                                  })
+                                }
                               >
-                                <button
-                                  type="button"
-                                  className={category === "*" ? "active" : ""}
-                                  aria-current={
-                                    category === "*" ? "page" : undefined
-                                  }
-                                  onClick={() => selectCategory(tab)}
+                                <ChevronLeft />
+                              </Button>
+                              <LayoutGroup id={`category-selector-${tab}`}>
+                                <nav
+                                  key={tab}
+                                  ref={categoryRail}
+                                  className="category-rail"
+                                  aria-label={`${sections.find((value) => value.id === tab)?.label} categories`}
                                 >
-                                  {category === "*" && (
-                                    <motion.span
-                                      className="category-selection-indicator"
-                                      layoutId="active-category-selection"
-                                      transition={{
-                                        type: "spring",
-                                        stiffness: 430,
-                                        damping: 34,
-                                      }}
-                                    />
-                                  )}
-                                  <span>All</span>
-                                </button>
-                                {visibleCategories.map((value) => (
                                   <button
-                                    key={value.id}
                                     type="button"
-                                    className={
-                                      category === value.id ? "active" : ""
-                                    }
+                                    className={category === "*" ? "active" : ""}
                                     aria-current={
-                                      category === value.id ? "page" : undefined
+                                      category === "*" ? "page" : undefined
                                     }
-                                    onClick={() =>
-                                      selectCategory(tab, value.id)
-                                    }
+                                    onClick={() => selectCategory(tab)}
                                   >
-                                    {category === value.id && (
+                                    {category === "*" && (
                                       <motion.span
                                         className="category-selection-indicator"
                                         layoutId="active-category-selection"
@@ -765,168 +893,204 @@ function App() {
                                         }}
                                       />
                                     )}
-                                    <span>{value.name}</span>
+                                    <span>All</span>
                                   </button>
-                                ))}
-                                {visibleCategories.length === 0 && (
-                                  <span className="category-search-empty">
-                                    No matching categories
-                                  </span>
-                                )}
-                              </nav>
-                            </LayoutGroup>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon-sm"
-                              className="category-scroll-button"
-                              aria-label="More categories"
-                              onClick={() =>
-                                categoryRail.current?.scrollBy({
-                                  left: 320,
-                                  behavior: "smooth",
-                                })
-                              }
-                            >
-                              <ChevronRight />
-                            </Button>
-                          </div>
-                        </motion.div>
-                      )}
-                    </AnimatePresence>
-                  </div>
-                  {items.length > 0 && (
-                    <div
-                      className={
-                        tab === "live"
-                          ? "catalog-grid live-grid"
-                          : "catalog-grid"
-                      }
-                    >
-                      {shownItems.map((item) => (
-                        <button
-                          type="button"
-                          key={item.id}
-                          className="media-card"
-                          onClick={(event) => {
-                            opener.current = event.currentTarget;
-                            libraryScroll.current = window.scrollY;
-                            searchPending.current = false;
-                            setSelected(item);
-                            setSelectedId(item.id);
-                            writeLocation(
-                              tab,
-                              category,
-                              search,
-                              false,
-                              item.id,
-                            );
-                            window.scrollTo({ top: 0 });
-                          }}
-                          aria-label={`Open ${item.name}`}
-                        >
-                          <div className="card-art">
-                            <Artwork item={item} />
-                            {tab === "live" && (
-                              <span className="card-live-pill">LIVE</span>
-                            )}
-                            <span className="card-play" aria-hidden="true">
-                              <Play size={13} fill="currentColor" />
-                            </span>
-                          </div>
-                          <div className="card-content">
-                            <div className="card-title-row">
-                              <h3>{item.name}</h3>
-                              {item.number !== undefined && (
-                                <span className="channel-number">
-                                  CH {item.number}
-                                </span>
-                              )}
+                                  {visibleCategories.map((value) => (
+                                    <button
+                                      key={value.id}
+                                      type="button"
+                                      className={
+                                        category === value.id ? "active" : ""
+                                      }
+                                      aria-current={
+                                        category === value.id
+                                          ? "page"
+                                          : undefined
+                                      }
+                                      onClick={() =>
+                                        selectCategory(tab, value.id)
+                                      }
+                                    >
+                                      {category === value.id && (
+                                        <motion.span
+                                          className="category-selection-indicator"
+                                          layoutId="active-category-selection"
+                                          transition={{
+                                            type: "spring",
+                                            stiffness: 430,
+                                            damping: 34,
+                                          }}
+                                        />
+                                      )}
+                                      <span>{value.name}</span>
+                                    </button>
+                                  ))}
+                                  {visibleCategories.length === 0 && (
+                                    <span className="category-search-empty">
+                                      No matching categories
+                                    </span>
+                                  )}
+                                </nav>
+                              </LayoutGroup>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-sm"
+                                className="category-scroll-button"
+                                aria-label="More categories"
+                                onClick={() =>
+                                  categoryRail.current?.scrollBy({
+                                    left: 320,
+                                    behavior: "smooth",
+                                  })
+                                }
+                              >
+                                <ChevronRight />
+                              </Button>
                             </div>
-                            <p className="card-category">
-                              {item.category ||
-                                (tab === "live"
-                                  ? "Live channel"
-                                  : "Entertainment")}
-                            </p>
-                            {tab === "live" && (
-                              <EpgPreview
-                                programs={epgByChannel.get(item.id) || []}
-                                now={now}
-                              />
-                            )}
-                            {tab !== "live" && item.description && (
-                              <p className="card-description">
-                                {item.description}
-                              </p>
-                            )}
-                          </div>
-                        </button>
-                      ))}
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </div>
-                  )}
-                  {!browseLoading && !browseError && items.length === 0 && (
-                    <div className="empty-state" role="status">
-                      <h3>
-                        {tab !== "live" && hasMore
-                          ? `No ${tab === "movie" ? "movies" : "series"} in the pages checked yet`
-                          : search
-                            ? "No matches found"
-                            : tab === "live"
-                              ? "No channels yet"
-                              : "No titles in this category"}
-                      </h3>
-                      <p>
-                        {hasMore
-                          ? "Continue loading to check the next pages."
-                          : "Try another category or search."}
-                      </p>
-                    </div>
-                  )}
-                  {browseLoading && items.length === 0 && (
-                    <div className="page-status" role="status">
-                      <Spinner size="small" className="app-spinner" /> Loading{" "}
-                      {tab === "movie" ? "movies" : "series"}…
-                    </div>
-                  )}
-                  {browseError && (
-                    <div className="page-error" role="alert">
-                      <span>{browseError}</span>
-                      <Button
-                        onClick={() =>
-                          fetchPage(browsePage + 1, browseGeneration.current)
+                    {(items.length > 0 || selectedId) && (
+                      <div
+                        ref={setCatalogGrid}
+                        className={
+                          tab === "live"
+                            ? "catalog-grid live-grid"
+                            : "catalog-grid"
                         }
                       >
-                        Retry page
-                      </Button>
-                    </div>
-                  )}
-                  {((tab === "live" && items.length > visibleCount) ||
-                    (tab !== "live" && hasMore && !browseError)) && (
-                    <div ref={loadSentinel} className="auto-loader">
-                      {browseLoading && (
-                        <span role="status">
-                          <Spinner size="small" className="app-spinner" />{" "}
-                          Loading more…
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </motion.div>
-              </AnimatePresence>
-            )}
+                        {displayedItems.map((item, index) => (
+                          <button
+                            type="button"
+                            key={item.id}
+                            className={`media-card ${selectedId === item.id ? "expanded" : ""}`}
+                            style={{ order: index * 2 }}
+                            aria-expanded={selectedId === item.id}
+                            aria-controls={
+                              selectedId === item.id
+                                ? "inline-title-details"
+                                : undefined
+                            }
+                            onClick={(event) => {
+                              openTitle(item, event.currentTarget);
+                            }}
+                            title={
+                              selectedId === item.id
+                                ? `Close ${item.name}`
+                                : undefined
+                            }
+                            aria-label={`Open ${item.name}`}
+                          >
+                            <div className="card-art">
+                              <Artwork item={item} />
+                              {tab === "live" && (
+                                <span
+                                  className="card-live-icon"
+                                  title="Live channel"
+                                >
+                                  <Radio size={15} aria-hidden="true" />
+                                  <span className="sr-only">Live channel</span>
+                                </span>
+                              )}
+                              <span className="card-play" aria-hidden="true">
+                                <Play size={13} fill="currentColor" />
+                              </span>
+                            </div>
+                            <div className="card-content">
+                              <div className="card-title-row">
+                                <h3>{item.name}</h3>
+                              </div>
+                              {item.kind === "live" &&
+                                currentPrograms.has(item.id) && (
+                                  <p
+                                    className="card-programme"
+                                    aria-label={`On now: ${currentPrograms.get(item.id)?.title}`}
+                                    title={currentPrograms.get(item.id)?.title}
+                                  >
+                                    <span
+                                      className="on-air-dot"
+                                      aria-hidden="true"
+                                    />
+                                    <span>
+                                      {currentPrograms.get(item.id)?.title}
+                                    </span>
+                                  </p>
+                                )}
+                            </div>
+                          </button>
+                        ))}
+                        {inlineDetails}
+                      </div>
+                    )}
+                    {!browseLoading && !browseError && items.length === 0 && (
+                      <div className="empty-state" role="status">
+                        <h3>
+                          {tab !== "live" && hasMore
+                            ? `No ${tab === "movie" ? "movies" : "series"} in the pages checked yet`
+                            : search
+                              ? "No matches found"
+                              : tab === "live"
+                                ? "No channels yet"
+                                : "No titles in this category"}
+                        </h3>
+                        <p>
+                          {hasMore
+                            ? "Continue loading to check the next pages."
+                            : "Try another category or search."}
+                        </p>
+                      </div>
+                    )}
+                    {browseLoading && items.length === 0 && (
+                      <div className="page-status" role="status">
+                        <Spinner size="small" className="app-spinner" /> Loading{" "}
+                        {tab === "movie" ? "movies" : "series"}…
+                      </div>
+                    )}
+                    {browseError && (
+                      <div className="page-error" role="alert">
+                        <span>{browseError}</span>
+                        <Button
+                          onClick={() =>
+                            fetchPage(browsePage + 1, browseGeneration.current)
+                          }
+                        >
+                          Retry page
+                        </Button>
+                      </div>
+                    )}
+                    {((tab === "live" && items.length > visibleCount) ||
+                      (tab !== "live" && hasMore && !browseError)) && (
+                      <div ref={setLoadSentinel} className="auto-loader">
+                        {browseLoading && (
+                          <span role="status">
+                            <Spinner size="small" className="app-spinner" />{" "}
+                            Loading more…
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </motion.div>
+                </AnimatePresence>
+              )}
+            </div>
           </main>
         </div>
         <nav className="mobile-bottom-nav" aria-label="Primary navigation">
           {sections.map((section) => {
             const Icon = section.icon;
+            const active =
+              section.id === "settings"
+                ? settingsOpen
+                : !settingsOpen && tab === section.id;
             return (
               <button
                 key={section.id}
                 type="button"
-                className={tab === section.id ? "active" : ""}
-                aria-current={tab === section.id ? "page" : undefined}
-                onClick={() => selectCategory(section.id)}
+                className={active ? "active" : ""}
+                aria-current={active ? "page" : undefined}
+                onClick={() => navigateSection(section.id)}
               >
                 <Icon size={20} />
                 <span>{section.label}</span>
@@ -939,42 +1103,22 @@ function App() {
   );
 }
 
-function EpgPreview({ programs, now }: { programs: Program[]; now: number }) {
-  const { current, next } = epgFor(programs, now);
-  if (!current && !next)
-    return <p className="epg-unavailable">Schedule unavailable</p>;
-  return (
-    <div className="epg-preview">
-      {current && (
-        <p>
-          <span>NOW</span>
-          <strong>{current.title}</strong>
-          <time>{formatTime(current.end)}</time>
-        </p>
-      )}
-      {next && (
-        <p>
-          <span>NEXT</span>
-          <strong>{next.title}</strong>
-          <time>{formatTime(next.start)}</time>
-        </p>
-      )}
-    </div>
-  );
-}
-
 function PlayerPage({
   item,
   programs,
   now,
-  onClose,
+  autoPlay,
+  onLivePlaybackChange,
   onSessionChange,
+  transitionRef,
 }: {
   item: Item;
   programs: Program[];
   now: number;
-  onClose: () => void;
+  autoPlay: boolean;
+  onLivePlaybackChange: (active: boolean) => void;
   onSessionChange: () => void;
+  transitionRef: RefObject<Promise<void>>;
 }) {
   const playbackArea = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
@@ -983,14 +1127,14 @@ function PlayerPage({
   const seekingRef = useRef(false);
   const pendingPlayUrlRef = useRef<string | null>(null);
   const attachedUrlRef = useRef<string | null>(null);
-  const resumeNeedsSeekRef = useRef(false);
-  const suppressPauseRef = useRef(false);
+  const hlsRef = useRef<Hls | null>(null);
   const releasedRef = useRef(false);
   const releasePromiseRef = useRef<Promise<void>>(Promise.resolve());
-  const transitionRef = useRef<Promise<void>>(Promise.resolve());
   const [episode, setEpisode] = useState<Item | null>(null);
   const [playingEpisode, setPlayingEpisode] = useState<Item | null>(null);
-  const [playRequested, setPlayRequested] = useState(false);
+  const [playRequested, setPlayRequested] = useState(
+    () => item.kind === "live" && autoPlay,
+  );
   const [playAttempt, setPlayAttempt] = useState(0);
   const [episodes, setEpisodes] = useState<Item[]>([]);
   const [episodesLoading, setEpisodesLoading] = useState(
@@ -1000,12 +1144,17 @@ function PlayerPage({
   const [episodeRetry, setEpisodeRetry] = useState(0);
   const [season, setSeason] = useState<number | null>(null);
   const [session, setSession] = useState<Session | null>(null);
+  const latestSession = useRef<Session | null>(null);
+  latestSession.current = session;
   const [playbackUrl, setPlaybackUrl] = useState("");
   const [error, setError] = useState("");
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
   const [position, setPosition] = useState(0);
-  const [seekTarget, setSeekTarget] = useState<number | null>(null);
+  const [buffered, setBuffered] = useState<{ start: number; end: number }[]>(
+    [],
+  );
+  const [buffering, setBuffering] = useState(true);
   const [seeking, setSeeking] = useState(false);
   const [viewerFinished, setViewerFinished] = useState(false);
   const activeItem = item.kind === "series" ? playingEpisode : item;
@@ -1043,6 +1192,7 @@ function PlayerPage({
     let timer: number | undefined;
     let heartbeat: number | undefined;
     let pollBusy = false;
+    let pollAfter = 0;
     let currentId: string | null = null;
     let postStarted = false;
     let postDone = false;
@@ -1078,14 +1228,14 @@ function PlayerPage({
       onSessionChange();
     };
     releasedRef.current = false;
-    resumeNeedsSeekRef.current = false;
     pendingPlayUrlRef.current = null;
     setSession(null);
     setPlaybackUrl("");
     setError("");
     setPosition(0);
+    setBuffered([]);
+    setBuffering(true);
     setSeeking(false);
-    setSeekTarget(null);
     setPlaying(false);
     setViewerFinished(false);
     void priorTransition.then(() => {
@@ -1115,6 +1265,12 @@ function PlayerPage({
           }
           timer = window.setInterval(() => {
             if (pollBusy || seekingRef.current || releasedRef.current) return;
+            if (
+              latestSession.current?.state !== "starting" &&
+              Date.now() < pollAfter
+            )
+              return;
+            pollAfter = Date.now() + 2000;
             pollBusy = true;
             const version = seekVersion.current;
             void request<Session>(
@@ -1132,7 +1288,7 @@ function PlayerPage({
               .finally(() => {
                 pollBusy = false;
               });
-          }, 2000);
+          }, 300);
           heartbeat = window.setInterval(() => {
             if (!releasedRef.current)
               void request<void>(
@@ -1165,9 +1321,12 @@ function PlayerPage({
   useEffect(() => {
     if (playRequested)
       window.requestAnimationFrame(() =>
-        window.scrollTo({ top: 0, behavior: "auto" }),
+        playbackArea.current?.scrollIntoView({
+          block: "nearest",
+          behavior: "smooth",
+        }),
       );
-  }, [playRequested]);
+  }, [playRequested, activeItem?.id]);
 
   useEffect(() => {
     seekingRef.current = seeking;
@@ -1186,13 +1345,22 @@ function PlayerPage({
     if (!playRequested || !element || !playbackUrl) return;
     let hls: Hls | undefined;
     setPlaying(false);
-    suppressPauseRef.current = true;
+    setBuffering(true);
     attachedUrlRef.current = playbackUrl;
     element.pause();
     element.removeAttribute("src");
     element.load();
     if (Hls.isSupported()) {
-      hls = new Hls({ enableWorker: true, startPosition: 0 });
+      hls = new Hls({
+        enableWorker: true,
+        startPosition: 0,
+        maxBufferLength: 45,
+        backBufferLength: 120,
+        // VOD is an append-only event playlist; never jump to its live edge.
+        liveSyncOnStallIncrease: activeItem?.kind === "live" ? 1 : 0,
+        liveSyncDuration: activeItem?.kind === "live" ? undefined : 86400,
+      });
+      hlsRef.current = hls;
       hls.loadSource(playbackUrl);
       hls.attachMedia(element);
       hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -1204,12 +1372,13 @@ function PlayerPage({
     else setError("This browser does not support HLS playback.");
     return () => {
       attachedUrlRef.current = null;
+      hlsRef.current = null;
       hls?.destroy();
       element.pause();
       element.removeAttribute("src");
       element.load();
     };
-  }, [playRequested, playbackUrl]);
+  }, [playRequested, playbackUrl, activeItem?.kind]);
 
   const seek = async (target: number, resume = false) => {
     const id = sessionId.current;
@@ -1219,12 +1388,31 @@ function PlayerPage({
       0,
       Math.min(Math.max(0, session.duration - 0.5), target),
     );
+    const element = video.current;
+    const local = desired - session.offset;
+    const details = hlsRef.current?.levels[hlsRef.current.loadLevel]?.details;
+    const ranges = element?.seekable;
+    const available =
+      attachedUrlRef.current === session.url &&
+      local >= 0 &&
+      ((details && local < details.edge - 0.25) ||
+        (ranges &&
+          Array.from({ length: ranges.length }, (_, i) => i).some(
+            (i) => local >= ranges.start(i) && local < ranges.end(i) - 0.25,
+          )));
+    if (element && available) {
+      element.currentTime = local;
+      setPosition(desired);
+      if (resume)
+        void element.play().catch(() => setError("Press play to resume."));
+      return;
+    }
     seekVersion.current++;
     const resumeAfterSeek =
       resume || !!(video.current && !video.current.paused);
     pendingPlayUrlRef.current = null;
-    suppressPauseRef.current = true;
     video.current?.pause();
+    hlsRef.current?.stopLoad();
     setSeeking(true);
     seekingRef.current = true;
     setError("");
@@ -1238,14 +1426,15 @@ function PlayerPage({
       pendingPlayUrlRef.current = resumeAfterSeek ? next.url : null;
       setSession(next);
       setPosition(next.offset);
-      setSeekTarget(null);
-      resumeNeedsSeekRef.current = false;
       if (next.state === "failed")
         setError(next.error || "Could not seek in this video.");
     } catch (cause) {
-      if (sessionId.current === id) setError(message(cause));
+      if (sessionId.current === id) {
+        setError(message(cause));
+        hlsRef.current?.startLoad();
+        if (resumeAfterSeek) void video.current?.play().catch(() => {});
+      }
       pendingPlayUrlRef.current = null;
-      suppressPauseRef.current = false;
     } finally {
       setSeeking(false);
       seekingRef.current = false;
@@ -1255,14 +1444,6 @@ function PlayerPage({
     const element = video.current;
     if (!element) return;
     if (element.paused) {
-      if (
-        resumeNeedsSeekRef.current &&
-        (session?.state === "ready" || session?.state === "ended") &&
-        session.duration > 0
-      ) {
-        await seek(position, true);
-        return;
-      }
       try {
         await element.play();
         setError("");
@@ -1301,6 +1482,7 @@ function PlayerPage({
       sessionId.current = null;
       onSessionChange();
     }
+    if (item.kind === "live") onLivePlaybackChange(false);
     setViewerFinished(true);
     setPlaying(false);
   };
@@ -1312,18 +1494,12 @@ function PlayerPage({
   );
   const vod = activeItem?.kind === "movie" || activeItem?.kind === "episode";
   const streamPreparing = session?.state === "starting";
-  const absolutePosition = Math.min(
-    session?.duration || 0,
-    seekTarget ?? position,
-  );
+  const absolutePosition = Math.min(session?.duration || 0, position);
 
   return (
     <article
       className={`title-page kind-${item.kind} ${playRequested ? "watching" : ""}`}
     >
-      <button type="button" className="back-link" onClick={onClose}>
-        <ArrowLeft size={16} /> Back to library
-      </button>
       <div className="title-hero">
         <div className="title-art">
           <Artwork item={item} />
@@ -1336,7 +1512,7 @@ function PlayerPage({
                 ? "LIVE TV"
                 : "MOVIE"}
           </span>
-          <h1>{item.name}</h1>
+          <h1 tabIndex={-1}>{item.name}</h1>
           <p className="title-category">
             {item.category ||
               (item.kind === "live" ? "Live channel" : "Entertainment")}
@@ -1344,12 +1520,6 @@ function PlayerPage({
           </p>
           {item.description && (
             <p className="title-description">{item.description}</p>
-          )}
-          {item.kind === "live" && (
-            <div className="title-guide">
-              <h2>On this channel</h2>
-              <EpgPreview programs={programs} now={now} />
-            </div>
           )}
           {item.kind === "series" && episode && (
             <p className="selected-episode">
@@ -1362,6 +1532,7 @@ function PlayerPage({
             disabled={item.kind === "series" && !episode}
             onClick={() => {
               if (item.kind === "series") setPlayingEpisode(episode);
+              if (item.kind === "live") onLivePlaybackChange(true);
               setPlayRequested(true);
             }}
           >
@@ -1369,6 +1540,55 @@ function PlayerPage({
             {item.kind === "series" ? "Play episode" : "Play"}
           </Button>
         </div>
+        {item.kind === "live" && (
+          <section className="title-guide" aria-label="On this channel">
+            <h2>On this channel</h2>
+            <div
+              className="channel-schedule"
+              tabIndex={0}
+              aria-label="Scroll channel schedule"
+            >
+              {programs.some((program) => Date.parse(program.end) > now) ? (
+                <ol>
+                  {programs
+                    .filter((program) => Date.parse(program.end) > now)
+                    .map((program) => {
+                      const onAir = Date.parse(program.start) <= now;
+                      return (
+                        <li
+                          key={`${program.start}:${program.title}`}
+                          className={onAir ? "on-air" : ""}
+                        >
+                          <div className="schedule-time">
+                            <time dateTime={program.start}>
+                              {new Date(program.start).toLocaleDateString([], {
+                                weekday: "short",
+                              })}
+                              {" · "}
+                              {formatTime(program.start)} –{" "}
+                              {formatTime(program.end)}
+                            </time>
+                            {onAir && (
+                              <span className="schedule-on-air">
+                                <Radio size={12} aria-hidden="true" /> On air
+                              </span>
+                            )}
+                          </div>
+                          <strong>{program.title}</strong>
+                          {program.description && <p>{program.description}</p>}
+                        </li>
+                      );
+                    })}
+                </ol>
+              ) : (
+                <p className="epg-unavailable">
+                  The provider hasn’t supplied an upcoming schedule for this
+                  channel.
+                </p>
+              )}
+            </div>
+          </section>
+        )}
       </div>
       {item.kind === "series" && (
         <div className="episode-browser">
@@ -1425,7 +1645,8 @@ function PlayerPage({
                   }
                   onClick={() => {
                     setEpisode(value);
-                    if (playRequested) setPlayingEpisode(value);
+                    setPlayingEpisode(value);
+                    setPlayRequested(true);
                   }}
                 >
                   <span className="episode-number">
@@ -1433,9 +1654,9 @@ function PlayerPage({
                   </span>
                   <span>
                     <strong>{value.name}</strong>
-                    <small>{value.description || "Select to watch"}</small>
+                    <small>{value.description || "Play episode"}</small>
                   </span>
-                  <span aria-hidden="true">›</span>
+                  <Play size={17} aria-hidden="true" />
                 </button>
               ))}
             </div>
@@ -1446,33 +1667,44 @@ function PlayerPage({
       )}
       {playRequested && activeItem && (
         <section className="watch-section" aria-label="Player">
-          <div className="watch-heading">
-            <h2>Now playing</h2>
-            <button
-              className="icon-button close-button"
-              aria-label="Close player"
-              onClick={() => setPlayRequested(false)}
-            >
-              <X size={18} />
-            </button>
-          </div>
-          <div className="playback-area" ref={playbackArea}>
+          <div
+            className="playback-area"
+            ref={playbackArea}
+            tabIndex={0}
+            aria-label="Video player"
+          >
             <div className="video-wrap">
               <video
                 ref={video}
                 playsInline
-                controls={!vod}
+                controls={false}
+                preload="auto"
+                onClick={() => {
+                  if (!streamPreparing && !seeking) void togglePlay();
+                }}
+                onDoubleClick={() => void enterFullscreen()}
+                onWaiting={() => setBuffering(true)}
+                onPlaying={() => setBuffering(false)}
+                onSeeked={() => setBuffering(false)}
+                onProgress={(event) => {
+                  const ranges = event.currentTarget.buffered;
+                  if (attachedUrlRef.current === session?.url) {
+                    const offset = session?.offset || 0;
+                    setBuffered(
+                      Array.from({ length: ranges.length }, (_, i) => ({
+                        start: offset + ranges.start(i),
+                        end: offset + ranges.end(i),
+                      })),
+                    );
+                  }
+                }}
+                onVolumeChange={(event) => setMuted(event.currentTarget.muted)}
                 onPlay={() => {
                   setPlaying(true);
-                  suppressPauseRef.current = false;
                 }}
-                onPause={() => {
-                  if (playing && vod && !suppressPauseRef.current)
-                    resumeNeedsSeekRef.current = true;
-                  setPlaying(false);
-                }}
+                onPause={() => setPlaying(false)}
                 onCanPlay={() => {
-                  suppressPauseRef.current = false;
+                  setBuffering(false);
                   if (
                     pendingPlayUrlRef.current &&
                     pendingPlayUrlRef.current === attachedUrlRef.current &&
@@ -1489,41 +1721,55 @@ function PlayerPage({
                   }
                 }}
                 onEnded={finishPlayback}
-                onTimeUpdate={(event) =>
-                  setPosition(
-                    (session?.offset || 0) + event.currentTarget.currentTime,
-                  )
-                }
+                onTimeUpdate={(event) => {
+                  if (attachedUrlRef.current === session?.url)
+                    setPosition(
+                      (session?.offset || 0) + event.currentTarget.currentTime,
+                    );
+                }}
                 onError={() => {
                   if (session?.state === "ready")
                     setError("The video could not be played.");
                 }}
                 aria-label={`${activeItem?.name} video`}
               />
-              {streamPreparing && !playbackUrl && (
-                <div className="video-overlay" role="status">
-                  <Spinner size="small" className="app-spinner" />
-                  Preparing playback…
-                </div>
-              )}
-              {streamPreparing && playbackUrl && (
-                <div className="seek-status" role="status">
-                  <Spinner size="small" className="app-spinner" />
-                  Jumping to{" "}
-                  {formatDuration(session?.offset || absolutePosition)}…
-                </div>
-              )}
-              {!playbackUrl && !streamPreparing && !error && (
-                <div className="video-overlay" role="status">
-                  <Spinner size="small" className="app-spinner" />
-                  Opening video…
-                </div>
-              )}
+              {(streamPreparing || seeking || buffering) &&
+                !error &&
+                !viewerFinished && (
+                  <div className="playback-loading" role="status">
+                    <Spinner size="large" className="app-spinner" />
+                    <span className="sr-only">Loading playback</span>
+                  </div>
+                )}
               {viewerFinished && (
                 <div className="video-overlay" role="status">
-                  You’ve reached the end
+                  <div className="playback-ended">
+                    <p>You’ve reached the end</p>
+                    <Button
+                      onClick={() => setPlayAttempt((value) => value + 1)}
+                    >
+                      <Play size={17} fill="currentColor" /> Play again
+                    </Button>
+                  </div>
                 </div>
               )}
+              <PlayerControls
+                area={playbackArea}
+                playing={playing}
+                muted={muted}
+                busy={streamPreparing || seeking || !playbackUrl}
+                finished={viewerFinished}
+                position={absolutePosition}
+                duration={session?.duration || 0}
+                buffered={buffered}
+                live={!vod}
+                onPlay={() => void togglePlay()}
+                onSeek={(target) => void seek(target)}
+                onMute={() => {
+                  if (video.current) video.current.muted = !video.current.muted;
+                }}
+                onFullscreen={() => void enterFullscreen()}
+              />
             </div>
             {error && (
               <div className="player-error" role="alert">
@@ -1533,90 +1779,6 @@ function PlayerPage({
                 </Button>
               </div>
             )}
-            {vod && session && playbackUrl && (
-              <div className="video-controls">
-                <button
-                  className="control-button"
-                  onClick={() => void togglePlay()}
-                  aria-label={playing ? "Pause" : "Play"}
-                  disabled={viewerFinished || streamPreparing || seeking}
-                >
-                  {playing ? (
-                    <Pause size={17} fill="currentColor" />
-                  ) : (
-                    <Play size={17} fill="currentColor" />
-                  )}
-                </button>
-                <span className="time-readout">
-                  {formatDuration(absolutePosition)}
-                </span>
-                <input
-                  type="range"
-                  className="timeline"
-                  aria-label="Seek position"
-                  min={0}
-                  max={Math.max(1, session.duration)}
-                  step={1}
-                  value={absolutePosition}
-                  disabled={
-                    seeking ||
-                    streamPreparing ||
-                    viewerFinished ||
-                    !Number.isFinite(session.duration) ||
-                    session.duration <= 0
-                  }
-                  onChange={(event) =>
-                    setSeekTarget(Number(event.target.value))
-                  }
-                  onPointerUp={(event) => {
-                    const target = Number(event.currentTarget.value);
-                    void seek(target);
-                  }}
-                  onKeyUp={(event) => {
-                    if (
-                      [
-                        "ArrowLeft",
-                        "ArrowRight",
-                        "Home",
-                        "End",
-                        "PageUp",
-                        "PageDown",
-                      ].includes(event.key)
-                    )
-                      void seek(Number(event.currentTarget.value));
-                  }}
-                />
-                <span className="time-readout">
-                  {formatDuration(session.duration)}
-                </span>
-                <button
-                  className="control-button"
-                  onClick={() => {
-                    if (video.current) {
-                      video.current.muted = !video.current.muted;
-                      setMuted(video.current.muted);
-                    }
-                  }}
-                  aria-label={muted ? "Unmute" : "Mute"}
-                >
-                  {muted ? <VolumeX size={17} /> : <Volume2 size={17} />}
-                </button>
-                <button
-                  className="control-button fullscreen"
-                  onClick={() => void enterFullscreen()}
-                  aria-label="Full screen"
-                >
-                  <Maximize2 size={17} />
-                </button>
-              </div>
-            )}
-            <div className="player-meta">
-              <div>
-                <h3>{activeItem?.name}</h3>
-                {activeItem?.description && <p>{activeItem.description}</p>}
-              </div>
-              {item.kind === "live" && <span className="live-badge">LIVE</span>}
-            </div>
           </div>
         </section>
       )}

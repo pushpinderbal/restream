@@ -45,7 +45,8 @@ type Server struct {
 	cancel                 context.CancelFunc
 	wg                     sync.WaitGroup
 	stateMu                sync.RWMutex
-	refreshing             int
+	catalogSync, epgSync   refreshState
+	refreshWake            [2]chan struct{}
 	catalogError, epgError string
 	episodeFlights         singleflight.Group
 	browseFlights          singleflight.Group
@@ -56,6 +57,17 @@ type Server struct {
 	imageCache             *ristretto.Cache[string, imageData]
 	imageFlights           singleflight.Group
 	imageFailureTTL        time.Duration
+}
+
+type refreshState struct {
+	Queued           bool       `json:"queued"`
+	Running          bool       `json:"running"`
+	StartedAt        *time.Time `json:"startedAt,omitempty"`
+	FinishedAt       *time.Time `json:"finishedAt,omitempty"`
+	NextRefreshAt    *time.Time `json:"nextRefreshAt,omitempty"`
+	LastSuccessfulAt *time.Time `json:"lastSuccessfulAt,omitempty"`
+	IntervalSeconds  float64    `json:"intervalSeconds"`
+	Error            string     `json:"error,omitempty"`
 }
 
 type imageData struct {
@@ -84,6 +96,7 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{cfg: cfg, provider: provider, streams: streams, cache: cache, ctx: ctx, cancel: cancel, imageClient: &http.Client{Timeout: 12 * time.Second}, imageCache: imageCache, imageFailureTTL: defaultImageFailureTTL}
+	s.refreshWake = [2]chan struct{}{make(chan struct{}, 1), make(chan struct{}, 1)}
 	cache.mu.RLock()
 	slog.Info("Cache restored", "liveChannels", len(cache.items), "categories", len(cache.categories), "programs", len(cache.programs))
 	if until := cache.portalCooldownUntil; until.After(time.Now()) {
@@ -106,6 +119,7 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok\n")) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok\n")) })
 	mux.HandleFunc("GET /api/status", s.status)
+	mux.HandleFunc("POST /api/refresh", s.refresh)
 	mux.HandleFunc("GET /api/catalog", s.catalog)
 	mux.HandleFunc("GET /api/categories", s.categories)
 	mux.HandleFunc("GET /api/browse", s.browse)
@@ -183,15 +197,70 @@ func (s *Server) static() http.Handler {
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	s.cache.mu.RLock()
 	cat, fullCat, epg := s.cache.catalogPublishedAt, s.cache.catalogAt, s.cache.epgAt
+	metadataAt := fullCat
+	if _, ok := s.provider.(model.BrowseProvider); ok && s.cache.categoriesAt.Before(metadataAt) {
+		metadataAt = s.cache.categoriesAt
+	}
+	cooldown := s.cache.portalCooldownUntil
+	library := map[string]any{"liveChannels": len(s.cache.items), "categories": len(s.cache.categories), "programmes": len(s.cache.programs)}
+	movies, series := 0, 0
+	for _, item := range s.cache.byID {
+		if item.Kind == "movie" {
+			movies++
+		}
+		if item.Kind == "series" {
+			series++
+		}
+	}
+	library["cachedMovies"], library["cachedSeries"] = movies, series
+	var guideStart, guideEnd time.Time
+	for _, program := range s.cache.programs {
+		if guideStart.IsZero() || program.Start.Before(guideStart) {
+			guideStart = program.Start
+		}
+		if program.End.After(guideEnd) {
+			guideEnd = program.End
+		}
+	}
+	if !guideStart.IsZero() {
+		library["guideStartsAt"] = guideStart
+	}
+	if !guideEnd.IsZero() {
+		library["guideEndsAt"] = guideEnd
+	}
 	s.cache.mu.RUnlock()
 	s.stateMu.RLock()
-	busy, catErr, epgErr := s.refreshing > 0, s.catalogError, s.epgError
+	catSync, epgSync := s.catalogSync, s.epgSync
+	catErr, epgErr := s.catalogError, s.epgError
 	s.stateMu.RUnlock()
+	catSync.IntervalSeconds, epgSync.IntervalSeconds = s.refreshInterval(true).Seconds(), s.refreshInterval(false).Seconds()
+	catSync.Error, epgSync.Error = catErr, epgErr
+	if cooldown.After(time.Now()) {
+		for _, state := range []*refreshState{&catSync, &epgSync} {
+			if state.NextRefreshAt != nil && cooldown.After(*state.NextRefreshAt) {
+				state.NextRefreshAt = &cooldown
+			}
+		}
+	}
+	if catSync.LastSuccessfulAt == nil && !metadataAt.IsZero() {
+		catSync.LastSuccessfulAt = &metadataAt
+	}
+	if epgSync.LastSuccessfulAt == nil && !epg.IsZero() {
+		epgSync.LastSuccessfulAt = &epg
+	}
+	busy := catSync.Queued || catSync.Running || epgSync.Queued || epgSync.Running
 	active := 0
 	if s.streams != nil {
 		active = s.streams.Active()
 	}
 	out := map[string]any{"configured": s.provider != nil, "refreshing": busy, "activeStreams": active, "maxStreams": s.cfg.MaxStreams}
+	out["sync"] = map[string]any{"catalog": catSync, "epg": epgSync}
+	out["library"] = library
+	out["timezone"], out["guideHours"] = s.cfg.Timezone, s.cfg.EPGHours
+	out["playback"] = map[string]any{"transcodeMode": s.cfg.TranscodeMode, "sessionTimeoutSeconds": s.cfg.SessionTTL.Seconds()}
+	if cooldown.After(time.Now()) {
+		out["portalCooldownUntil"] = cooldown
+	}
 	if !cat.IsZero() {
 		out["catalogUpdatedAt"] = cat
 	}
@@ -207,6 +276,56 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		out["error"] = epgErr
 	}
 	respond(w, 200, out)
+}
+
+// Manual refreshes wake the existing schedulers; they never create a second
+// refresh worker or tie shared work to the requesting browser's lifetime.
+func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
+	if s.provider == nil {
+		fail(w, 503, "unconfigured", "Configure the portal on the server first.")
+		return
+	}
+	var input struct {
+		Target string `json:"target"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if input.Target == "" {
+		input.Target = "all"
+	}
+	if input.Target != "all" && input.Target != "catalog" && input.Target != "epg" {
+		fail(w, 400, "invalid", "Choose library, programme guide, or all.")
+		return
+	}
+	s.cache.mu.RLock()
+	cooldown := s.cache.portalCooldownUntil
+	s.cache.mu.RUnlock()
+	if cooldown.After(time.Now()) {
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(time.Until(cooldown).Seconds()))))
+		fail(w, 429, "cooldown", "The provider is cooling down. Refresh will resume automatically.")
+		return
+	}
+	s.stateMu.Lock()
+	if s.ctx.Err() != nil {
+		s.stateMu.Unlock()
+		fail(w, 503, "unavailable", "The server is shutting down.")
+		return
+	}
+	for idx, state := range []*refreshState{&s.catalogSync, &s.epgSync} {
+		if (idx == 0 && input.Target == "epg") || (idx == 1 && input.Target == "catalog") {
+			continue
+		}
+		if !state.Running && !state.Queued {
+			state.Queued = true
+			select {
+			case s.refreshWake[idx] <- struct{}{}:
+			default:
+			}
+		}
+	}
+	s.stateMu.Unlock()
+	respond(w, 202, map[string]any{"accepted": true})
 }
 func publicItems(items []model.Item) []model.Item {
 	out := make([]model.Item, 0, len(items))
@@ -326,13 +445,10 @@ func episodeFailureReason(err error) string {
 		return "provider_error"
 	}
 }
-func (s *Server) scheduler(catalog bool) {
-	defer s.wg.Done()
+func (s *Server) refreshInterval(catalog bool) time.Duration {
 	interval := s.cfg.EPGRefresh
-	kind := "epg"
 	if catalog {
 		interval = s.cfg.CatalogRefresh
-		kind = "metadata"
 	}
 	if interval <= 0 {
 		interval = 6 * time.Hour
@@ -340,11 +456,20 @@ func (s *Server) scheduler(catalog bool) {
 			interval = 24 * time.Hour
 		}
 	}
+	return interval
+}
+func (s *Server) scheduler(catalog bool) {
+	defer s.wg.Done()
+	interval := s.refreshInterval(catalog)
+	kind, idx, state := "epg", 1, &s.epgSync
+	if catalog {
+		kind, idx, state = "metadata", 0, &s.catalogSync
+	}
 	s.cache.mu.RLock()
 	last := s.cache.epgAt
 	if catalog {
 		last = s.cache.catalogAt
-		if s.cache.categoriesAt.Before(last) {
+		if _, ok := s.provider.(model.BrowseProvider); ok && s.cache.categoriesAt.Before(last) {
 			last = s.cache.categoriesAt
 		}
 	}
@@ -359,14 +484,54 @@ func (s *Server) scheduler(catalog bool) {
 	}
 	failures := 0
 	for {
+		s.stateMu.Lock()
+		nextAt := next
+		state.NextRefreshAt = &nextAt
+		s.stateMu.Unlock()
 		timer := time.NewTimer(max(0, time.Until(next)))
 		select {
 		case <-s.ctx.Done():
 			timer.Stop()
 			return
 		case <-timer.C:
+		case <-s.refreshWake[idx]:
+			timer.Stop()
 		}
+		// A different worker can discover a shared provider cooldown while this
+		// scheduler is waiting. Recheck it before any provider request.
+		s.cache.mu.RLock()
+		cooldown = s.cache.portalCooldownUntil
+		s.cache.mu.RUnlock()
+		if cooldown.After(time.Now()) {
+			next = cooldown
+			s.stateMu.Lock()
+			select {
+			case <-s.refreshWake[idx]:
+			default:
+			}
+			state.Queued = false
+			s.stateMu.Unlock()
+			continue
+		}
+		s.stateMu.Lock()
+		// If the timer and a manual request arrived together, consume the wake
+		// here so it cannot trigger another refresh after this one completes.
+		select {
+		case <-s.refreshWake[idx]:
+		default:
+		}
+		started := time.Now().UTC()
+		state.Queued, state.Running, state.StartedAt = false, true, &started
+		state.NextRefreshAt = nil
+		s.stateMu.Unlock()
 		err := s.doRefresh(catalog, !catalog)
+		s.stateMu.Lock()
+		finished := time.Now().UTC()
+		state.Running, state.FinishedAt = false, &finished
+		if err == nil {
+			state.LastSuccessfulAt = &finished
+		}
+		s.stateMu.Unlock()
 		if s.ctx.Err() != nil {
 			return
 		}
@@ -392,10 +557,6 @@ func retryCooldown(err error, failures int) time.Duration {
 	return min(time.Minute<<min(max(failures-1, 0), 5), 30*time.Minute)
 }
 func (s *Server) doRefresh(catalog, epg bool) error {
-	s.stateMu.Lock()
-	s.refreshing++
-	s.stateMu.Unlock()
-	defer func() { s.stateMu.Lock(); s.refreshing--; s.stateMu.Unlock() }()
 	var refreshErr error
 	if catalog {
 		started := time.Now()

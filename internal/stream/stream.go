@@ -54,11 +54,17 @@ type generation struct {
 	done   chan struct{}
 }
 
+type probeResult struct {
+	mode     string
+	duration float64
+}
+
 type entry struct {
 	session   Session
 	item      model.Item
 	gen       *generation
 	heartbeat time.Time
+	probe     *probeResult
 }
 
 type Manager struct {
@@ -352,9 +358,25 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 		m.fail(e, g, ctx, "output_directory", errorClass(err), started)
 		return
 	}
-	mode, probedDuration, probeReason := m.probeWithDiagnostics(startupCtx, source)
-	if probeReason != "" && ctx.Err() == nil {
-		m.logFailure(e, "probe", probeReason, started)
+	// Reuse title metadata on seek, but resolve fresh provider links as they may expire.
+	m.mu.Lock()
+	cached := e.probe
+	m.mu.Unlock()
+	mode, probedDuration := "transcode", 0.0
+	if cached != nil {
+		mode, probedDuration = cached.mode, cached.duration
+	} else {
+		var reason string
+		mode, probedDuration, reason = m.probeWithDiagnostics(startupCtx, source)
+		if reason != "" && ctx.Err() == nil {
+			m.logFailure(e, "probe", reason, started)
+		} else if reason == "" && ctx.Err() == nil {
+			m.mu.Lock()
+			if m.sessions[e.session.ID] == e && e.gen == g {
+				e.probe = &probeResult{mode: mode, duration: probedDuration}
+			}
+			m.mu.Unlock()
+		}
 	}
 	duration := 0.0
 	if !source.Live && e.item.Kind != "live" {
@@ -370,7 +392,13 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 	if m.cfg.TranscodeMode != "auto" {
 		mode = m.cfg.TranscodeMode
 	}
-	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-re", "-rw_timeout", "10000000", "-protocol_whitelist", "http,https,tcp,tls,crypto"}
+	live := source.Live || e.item.Kind == "live"
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-readrate", "1"}
+	if !live {
+		// Fill initial segments immediately, then pace the relay.
+		args = append(args, "-readrate_initial_burst", "8")
+	}
+	args = append(args, "-rw_timeout", "10000000", "-protocol_whitelist", "http,https,tcp,tls,crypto")
 	if pos > 0 {
 		args = append(args, "-ss", strconv.FormatFloat(pos, 'f', 3, 64))
 	}
@@ -397,14 +425,16 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 			args = append(args, "-preset", "veryfast", "-tune", "zerolatency")
 		}
 		args = append(args, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k")
-		args = append(args, "-force_key_frames", "expr:gte(t,n_forced*2)")
+		args = append(args, "-force_key_frames", "expr:gte(t,n_forced*1)")
 	}
-	live := source.Live || e.item.Kind == "live"
-	flags := "delete_segments+temp_file"
+	args = append(args, "-f", "hls", "-hls_time", "1")
 	if live {
-		flags += "+omit_endlist"
+		args = append(args, "-hls_list_size", "6", "-hls_delete_threshold", "2", "-hls_flags", "delete_segments+temp_file+omit_endlist")
+	} else {
+		// Retain segments for local seeking and pause/resume until session cleanup.
+		args = append(args, "-hls_playlist_type", "event", "-hls_list_size", "0", "-hls_flags", "temp_file")
 	}
-	args = append(args, "-f", "hls", "-hls_time", "2", "-hls_list_size", "6", "-hls_delete_threshold", "2", "-hls_flags", flags, "-hls_segment_filename", filepath.Join(g.dir, "seg-%06d.ts"), filepath.Join(g.dir, "index.m3u8"))
+	args = append(args, "-hls_segment_filename", filepath.Join(g.dir, "seg-%06d.ts"), filepath.Join(g.dir, "index.m3u8"))
 	cmd := exec.CommandContext(ctx, m.cfg.FFmpegPath, args...)
 	// Diagnostics can contain upstream URLs and authorization headers. Only classify them.
 	stderr := &boundedOutput{limit: 16 * 1024}
