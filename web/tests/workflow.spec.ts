@@ -100,6 +100,7 @@ test.afterEach(async ({ page }) => {
 async function mockApi(
   page: Page,
   options: {
+    nativeHls?: boolean;
     initialEmpty?: boolean;
     capacity?: boolean;
     producerEnded?: boolean;
@@ -126,6 +127,18 @@ async function mockApi(
     }>;
   } = {},
 ) {
+  // Workflow fixtures exercise controlled media state; real-playback.mjs
+  // covers HLS decoding. Avoid starting an actual decoder on empty playlists.
+  await page.addInitScript((nativeHls) => {
+    const canPlayType = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function (type) {
+      return type === "application/vnd.apple.mpegurl"
+        ? nativeHls
+          ? "probably"
+          : ""
+        : canPlayType.call(this, type);
+    };
+  }, options.nativeHls !== false);
   let catalogReady = !options.initialEmpty;
   let active = false;
   let nextId = 0;
@@ -267,7 +280,7 @@ async function mockApi(
     if (path === "/api/series/series-1/episodes") {
       episodeAttempts++;
       events.push("EPISODES");
-      if (options.episodesFailureOnce && episodeAttempts <= 2)
+      if (options.episodesFailureOnce && episodeAttempts === 1)
         return json({ error: "Episodes are temporarily unavailable" }, 503);
       return json({ items: options.episodeItems?.() ?? episodes });
     }
@@ -842,10 +855,11 @@ for (const viewport of [
         "style",
         /height: auto/,
       );
-      await page.screenshot({
-        path: `/tmp/restream-episodes-${viewport.width}.png`,
-        fullPage: true,
-      });
+      if (process.env.CAPTURE_SCREENSHOTS)
+        await page.screenshot({
+          path: `/tmp/restream-episodes-${viewport.width}.png`,
+          fullPage: true,
+        });
     }
   });
 
@@ -951,9 +965,10 @@ test("player stays pinned while browsing and resizing without replacing its vide
       await page.evaluate(() => document.documentElement.scrollWidth),
     ).toBeLessThanOrEqual(viewport.width);
     expect(await video!.evaluate((element) => element.isConnected)).toBe(true);
-    await page.screenshot({
-      path: `/tmp/restream-player-${viewport.width}.png`,
-    });
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `/tmp/restream-player-${viewport.width}.png`,
+      });
   }
   expect(api.sessionItemIds).toEqual([movie.id]);
   await page.getByRole("button", { name: "Stop playback" }).click();
@@ -1619,25 +1634,46 @@ test("channel details contain the full guide with one animated page background",
       return { width: canvas.width, height: canvas.height, digest };
     });
   const movement = await readMotion();
-  await page.waitForTimeout(1500);
-  expect(await readMotion()).not.toEqual(movement);
+  await expect.poll(readMotion).not.toEqual(movement);
+  await page.setViewportSize({ width: 3840, height: 2160 });
+  await field.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      ),
+  );
+  const largeCanvas = await readMotion();
+  expect(largeCanvas.width * largeCanvas.height).toBeLessThanOrEqual(
+    1920 * 1080,
+  );
+  await page.setViewportSize({ width: 1280, height: 720 });
   await page.getByRole("button", { name: "Open North News" }).click();
   const guide = page.getByRole("region", { name: "On this channel" });
   await expect(guide).toContainText("Tomorrow Briefing");
   await expect(guide).toContainText("Stories from across the city.");
-  await page.screenshot({
-    path: "/tmp/restream-guide-desktop.png",
-    fullPage: true,
-  });
+  if (process.env.CAPTURE_SCREENSHOTS)
+    await page.screenshot({
+      path: "/tmp/restream-guide-desktop.png",
+      fullPage: true,
+    });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(guide).toBeVisible();
   expect(
     await page.evaluate(() => document.documentElement.scrollWidth),
   ).toBeLessThanOrEqual(390);
-  await page.screenshot({
-    path: "/tmp/restream-guide-mobile.png",
-    fullPage: true,
-  });
+  if (process.env.CAPTURE_SCREENSHOTS)
+    await page.screenshot({
+      path: "/tmp/restream-guide-mobile.png",
+      fullPage: true,
+    });
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Player" })).toBeVisible();
+  const duringPlayback = await readMotion();
+  await page.waitForTimeout(250);
+  expect(await readMotion()).toEqual(duringPlayback);
+  await page.getByRole("button", { name: "Stop playback" }).click();
+  await expect(page.getByRole("region", { name: "Player" })).toHaveCount(0);
+  await expect.poll(readMotion).not.toEqual(duringPlayback);
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.waitForTimeout(100);
   const still = await readMotion();
@@ -2311,4 +2347,96 @@ test("mobile settings is reachable, fits narrow screens and handles an unconfigu
   await expect(
     page.getByRole("button", { name: "Refresh guide" }),
   ).toBeDisabled();
+});
+
+test("native HLS playback keeps the decoder and worker out of browser requests", async ({
+  page,
+}) => {
+  await mockApi(page);
+  const decoderRequests: string[] = [];
+  page.on("request", (request) => {
+    if (/\/assets\/hls(?:[.-])/.test(new URL(request.url()).pathname))
+      decoderRequests.push(request.url());
+  });
+  await page.goto("/?section=movie");
+  await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+  expect(decoderRequests).toEqual([]);
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await expect(page.locator("video")).toHaveAttribute(
+    "src",
+    /\/api\/streams\/session-1\/0\/index\.m3u8$/,
+  );
+  await playableVideo(page);
+  await page.getByRole("button", { name: "Stop playback" }).click();
+  await expect(page.locator("video")).toHaveCount(0);
+  expect(decoderRequests).toEqual([]);
+});
+
+test("closing while the HLS decoder downloads prevents a late media attachment", async ({
+  page,
+}) => {
+  const api = await mockApi(page, { nativeHls: false });
+  let finishDownload!: () => void;
+  const downloadHeld = new Promise<void>((resolve) => {
+    finishDownload = resolve;
+  });
+  let decoderRequested!: () => void;
+  const requested = new Promise<void>((resolve) => {
+    decoderRequested = resolve;
+  });
+  let manifests = 0;
+  const workers: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().endsWith(".m3u8")) manifests++;
+  });
+  page.on("worker", (worker) => workers.push(worker.url()));
+  await page.route(/\/assets\/hls-[^/]+\.js$/, async (route) => {
+    decoderRequested();
+    await downloadHeld;
+    await route.continue();
+  });
+  await page.goto("/?section=movie");
+  await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await requested;
+  await page.getByRole("button", { name: "Stop playback" }).click();
+  await expect(page.locator("video")).toHaveCount(0);
+  const downloadFinished = page.waitForResponse(/\/assets\/hls-[^/]+\.js$/);
+  finishDownload();
+  await downloadFinished;
+  await page.evaluate(() => new Promise(requestAnimationFrame));
+  expect(manifests).toBe(0);
+  expect(workers).toEqual([]);
+  expect(api.events.filter((event) => event === "DELETE")).toHaveLength(1);
+});
+
+test("a fatal HLS manifest failure clears media and remains retryable", async ({
+  page,
+}) => {
+  await mockApi(page, { nativeHls: false });
+  await page.route("**/api/streams/**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/vnd.apple.mpegurl",
+      body: "invalid manifest",
+    }),
+  );
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto("/?section=movie");
+  await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("Playback stopped");
+  await expect
+    .poll(() =>
+      page.locator("video").evaluate((video) => ({
+        paused: (video as HTMLVideoElement).paused,
+        source: video.getAttribute("src"),
+      })),
+    )
+    .toEqual({ paused: true, source: null });
+  await expect(
+    page.getByRole("button", { name: "Try again", exact: true }),
+  ).toBeEnabled();
+  expect(errors).toEqual([]);
 });

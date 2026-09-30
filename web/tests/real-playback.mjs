@@ -1,4 +1,4 @@
-import { chromium } from "@playwright/test";
+import { chromium, expect } from "@playwright/test";
 
 const baseURL = process.argv[2];
 if (!baseURL) throw new Error("Usage: bun tests/real-playback.mjs <baseURL>");
@@ -12,7 +12,60 @@ const browser = await chromium.launch({
 });
 
 const page = await browser.newPage();
+// Exercise our JS decoder and worker even on Chromium versions with native HLS.
+// Workflow tests cover the native selection and media lifecycle separately.
+await page.addInitScript(() => {
+  const canPlayType = HTMLMediaElement.prototype.canPlayType;
+  HTMLMediaElement.prototype.canPlayType = function (type) {
+    return type === "application/vnd.apple.mpegurl"
+      ? ""
+      : canPlayType.call(this, type);
+  };
+});
+page.on("console", (message) => {
+  if (message.type() === "error" || message.type() === "warning")
+    console.log(`Browser ${message.type()}: ${message.text()}`);
+});
 const browserErrors = [];
+const activeWorkers = new Set();
+page.on("worker", (worker) => {
+  activeWorkers.add(worker);
+  worker.on("close", () => activeWorkers.delete(worker));
+});
+const cdp = await page.context().newCDPSession(page);
+const heapUsage = async () => {
+  await cdp.send("HeapProfiler.collectGarbage");
+  return (await cdp.send("Runtime.getHeapUsage")).usedSize;
+};
+const checkReleasedMedia = async () => {
+  await expect.poll(() => activeWorkers.size, { timeout: 5000 }).toBe(0);
+  await expect(page.locator("video")).toHaveCount(0);
+};
+const checkBufferWindow = async () => {
+  const window = await page.locator("video").evaluate((video) => {
+    let duration = 0;
+    for (let i = 0; i < video.buffered.length; i++)
+      duration += video.buffered.end(i) - video.buffered.start(i);
+    return {
+      duration,
+      ahead: video.buffered.length
+        ? Math.max(
+            0,
+            video.buffered.end(video.buffered.length - 1) - video.currentTime,
+          )
+        : 0,
+      back: video.buffered.length
+        ? Math.max(0, video.currentTime - video.buffered.start(0))
+        : 0,
+    };
+  });
+  // Allow segment boundaries around each configured 30-second window.
+  if (window.ahead > 35 || window.back > 35)
+    throw new Error(
+      `HLS buffer exceeded its media window: ${JSON.stringify(window)}`,
+    );
+  return window.duration;
+};
 const sessionIds = new Set();
 let seekCount = 0;
 page.on("pageerror", (error) => {
@@ -55,8 +108,140 @@ const progressing = () => {
   );
 };
 
+async function checkNativePlayback() {
+  const nativePage = await browser.newPage();
+  const supported = await nativePage.evaluate(
+    () =>
+      !!document
+        .createElement("video")
+        .canPlayType("application/vnd.apple.mpegurl"),
+  );
+  if (!supported) {
+    console.log(
+      "Native HLS decoding unavailable in this browser; native selection covered by workflow tests",
+    );
+    await nativePage.close();
+    return;
+  }
+  let nativeSeeks = 0;
+  const nativeErrors = [];
+  nativePage.on("pageerror", (error) => nativeErrors.push(error.message));
+  nativePage.on("request", (request) => {
+    if (/\/api\/sessions\/[^/]+\/seek$/.test(request.url())) nativeSeeks++;
+    if (/\/assets\/hls(?:[.-])/.test(new URL(request.url()).pathname))
+      nativeErrors.push("Native playback loaded the JS decoder");
+  });
+  nativePage.on("response", async (response) => {
+    if (
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/api/sessions" &&
+      response.status() === 201
+    )
+      sessionIds.add((await response.json()).id);
+  });
+  try {
+    await nativePage.goto(`${baseURL}/?section=movie`);
+    await nativePage.getByRole("button", { name: "Open Test movie" }).click();
+    await nativePage.getByRole("button", { name: "Play", exact: true }).click();
+    await nativePage.waitForFunction(progressing, undefined, {
+      timeout: 15000,
+    });
+    const source = (await nativePage.evaluate(videoState)).src;
+    const nativeArea = nativePage.locator(".playback-area");
+    await nativeArea.hover();
+    await nativePage
+      .getByRole("button", { name: "Pause", exact: true })
+      .click();
+    await nativePage.waitForFunction(
+      () => document.querySelector("video")?.paused,
+    );
+    const window = await nativePage.locator("video").evaluate((video) => ({
+      time: video.currentTime,
+      seekable: Array.from({ length: video.seekable.length }, (_, i) => ({
+        start: video.seekable.start(i),
+        end: video.seekable.end(i),
+      })),
+      buffered: Array.from({ length: video.buffered.length }, (_, i) => ({
+        start: video.buffered.start(i),
+        end: video.buffered.end(i),
+      })),
+    }));
+    console.log(`Native HLS media window: ${JSON.stringify(window)}`);
+    const range = [...window.seekable, ...window.buffered].find(
+      (range) => range.end - range.start > 1,
+    );
+    if (!range) throw new Error("Native HLS did not expose a media window");
+    const target = Math.ceil(range.start + 0.5);
+    if (target >= range.end - 0.25)
+      throw new Error("Native seekable window was too short");
+    const timeline = await nativePage.locator(".timeline").boundingBox();
+    const thumb = await nativePage.locator(".timeline-thumb").boundingBox();
+    if (!timeline || !thumb)
+      throw new Error("Native HLS timeline was not visible");
+    await nativePage.mouse.click(
+      timeline.x +
+        thumb.width / 2 +
+        ((timeline.width - thumb.width) * target) / 60,
+      timeline.y + timeline.height / 2,
+    );
+    await expect
+      .poll(() =>
+        nativePage.locator("video").evaluate((video) => video.currentTime),
+      )
+      .toBeCloseTo(target, 0);
+    if (nativeSeeks || (await nativePage.evaluate(videoState)).src !== source)
+      throw new Error("Native in-window seek restarted the server stream");
+    await nativeArea.hover();
+    await nativePage.getByRole("button", { name: "Play", exact: true }).click();
+    await nativePage.waitForFunction(progressing, undefined, {
+      timeout: 10000,
+    });
+    await nativeArea.hover();
+    const seekResponse = nativePage.waitForResponse((response) =>
+      /\/api\/sessions\/[^/]+\/seek$/.test(response.url()),
+    );
+    await nativePage.mouse.click(
+      timeline.x + timeline.width * 0.9,
+      timeline.y + timeline.height / 2,
+    );
+    await seekResponse;
+    await nativePage.waitForFunction(
+      (source) => document.querySelector("video")?.currentSrc !== source,
+      source,
+      { timeout: 15000 },
+    );
+    await nativePage.waitForFunction(progressing, undefined, {
+      timeout: 15000,
+    });
+    await nativePage.getByRole("button", { name: "Stop playback" }).click();
+    await expect(nativePage.locator("video")).toHaveCount(0);
+    await nativePage.waitForFunction(
+      async () =>
+        (await (await fetch("/api/status")).json()).activeStreams === 0,
+    );
+    if (nativeErrors.length) throw new Error(nativeErrors.join("\n"));
+    console.log(
+      "Native HLS decodes, pauses, seeks locally within its media window, resumes after a server seek, and releases playback",
+    );
+  } finally {
+    await nativePage.close();
+  }
+}
+
 try {
+  const codecsSupported = await page.evaluate(
+    () =>
+      typeof MediaSource !== "undefined" &&
+      MediaSource.isTypeSupported('video/mp4;codecs="avc1.42e01e"') &&
+      MediaSource.isTypeSupported('audio/mp4;codecs="mp4a.40.2"'),
+  );
+  if (!codecsSupported)
+    throw new Error(
+      "Real playback requires H.264/AAC support. Set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH to a compatible Chrome/Chromium executable.",
+    );
   await page.goto(baseURL);
+  const initialHeap = await heapUsage();
+  if (activeWorkers.size) throw new Error("Decoder started before playback");
   await page
     .getByRole("navigation", { name: "Library" })
     .getByRole("button", { name: "Movies", exact: true })
@@ -81,6 +266,19 @@ try {
       throw error;
     });
   const decoded = await page.evaluate(videoState);
+  const nativeHls = await page
+    .locator("video")
+    .evaluate((video) => !!video.canPlayType("application/vnd.apple.mpegurl"));
+  if (
+    !nativeHls &&
+    ![...activeWorkers].some((worker) =>
+      /\/assets\/hls\.worker-/.test(worker.url()),
+    )
+  )
+    throw new Error("HLS transmuxing did not start its local worker");
+  console.log(
+    `Buffered ${await checkBufferWindow()}s; decoding worker active: ${activeWorkers.size}`,
+  );
   console.log(
     `Decoded HLS ${decoded.width}x${decoded.height}; first progressing frame in ${Date.now() - started}ms`,
   );
@@ -163,7 +361,9 @@ try {
   if (seekCount !== 0)
     throw new Error("Available forward seek restarted the stream");
   console.log("Available forward seek stays local");
-  await page.screenshot({ path: "/tmp/restream-real-player.png" });
+  await checkBufferWindow();
+  if (process.env.CAPTURE_SCREENSHOTS === "1")
+    await page.screenshot({ path: "/tmp/restream-real-player.png" });
   const bounds = await page.locator(".timeline").boundingBox();
   if (!bounds) throw new Error("Timeline not visible");
   const seeksBefore = seekCount;
@@ -191,9 +391,11 @@ try {
   if (afterSeek.paused || afterSeek.width === 0)
     throw new Error("Playback did not resume after timeline seek");
   console.log("Timeline seek decoded new HLS generation");
+  await checkBufferWindow();
   await page.setViewportSize({ width: 390, height: 844 });
   await area.hover({ position: { x: 70, y: 40 } });
-  await page.screenshot({ path: "/tmp/restream-real-player-mobile.png" });
+  if (process.env.CAPTURE_SCREENSHOTS === "1")
+    await page.screenshot({ path: "/tmp/restream-real-player-mobile.png" });
   if ((await page.evaluate(() => document.documentElement.scrollWidth)) > 390)
     throw new Error("Player overflows mobile viewport");
 
@@ -265,6 +467,7 @@ try {
     baseURL,
     { timeout: 10000 },
   );
+  await checkReleasedMedia();
   await page
     .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Live TV", exact: true })
@@ -305,8 +508,14 @@ try {
     baseURL,
     { timeout: 10000 },
   );
+  await checkReleasedMedia();
+  const finalHeap = await heapUsage();
+  console.log(
+    `JS heap after GC: ${(initialHeap / 1024 / 1024).toFixed(1)}MiB before playback, ${(finalHeap / 1024 / 1024).toFixed(1)}MiB after playback (decoder modules remain cached)`,
+  );
   if (browserErrors.length) throw new Error(browserErrors.join("\n"));
   console.log("Leaving player released stream slot; no browser errors");
+  await checkNativePlayback();
 } finally {
   for (const id of sessionIds) {
     await fetch(`${baseURL}/api/sessions/${encodeURIComponent(id)}`, {

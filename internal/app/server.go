@@ -95,6 +95,7 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	}
 	imageCache, err := ristretto.NewCache(&ristretto.Config[string, imageData]{NumCounters: 1024, MaxCost: 32 << 20, BufferItems: 64})
 	if err != nil {
+		_ = cache.close()
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -111,7 +112,7 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 		until := cache.portalCooldownUntil
 		cache.mu.RUnlock()
 		cooldownProvider.ConfigureCooldown(until, func(next time.Time) error {
-			if err := cache.setRetryDeadline(false, next, true); err != nil {
+			if err := cache.setPortalCooldown(next); err != nil {
 				return err
 			}
 			slog.Debug("Portal cooldown saved", "until", next, "wait", max(0, time.Until(next)).Round(time.Second))
@@ -548,7 +549,7 @@ func (s *Server) scheduler(catalog bool) {
 			next = time.Now().Add(retryCooldown(err, failures))
 			var limited interface{ RetryDelay() time.Duration }
 			if errors.As(err, &limited) && limited.RetryDelay() > 0 {
-				_ = s.cache.setRetryDeadline(false, next, true)
+				_ = s.cache.setPortalCooldown(next)
 			}
 			slog.Info("Refresh retry scheduled", "kind", kind, "nextAt", next, "failures", failures)
 		} else {
@@ -924,8 +925,11 @@ func (s *Server) fetchImage(rawURL string) (imageData, error) {
 		return imageData{}, fmt.Errorf("image upstream returned %d", res.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(res.Body, (5<<20)+1))
-	if err != nil || len(data) > 5<<20 {
-		return imageData{}, fmt.Errorf("image too large or unreadable: %w", err)
+	if err != nil {
+		return imageData{}, fmt.Errorf("image unreadable: %w", err)
+	}
+	if len(data) > 5<<20 {
+		return imageData{}, errors.New("image too large")
 	}
 	mime := http.DetectContentType(data)
 	switch mime {
