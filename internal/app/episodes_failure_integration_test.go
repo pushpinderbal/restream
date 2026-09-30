@@ -42,7 +42,7 @@ func TestEpisodeFailureLoggedOnceWithoutPrivateDetails(t *testing.T) {
 	}
 	defer s.Close()
 	q := model.BrowseQuery{Kind: "series", Category: "*", Page: 1}
-	if err := s.cache.setBrowse(q, model.BrowsePage{Items: []model.Item{{ID: "series:229631", Kind: "series", Name: "Cached series", ProviderID: "229631"}}, Page: 1}, time.Hour); err != nil {
+	if err := s.cache.setBrowseAtRevision(q, model.BrowsePage{Items: []model.Item{{ID: "series:229631", Kind: "series", Name: "Cached series", ProviderID: "229631"}}, Page: 1}, time.Hour, s.cache.libraryRevision()); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(s)
@@ -94,11 +94,11 @@ func TestCachedEpisodePlaybackRetainsProviderIdentityAfterRestart(t *testing.T) 
 		t.Fatal(err)
 	}
 	series := model.Item{ID: "series:229631", Kind: "series", Name: "Show", ProviderID: "229631"}
-	if err := cache.setBrowse(model.BrowseQuery{Kind: "series", Category: "*", Page: 1}, model.BrowsePage{Page: 1, Items: []model.Item{series}}, time.Hour); err != nil {
+	if err := cache.setBrowseAtRevision(model.BrowseQuery{Kind: "series", Category: "*", Page: 1}, model.BrowsePage{Page: 1, Items: []model.Item{series}}, time.Hour, cache.libraryRevision()); err != nil {
 		t.Fatal(err)
 	}
 	episode := model.Item{ID: "episode:229631:16659:730024", Kind: "episode", Name: "Pilot", Season: 1, Episode: 1, ProviderID: "730024", SeriesID: "229631", EpisodeID: "730024"}
-	if err := cache.setEpisodes(series.ID, []model.Item{episode}); err != nil {
+	if err := cache.setEpisodesAtRevision(series.ID, []model.Item{episode}, cache.libraryRevision()); err != nil {
 		t.Fatal(err)
 	}
 	if err := cache.close(); err != nil {

@@ -674,9 +674,6 @@ func (s *store) browse(q model.BrowseQuery, ttl time.Duration) (model.BrowsePage
 	}
 	return page, true, nil
 }
-func (s *store) setBrowse(q model.BrowseQuery, p model.BrowsePage, ttl time.Duration) error {
-	return s.setBrowseAtRevision(q, p, ttl, s.libraryRevision())
-}
 
 func (s *store) setBrowseAtRevision(q model.BrowseQuery, p model.BrowsePage, ttl time.Duration, revision time.Time) error {
 	b, err := encodePage(p)
@@ -715,10 +712,7 @@ func (s *store) setBrowseAtRevision(q model.BrowseQuery, p model.BrowsePage, ttl
 	}
 	return nil
 }
-func (s *store) setRetryDeadline(_ bool, at time.Time, shared bool) error {
-	if !shared {
-		return nil
-	}
+func (s *store) setPortalCooldown(at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !at.After(s.portalCooldownUntil) {
@@ -737,9 +731,6 @@ func (s *store) setRetryDeadline(_ bool, at time.Time, shared bool) error {
 	}
 	s.portalCooldownUntil = at
 	return nil
-}
-func (s *store) setEpisodes(id string, items []model.Item) error {
-	return s.setEpisodesAtRevision(id, items, s.libraryRevision())
 }
 
 func (s *store) setEpisodesAtRevision(id string, items []model.Item, revision time.Time) error {
@@ -787,17 +778,6 @@ func (s *store) getEpisodes(id string, ttl time.Duration) ([]model.Item, bool) {
 		return nil, false
 	}
 	return append([]model.Item(nil), items...), true
-}
-func (s *store) cachedSeries() []model.Item {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]model.Item, 0, len(s.episodes))
-	for id := range s.episodes {
-		if i, ok := s.byID[id]; ok && i.Kind == "series" {
-			out = append(out, i)
-		}
-	}
-	return out
 }
 func (s *store) item(id string) (model.Item, bool) {
 	s.mu.RLock()

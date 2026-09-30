@@ -6,7 +6,7 @@ import {
   type RefObject,
 } from "react";
 import { motion } from "motion/react";
-import { Slider } from "radix-ui";
+import * as Slider from "@radix-ui/react-slider";
 import {
   Maximize2,
   Minimize2,

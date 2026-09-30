@@ -11,6 +11,16 @@ run = "docker compose -f compose.dev.yaml up --build --watch"
 description = "Stop the Docker development stack"
 run = "docker compose -f compose.dev.yaml down"
 
+[tasks."dev:ui"]
+description = "Run the UI locally against a backend on localhost:8080"
+dir = "web"
+run = ["bun install --frozen-lockfile", "bun run dev"]
+
+[tasks.frontend]
+description = "Install locked frontend dependencies and build the production UI"
+dir = "web"
+run = ["bun install --frozen-lockfile", "bun run build"]
+
 [tasks."dev:logs"]
 description = "Follow development container logs"
 run = "docker compose -f compose.dev.yaml logs -f"
@@ -43,4 +53,4 @@ run = ["bun install --frozen-lockfile", "node node_modules/@playwright/test/cli.
 [tasks."test:playback"]
 description = "Run FFmpeg-to-browser integration test"
 depends = ["frontend"]
-run = ["cd web && node node_modules/@playwright/test/cli.js install chromium", "RESTREAM_BROWSER_TESTS=1 go test ./internal/app -run TestPortalToBrowserPlayback -v"]
+run = ["cd web && node node_modules/@playwright/test/cli.js install chromium", "RESTREAM_BROWSER_TESTS=1 go test ./internal/app -run '^TestPortalToBrowserPlayback$' -count=1 -v"]

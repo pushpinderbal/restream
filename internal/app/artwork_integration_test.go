@@ -156,11 +156,11 @@ func TestBrowseCacheUpgradePreservesOtherSavedData(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := model.BrowseQuery{Kind: "movie", Category: "7", Search: "literal", Page: 1}
-	if err := s.setBrowse(q, model.BrowsePage{Items: []model.Item{{ID: "movie:3", Kind: "movie", Name: "Cached film"}}, Page: 1}, time.Hour); err != nil {
+	if err := s.setBrowseAtRevision(q, model.BrowsePage{Items: []model.Item{{ID: "movie:3", Kind: "movie", Name: "Cached film"}}, Page: 1}, time.Hour, s.libraryRevision()); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(2 * time.Minute)
-	if err := s.setRetryDeadline(false, deadline, true); err != nil {
+	if err := s.setPortalCooldown(deadline); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec(`DELETE FROM meta WHERE key='browse_cache_version'`); err != nil {

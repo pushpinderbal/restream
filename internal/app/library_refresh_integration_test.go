@@ -220,7 +220,7 @@ func TestEpisodeCacheExpiresIndependentlyOfSeriesPages(t *testing.T) {
 
 func TestRefreshDoesNotJoinOrCacheOlderListRequests(t *testing.T) {
 	s, ts, p := newChangingLibrary(t, time.Hour)
-	if err := s.cache.setBrowse(model.BrowseQuery{Kind: "series", Category: "seed", Page: 1}, model.BrowsePage{Items: []model.Item{{ID: "series:2", Kind: "series"}}}, 24*time.Hour); err != nil {
+	if err := s.cache.setBrowseAtRevision(model.BrowseQuery{Kind: "series", Category: "seed", Page: 1}, model.BrowsePage{Items: []model.Item{{ID: "series:2", Kind: "series"}}}, 24*time.Hour, s.cache.libraryRevision()); err != nil {
 		t.Fatal(err)
 	}
 	gate := make(chan struct{})

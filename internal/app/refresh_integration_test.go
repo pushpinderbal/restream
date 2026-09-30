@@ -137,7 +137,7 @@ func TestSettingsManualRefreshLifecycle(t *testing.T) {
 		t.Fatal("cross-origin refresh accepted", res.StatusCode)
 	}
 	cooldown := time.Now().Add(time.Hour)
-	if err := s.cache.setRetryDeadline(false, cooldown, true); err != nil {
+	if err := s.cache.setPortalCooldown(cooldown); err != nil {
 		t.Fatal(err)
 	}
 	req, _ = http.NewRequest("POST", ts.URL+"/api/refresh", strings.NewReader(`{"target":"all"}`))

@@ -36,7 +36,7 @@ func run() error {
 	}
 	var manager *stream.Manager
 	if provider != nil {
-		manager, err = stream.New(stream.Config{MaxStreams: cfg.MaxStreams, SessionTTL: cfg.SessionTTL, DataDir: cfg.DataDir, FFmpegPath: cfg.FFmpegPath, FFprobePath: cfg.FFprobePath, TranscodeMode: cfg.TranscodeMode}, provider.Resolve)
+		manager, err = stream.New(stream.Config{MaxStreams: cfg.MaxStreams, SessionTTL: cfg.SessionTTL, DataDir: cfg.DataDir, TranscodeMode: cfg.TranscodeMode}, provider.Resolve)
 		if err != nil {
 			return err
 		}

@@ -24,8 +24,17 @@ type Particle = {
 const random = (min: number, max: number) => min + Math.random() * (max - min);
 const smooth = (value: number) => value * value * (3 - 2 * value);
 
-export const GalaxyBackdrop = memo(function GalaxyBackdrop() {
+export const GalaxyBackdrop = memo(function GalaxyBackdrop({
+  active = true,
+}: {
+  active?: boolean;
+}) {
   const canvas = useRef<HTMLCanvasElement>(null);
+  const activeRef = useRef(active);
+  const syncMotionRef = useRef<(() => void) | null>(null);
+  activeRef.current = active;
+
+  useEffect(() => syncMotionRef.current?.(), [active]);
 
   useEffect(() => {
     const surface = canvas.current;
@@ -67,9 +76,15 @@ export const GalaxyBackdrop = memo(function GalaxyBackdrop() {
     const resize = () => {
       width = surface.clientWidth;
       height = surface.clientHeight;
-      const ratio = Math.min(window.devicePixelRatio || 1, 1.5);
-      surface.width = Math.round(width * ratio);
-      surface.height = Math.round(height * ratio);
+      // Decorative pixels do not need to scale with a 4K/Retina video surface.
+      // Keep this canvas under 2.1 million pixels (about 8 MB of RGBA data).
+      const ratio = Math.min(
+        window.devicePixelRatio || 1,
+        1.5,
+        Math.sqrt((1920 * 1080) / Math.max(1, width * height)),
+      );
+      surface.width = Math.floor(width * ratio);
+      surface.height = Math.floor(height * ratio);
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
       context.fillStyle = "#020308";
       context.fillRect(0, 0, width, height);
@@ -176,7 +191,7 @@ export const GalaxyBackdrop = memo(function GalaxyBackdrop() {
 
     const animate = (now: number) => {
       frame = requestAnimationFrame(animate);
-      if (now - lastFrame < 1000 / 30) return;
+      if (now - lastFrame < 1000 / 15) return;
       const delta = lastFrame ? Math.min((now - lastFrame) / 1000, 0.1) : 0;
       lastFrame = now;
       draw(delta);
@@ -185,8 +200,10 @@ export const GalaxyBackdrop = memo(function GalaxyBackdrop() {
       cancelAnimationFrame(frame);
       lastFrame = 0;
       if (reducedMotion.matches) draw(0);
-      else if (!document.hidden) frame = requestAnimationFrame(animate);
+      else if (activeRef.current && !document.hidden)
+        frame = requestAnimationFrame(animate);
     };
+    syncMotionRef.current = syncMotion;
     const observer = new ResizeObserver(resize);
     observer.observe(surface);
     reducedMotion.addEventListener("change", syncMotion);
@@ -194,6 +211,7 @@ export const GalaxyBackdrop = memo(function GalaxyBackdrop() {
     resize();
     syncMotion();
     return () => {
+      syncMotionRef.current = null;
       cancelAnimationFrame(frame);
       observer.disconnect();
       reducedMotion.removeEventListener("change", syncMotion);
