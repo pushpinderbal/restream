@@ -33,10 +33,35 @@ export type Status = {
   configured: boolean;
   refreshing: boolean;
   catalogUpdatedAt?: string;
+  catalogRefreshCompletedAt?: string;
   epgUpdatedAt?: string;
   error?: string;
   activeStreams: number;
   maxStreams: number;
+  sync?: { catalog: RefreshState; epg: RefreshState };
+  portalCooldownUntil?: string;
+  timezone?: string;
+  guideHours?: number;
+  library?: {
+    liveChannels: number;
+    categories: number;
+    cachedMovies: number;
+    cachedSeries: number;
+    programmes: number;
+    guideStartsAt?: string;
+    guideEndsAt?: string;
+  };
+  playback?: { transcodeMode: string; sessionTimeoutSeconds: number };
+};
+export type RefreshState = {
+  queued: boolean;
+  running: boolean;
+  startedAt?: string;
+  finishedAt?: string;
+  nextRefreshAt?: string;
+  lastSuccessfulAt?: string;
+  intervalSeconds: number;
+  error?: string;
 };
 export type Session = {
   id: string;

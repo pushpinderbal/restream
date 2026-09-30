@@ -3,10 +3,17 @@ bun = "1.4.0"
 go = "1.27"
 node = "26.8.1"
 
-[tasks.frontend]
-description = "Build the frontend"
-dir = "web"
-run = ["bun install --frozen-lockfile", "bun run build"]
+[tasks.dev]
+description = "Run the Docker development stack with UI hot reload and backend rebuilds"
+run = "docker compose -f compose.dev.yaml up --build --watch"
+
+[tasks."dev:down"]
+description = "Stop the Docker development stack"
+run = "docker compose -f compose.dev.yaml down"
+
+[tasks."dev:logs"]
+description = "Follow development container logs"
+run = "docker compose -f compose.dev.yaml logs -f"
 
 [tasks.build]
 description = "Build the Docker image"
