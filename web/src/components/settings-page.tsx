@@ -143,7 +143,7 @@ export function SettingsPage({
                 target: "catalog" as const,
                 title: "Library metadata",
                 description:
-                  "Live channels and categories. Movie and series lists are fetched as you browse.",
+                  "Update live channels and categories, and check movie, series, and episode lists for changes.",
                 icon: Database,
               },
               {

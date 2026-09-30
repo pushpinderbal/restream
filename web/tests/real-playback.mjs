@@ -85,6 +85,29 @@ try {
     `Decoded HLS ${decoded.width}x${decoded.height}; first progressing frame in ${Date.now() - started}ms`,
   );
 
+  const persistentVideo = await page.locator("video").elementHandle();
+  for (const section of ["Series", "Live TV", "Movies"]) {
+    await page
+      .getByRole("navigation", { name: "Library" })
+      .getByRole("button", { name: section, exact: true })
+      .click();
+    const state = await page.evaluate(videoState);
+    if (
+      !(await persistentVideo.evaluate(
+        (element) => element === document.querySelector("video"),
+      )) ||
+      state.src !== decoded.src ||
+      state.paused ||
+      !state.width ||
+      seekCount !== 0
+    )
+      throw new Error(
+        `Switching to ${section} interrupted the decoding player`,
+      );
+  }
+  await page.getByRole("button", { name: "Open Test movie" }).click();
+  console.log("Library tabs preserve the same decoding player and HLS source");
+
   const area = page.locator(".playback-area");
   const controls = page.locator(".video-controls");
   await page.mouse.move(1, 1);
@@ -180,6 +203,19 @@ try {
   const timeBeforeSettings = (await page.evaluate(videoState)).time;
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("heading", { name: "Settings", exact: true }).waitFor();
+  const beforeRefresh = await (
+    await page.request.get(`${baseURL}/api/status`)
+  ).json();
+  const libraryRefreshed = page.waitForResponse(async (response) => {
+    if (!response.url().endsWith("/api/status")) return false;
+    const status = await response.json();
+    return (
+      status.libraryUpdatedAt !== beforeRefresh.libraryUpdatedAt &&
+      !status.refreshing
+    );
+  });
+  await page.getByRole("button", { name: "Refresh library" }).click();
+  await libraryRefreshed;
   await page.getByRole("button", { name: "Refresh guide" }).click();
   await page.waitForFunction(
     (previous) => {
@@ -193,10 +229,14 @@ try {
     !(await playingVideo.evaluate((element) => element.isConnected)) ||
     (await page.evaluate(videoState)).src !== sourceBeforeSearch
   )
-    throw new Error("Settings or background guide refresh restarted playback");
+    throw new Error(
+      "Settings or background library/guide refresh restarted playback",
+    );
   await page.getByRole("button", { name: "Movies", exact: true }).click();
   await area.waitFor({ state: "visible" });
-  console.log("Settings and guide refresh preserve the same decoding player");
+  console.log(
+    "Settings, library refresh, and guide refresh preserve the same decoding player",
+  );
   await page
     .locator(".header-search")
     .getByRole("searchbox")

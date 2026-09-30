@@ -74,7 +74,7 @@ export function BeamSearch({
             if (event.key === "Enter") onSubmit?.(currentValue);
             if (event.key === "Escape") update("");
           }}
-          className="min-w-0 flex-1 bg-transparent text-[13px] text-neutral-100 outline-hidden placeholder:text-neutral-500 [&::-webkit-search-cancel-button]:hidden"
+          className="min-w-0 flex-1 bg-transparent text-[13px] text-neutral-100 outline-none placeholder:text-neutral-500 [&::-webkit-search-cancel-button]:hidden"
         />
         {currentValue ? (
           <button

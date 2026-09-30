@@ -17,6 +17,7 @@ type Config struct {
 	PortalURL, MAC, Timezone, UserAgent, SerialNumber, DeviceID, DeviceID2 string
 	MaxStreams                                                             int
 	SessionTTL, CatalogRefresh, EPGRefresh, RequestInterval                time.Duration
+	EpisodeCacheTTL                                                        time.Duration
 	FFmpegPath, FFprobePath, TranscodeMode                                 string
 }
 
@@ -57,6 +58,7 @@ func LoadConfig() (Config, error) {
 	}{
 		{"SESSION_TTL", "45s", &c.SessionTTL, 30 * time.Second},
 		{"CATALOG_REFRESH_INTERVAL", "24h", &c.CatalogRefresh, time.Minute},
+		{"EPISODE_CACHE_TTL", "1h", &c.EpisodeCacheTTL, time.Minute},
 		{"EPG_REFRESH_INTERVAL", "6h", &c.EPGRefresh, time.Minute},
 	} {
 		*setting.target, err = time.ParseDuration(env(setting.name, setting.fallback))
