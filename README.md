@@ -27,7 +27,7 @@ Compose pulls `ghcr.io/pushpinderbal/restream:latest`. Open `http://localhost:80
 
 Choose Live TV, Movies, or Series, browse or search, then open a title and press **Play**.
 
-Open **Settings** to check library and programme guide sync states, last successful and upcoming refreshes, guide coverage, and stream usage. Use the refresh icon beside each sync state to start a background refresh without interrupting playback. The icon spins and its state changes to **Syncing** while the refresh runs. Library refresh updates live channels and categories; movie and series pages continue to refresh as you browse. Refreshes respect provider cooldowns. Intervals and playback limits are configured in `.env`.
+Open **Settings** to check library and programme guide sync states, last successful and upcoming refreshes, guide coverage, and stream usage. Use the refresh icon beside each sync state to start a background refresh without interrupting playback. The icon spins and its state changes to **Syncing** while the refresh runs. A successful library refresh updates live channels and categories and expires cached movie, series, and episode lists. Open lists reload automatically; other lists fetch fresh data when next visited. Refreshes respect provider cooldowns. Intervals and playback limits are configured in `.env`.
 
 To update the published app:
 
@@ -65,7 +65,7 @@ To work on the UI using a locally installed Bun instead, keep a backend running 
 
 ## How it works
 
-Restream caches live channels, guide data, categories, and requested movie and series pages in SQLite under `/data`. It fetches movie and series pages as people browse; it does not download the full catalog at startup. Episode lists are shared after the first visit. Keep the `/data` volume to retain the cache across restarts.
+Restream caches live channels, guide data, categories, and requested movie and series pages in SQLite under `/data`. It fetches movie and series pages as people browse; it does not download the full catalog at startup. Movie and series pages expire after `CATALOG_REFRESH_INTERVAL` (default `24h`). Episode lists are shared after the first visit and expire independently after `EPISODE_CACHE_TTL` (default `1h`); reopening a series after expiry checks for new episodes. Successful manual and scheduled library refreshes expire these lists immediately while retaining title records used by active playback. Keep the `/data` volume to retain the cache across restarts.
 
 Each viewer uses a separate upstream stream. `MAX_STREAMS` (default: `1`) limits simultaneous players, including paused players; when all slots are in use, the browser shows a warning. Set the limit within your provider's allowance.
 

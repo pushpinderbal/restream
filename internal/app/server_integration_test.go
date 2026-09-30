@@ -86,9 +86,9 @@ func (p *fixtureProvider) Browse(ctx context.Context, q model.BrowseQuery) (mode
 			return model.BrowsePage{}, ctx.Err()
 		}
 	}
-	item := model.Item{ID: "movie:2", Kind: "movie", Name: "Film", Category: q.Category, Command: "secret-film", ProviderID: "2", Logo: "http://provider.invalid/private-poster"}
+	item := model.Item{ID: "movie:2", Kind: "movie", Name: "Film", CategoryID: "8", Category: q.Category, Command: "secret-film", ProviderID: "2", Logo: "http://provider.invalid/private-poster"}
 	if q.Kind == "series" {
-		item = model.Item{ID: "series:2", Kind: "series", Name: "A series", Category: q.Category, ProviderID: "2", Logo: "http://provider.invalid/private-poster"}
+		item = model.Item{ID: "series:2", Kind: "series", Name: "A series", CategoryID: "7", Category: q.Category, ProviderID: "2", Logo: "http://provider.invalid/private-poster"}
 	}
 	return model.BrowsePage{Items: []model.Item{item}, Page: q.Page, Total: 1, HasMore: false}, nil
 }
@@ -146,6 +146,20 @@ func TestPassiveBrowseSharedAndPersistent(t *testing.T) {
 		t.Fatal("cache miss")
 	}
 	p.mu.Unlock()
+	for _, tc := range []struct{ kind, id, categoryID, category string }{
+		{"movie", "movie:2", "8", "Films"},
+		{"series", "series:2", "7", "Drama"},
+	} {
+		status, body := request(t, ts.URL, "GET", "/api/browse?kind="+tc.kind+"&category=*&search=title&page=1", "")
+		var page model.BrowsePage
+		if err := json.Unmarshal([]byte(body), &page); err != nil || status != 200 || len(page.Items) != 1 || page.Items[0].CategoryID != tc.categoryID || page.Items[0].Category != tc.category {
+			t.Fatalf("search lost category: status=%d body=%s err=%v", status, body, err)
+		}
+		_, detail := request(t, ts.URL, "GET", "/api/items/"+tc.id, "")
+		if !strings.Contains(detail, `"categoryId":"`+tc.categoryID+`"`) || !strings.Contains(detail, `"category":"`+tc.category+`"`) {
+			t.Fatal("detail lost search category", detail)
+		}
+	}
 	status, body := request(t, ts.URL, "GET", "/api/series/series:2/episodes", "")
 	if status != 200 || !strings.Contains(body, "Pilot") {
 		t.Fatal(status, body)
@@ -158,7 +172,7 @@ func TestPassiveBrowseSharedAndPersistent(t *testing.T) {
 	}
 	defer reopened.close()
 	page, ok, err := reopened.browse(model.BrowseQuery{Kind: "series", Category: "7", Search: "pilot", Page: 1, SourceType: "vod"}, time.Hour)
-	if err != nil || !ok || len(page.Items) != 1 || page.Items[0].Logo == "" {
+	if err != nil || !ok || len(page.Items) != 1 || page.Items[0].Logo == "" || page.Items[0].CategoryID != "7" || page.Items[0].Category != "Drama" {
 		t.Fatal("browse page not restored", err)
 	}
 	if len(reopened.categories) != 2 || reopened.categories[0].SourceType == "" {

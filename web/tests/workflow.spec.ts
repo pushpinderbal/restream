@@ -65,6 +65,9 @@ const programs = [
 ];
 
 async function collapseTitle(page: Page) {
+  await page.evaluate(async () => {
+    if (document.fullscreenElement) await document.exitFullscreen();
+  });
   const selectedTile = page
     .locator('.media-card[aria-expanded="true"]')
     .first();
@@ -109,7 +112,9 @@ async function mockApi(
     createDelayMs?: number;
     releaseDelayMs?: number;
     episodesFailureOnce?: boolean;
+    episodeItems?: () => Record<string, unknown>[];
     catalogItems?: Record<string, unknown>[];
+    categories?: { id: string; name: string; kind: string }[];
     guidePrograms?: Array<(typeof programs)[number] & { description?: string }>;
     browseResponse?: (params: URLSearchParams) => Promise<{
       items?: Record<string, unknown>[];
@@ -149,6 +154,7 @@ async function mockApi(
         refreshing:
           options.refreshing || refreshRunning.catalog || refreshRunning.epg,
         catalogUpdatedAt: catalogReady ? refreshUpdated.catalog : undefined,
+        libraryUpdatedAt: catalogReady ? refreshUpdated.catalog : undefined,
         epgUpdatedAt: refreshUpdated.epg,
         activeStreams: active ? 1 : 0,
         maxStreams: 1,
@@ -195,7 +201,7 @@ async function mockApi(
       });
     if (path === "/api/categories")
       return json({
-        categories: [
+        categories: options.categories ?? [
           { id: "news", name: "News", kind: "live" },
           { id: "drama-movie", name: "Drama", kind: "movie" },
           { id: "drama-series", name: "Drama", kind: "series" },
@@ -216,6 +222,7 @@ async function mockApi(
         (item) =>
           item.kind === kind &&
           (category === "*" ||
+            (options.categories && item.categoryId === category) ||
             (kind === "movie"
               ? category === "drama-movie"
               : category === "drama-series")) &&
@@ -262,7 +269,7 @@ async function mockApi(
       events.push("EPISODES");
       if (options.episodesFailureOnce && episodeAttempts <= 2)
         return json({ error: "Episodes are temporarily unavailable" }, 503);
-      return json({ items: episodes });
+      return json({ items: options.episodeItems?.() ?? episodes });
     }
     if (path === "/api/sessions" && method === "POST") {
       events.push("POST");
@@ -343,6 +350,683 @@ async function mockApi(
     },
   };
 }
+
+// Exercise the real player UI with a controlled media window, including native
+// HLS's seekable fallback. Existing real-playback checks cover HLS decoding.
+async function playableVideo(page: Page, position = 30, edge = 100) {
+  await page.locator("video").evaluate(
+    (element, { position, edge }) => {
+      const video = element as HTMLVideoElement;
+      let paused = false;
+      let currentTime = position;
+      Object.defineProperties(video, {
+        paused: { configurable: true, get: () => paused },
+        currentTime: {
+          configurable: true,
+          get: () => currentTime,
+          set: (value: number) => {
+            currentTime = value;
+            video.dispatchEvent(new Event("timeupdate"));
+          },
+        },
+        seekable: {
+          configurable: true,
+          get: () => ({ length: 1, start: () => 0, end: () => edge }),
+        },
+        play: {
+          configurable: true,
+          value: async () => {
+            paused = false;
+            video.dispatchEvent(new Event("play"));
+            video.dispatchEvent(new Event("playing"));
+          },
+        },
+        pause: {
+          configurable: true,
+          value: () => {
+            paused = true;
+            video.dispatchEvent(new Event("pause"));
+          },
+        },
+      });
+      video.dispatchEvent(new Event("play"));
+      video.dispatchEvent(new Event("playing"));
+      video.dispatchEvent(new Event("timeupdate"));
+    },
+    { position, edge },
+  );
+}
+
+test("LIVE greys behind the stream and jumps to the latest seek point while resuming", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open North News" }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await expect(
+    page
+      .getByRole("button", { name: "Pause", exact: true })
+      .or(page.locator(".primary-control")),
+  ).toBeEnabled();
+  await playableVideo(page);
+  const liveButton = page.getByRole("button", { name: "Go to live" });
+  await expect(liveButton).toHaveAttribute("data-behind", "true");
+  await expect(liveButton).toHaveCSS("color", "rgb(146, 152, 165)");
+  await page.getByRole("button", { name: "Pause", exact: true }).click();
+  await liveButton.click();
+  await expect
+    .poll(() =>
+      page.locator("video").evaluate((video) => ({
+        time: (video as HTMLVideoElement).currentTime,
+        paused: (video as HTMLVideoElement).paused,
+      })),
+    )
+    .toEqual({ time: 99.5, paused: false });
+  await expect(liveButton).toHaveAttribute("data-behind", "false");
+  await expect(liveButton).toHaveCSS("color", "rgb(255, 114, 124)");
+  await page.locator("video").evaluate((video) => {
+    (video as HTMLVideoElement).currentTime = 90;
+  });
+  await expect(liveButton).toHaveAttribute("data-behind", "false");
+  await page.locator("video").evaluate((video) => {
+    Object.defineProperty(video, "seekable", {
+      configurable: true,
+      get: () => ({ length: 1, start: () => 10, end: () => 130 }),
+    });
+    video.dispatchEvent(new Event("progress"));
+  });
+  await expect(liveButton).toHaveAttribute("data-behind", "true");
+  await liveButton.click();
+  await expect
+    .poll(() =>
+      page
+        .locator("video")
+        .evaluate((video) => (video as HTMLVideoElement).currentTime),
+    )
+    .toBe(129.5);
+  await page.locator("video").click();
+  expect(
+    await page
+      .locator("video")
+      .evaluate((video) => (video as HTMLVideoElement).paused),
+  ).toBe(true);
+  await page.locator("video").click();
+  expect(
+    await page
+      .locator("video")
+      .evaluate((video) => (video as HTMLVideoElement).paused),
+  ).toBe(false);
+  expect(api.sessionItemIds).toEqual([live.id]);
+  expect(api.events).not.toContain("DELETE");
+});
+
+for (const viewport of [
+  { width: 1440, height: 900 },
+  { width: 390, height: 844 },
+]) {
+  test(`playback survives library tabs and title browsing at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    const api = await mockApi(page);
+    await page.setViewportSize(viewport);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Open North News" }).click();
+    await page.getByRole("button", { name: "Play", exact: true }).click();
+    await expect(page.locator(".primary-control")).toBeEnabled();
+    await playableVideo(page);
+    await page.locator("video").evaluate((video) => {
+      (video as HTMLVideoElement).muted = true;
+    });
+    const originalVideo = await page.locator("video").elementHandle();
+    const navigation = page.getByRole("navigation", {
+      name: viewport.width <= 820 ? "Primary navigation" : "Library",
+    });
+    const checkPlayback = async () => {
+      await expect(page.locator("video")).toHaveCount(1);
+      expect(
+        await originalVideo!.evaluate(
+          (element) => element === document.querySelector("video"),
+        ),
+      ).toBe(true);
+      expect(
+        await originalVideo!.evaluate((element) => {
+          const video = element as HTMLVideoElement;
+          return {
+            paused: video.paused,
+            muted: video.muted,
+            time: video.currentTime,
+          };
+        }),
+      ).toEqual({ paused: false, muted: true, time: 30 });
+      await expect(page.locator(".dock-title")).toHaveText(live.name);
+      expect(api.sessionItemIds).toEqual([live.id]);
+      expect(api.events).not.toContain("DELETE");
+    };
+
+    await navigation
+      .getByRole("button", { name: "Series", exact: true })
+      .click();
+    await page.getByRole("button", { name: "Open Night Shift" }).click();
+    await expect(
+      page.getByRole("button", { name: /After Hours/ }),
+    ).toBeVisible();
+    await checkPlayback();
+    await navigation
+      .getByRole("button", { name: "Movies", exact: true })
+      .click();
+    await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+    await checkPlayback();
+    await navigation
+      .getByRole("button", { name: "Live TV", exact: true })
+      .click();
+    await checkPlayback();
+
+    const search = page.locator(".header-search").getByRole("searchbox");
+    await search.click();
+    await expect(search).toBeFocused();
+    await expect(search).toHaveCSS("outline-style", "none");
+    await search.fill("North");
+    await checkPlayback();
+    await search.press("Escape");
+    await expect(search).toHaveValue("");
+    await expect(page.locator(".header-status")).toHaveCount(0);
+
+    await navigation
+      .getByRole("button", { name: "Movies", exact: true })
+      .click();
+    await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+    await page
+      .getByRole("region", { name: "Expanded title" })
+      .getByRole("button", { name: "Play", exact: true })
+      .click();
+    await expect.poll(() => api.sessionItemIds).toEqual([live.id, movie.id]);
+    await expect
+      .poll(() =>
+        api.events.filter((event) => event === "POST" || event === "DELETE"),
+      )
+      .toEqual(["POST", "DELETE", "POST"]);
+    expect(
+      await originalVideo!.evaluate((element) => element.isConnected),
+    ).toBe(false);
+    await expect(page.locator(".dock-title")).toHaveText(movie.name);
+    await page.getByRole("button", { name: "Stop playback" }).click();
+    await expect(page.getByRole("region", { name: "Player" })).toHaveCount(0);
+    await expect
+      .poll(() => api.events.filter((event) => event === "DELETE").length)
+      .toBe(2);
+  });
+}
+
+for (const viewport of [
+  { width: 1440, height: 900 },
+  { width: 390, height: 844 },
+]) {
+  test(`searched channel breadcrumbs navigate its category without interrupting playback at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    const api = await mockApi(page);
+    await page.setViewportSize(viewport);
+    await page.goto("/?search=North");
+    await page.getByRole("button", { name: "Open North News" }).click();
+    await page.getByRole("button", { name: "Play", exact: true }).click();
+    await expect(page.locator(".primary-control")).toBeEnabled();
+    await playableVideo(page);
+    const original = await page.locator("video").elementHandle();
+    const breadcrumbs = page.getByRole("navigation", {
+      name: "Playback breadcrumbs",
+    });
+    await breadcrumbs.getByRole("link", { name: "News", exact: true }).click();
+    await expect(page).toHaveURL(/category=news/);
+    await expect(page.locator(".header-search input")).toHaveValue("");
+    await expect(
+      page.getByRole("region", { name: "Expanded title" }),
+    ).toHaveCount(0);
+    await page
+      .locator(".dock-title")
+      .getByRole("link", { name: live.name })
+      .click();
+    await expect(
+      page.getByRole("region", { name: "Expanded title" }),
+    ).toBeVisible();
+    await breadcrumbs
+      .getByRole("link", { name: "Live TV", exact: true })
+      .click();
+    expect(new URL(page.url()).searchParams.has("category")).toBe(false);
+    expect(
+      await original!.evaluate(
+        (element) =>
+          element === document.querySelector("video") &&
+          !(element as HTMLVideoElement).paused,
+      ),
+    ).toBe(true);
+    expect(api.sessionItemIds).toEqual([live.id]);
+    expect(api.events).not.toContain("DELETE");
+  });
+
+  test(`series breadcrumbs restore the playing season across library tabs at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    const api = await mockApi(page);
+    await page.setViewportSize(viewport);
+    await page.goto("/?section=series&search=Night");
+    await page.getByRole("button", { name: "Open Night Shift" }).click();
+    await page.getByRole("combobox", { name: "Season" }).click();
+    await page.getByRole("option", { name: "Season 2" }).click();
+    await page
+      .getByRole("button", { name: "Play episode", exact: true })
+      .click();
+    await expect(page.locator(".primary-control")).toBeEnabled();
+    await playableVideo(page);
+    const original = await page.locator("video").elementHandle();
+    const navigation = page.getByRole("navigation", {
+      name: viewport.width <= 820 ? "Primary navigation" : "Library",
+    });
+    await navigation
+      .getByRole("button", { name: "Movies", exact: true })
+      .click();
+    const breadcrumbs = page.getByRole("navigation", {
+      name: "Playback breadcrumbs",
+    });
+    await breadcrumbs
+      .getByRole("link", { name: "Season 2", exact: true })
+      .click();
+    await expect(page).toHaveURL(/section=series/);
+    await expect(page).toHaveURL(/category=drama-series/);
+    await expect(page).toHaveURL(/season=2/);
+    await expect(page.getByRole("combobox", { name: "Season" })).toHaveText(
+      "Season 2",
+    );
+    await expect(
+      page.getByText("Selected · S2 E1 · Fresh Start"),
+    ).toBeVisible();
+    await expect(page.locator(".episode-row.selected")).toContainText(
+      "Fresh Start",
+    );
+    await page.getByRole("combobox", { name: "Season" }).click();
+    await page.getByRole("option", { name: "Season 1" }).click();
+    await breadcrumbs
+      .getByRole("link", { name: "Season 2", exact: true })
+      .click();
+    await expect(page.getByRole("combobox", { name: "Season" })).toHaveText(
+      "Season 2",
+    );
+    await breadcrumbs.getByRole("link", { name: "Drama", exact: true }).click();
+    await expect(
+      page.getByRole("region", { name: "Expanded title" }),
+    ).toHaveCount(0);
+    await expect(page.locator(".header-search input")).toHaveValue("");
+    await breadcrumbs
+      .getByRole("link", { name: series.name, exact: true })
+      .click();
+    await expect(page.getByRole("combobox", { name: "Season" })).toHaveText(
+      "Season 2",
+    );
+    expect(
+      await original!.evaluate(
+        (element) =>
+          element === document.querySelector("video") &&
+          !(element as HTMLVideoElement).paused,
+      ),
+    ).toBe(true);
+    expect(api.sessionItemIds).toEqual(["episode-3"]);
+    expect(api.events).not.toContain("DELETE");
+    // The breadcrumb destination also opens correctly as a direct link.
+    await page.reload();
+    await expect(page.getByRole("combobox", { name: "Season" })).toHaveText(
+      "Season 2",
+    );
+    await expect(
+      page.getByText("Selected · S2 E1 · Fresh Start"),
+    ).toBeVisible();
+  });
+}
+
+for (const reducedMotion of ["no-preference", "reduce"] as const) {
+  test(`closing the player stops playback promptly and respects ${reducedMotion} motion`, async ({
+    page,
+  }) => {
+    const api = await mockApi(page);
+    await page.emulateMedia({ reducedMotion });
+    await page.goto("/?section=movie");
+    await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+    await page.getByRole("button", { name: "Play", exact: true }).click();
+    await expect(page.locator(".primary-control")).toBeEnabled();
+    await playableVideo(page);
+    await expect(page.locator(".watch-section")).toBeVisible();
+    const framesPromise = page.evaluate(async () => {
+      const player = document.querySelector<HTMLElement>(".watch-section")!;
+      const video = player.querySelector("video")!;
+      await new Promise<void>((resolve) => {
+        player
+          .querySelector<HTMLButtonElement>(".dock-stop")!
+          .addEventListener("click", () => resolve(), { once: true });
+      });
+      const initialHeight = player.getBoundingClientRect().height;
+      const frames: {
+        height: number;
+        opacity: number;
+        paused: boolean;
+        closing: boolean;
+      }[] = [];
+      const deadline = performance.now() + 2000;
+      while (player.isConnected && performance.now() < deadline) {
+        await new Promise(requestAnimationFrame);
+        frames.push({
+          height: player.getBoundingClientRect().height / initialHeight,
+          opacity: Number(getComputedStyle(player).opacity),
+          paused: video.paused,
+          closing: player.dataset.closing === "true",
+        });
+      }
+      return frames;
+    });
+    await page.getByRole("button", { name: "Stop playback" }).click();
+    const frames = await framesPromise;
+    const closing = frames.filter((frame) => frame.closing);
+    expect(closing.every((frame) => frame.paused)).toBe(true);
+    if (reducedMotion === "no-preference") {
+      expect(
+        closing.some(
+          (frame) =>
+            frame.height > 0 &&
+            frame.height < 0.95 &&
+            frame.opacity > 0 &&
+            frame.opacity < 1,
+        ),
+        JSON.stringify(frames),
+      ).toBe(true);
+    }
+    await expect(page.locator(".watch-section")).toHaveCount(0);
+    await expect
+      .poll(() => api.events.filter((event) => event === "DELETE").length)
+      .toBe(1);
+    await expect
+      .poll(() =>
+        page
+          .locator(".player-dock")
+          .evaluate((element) => element.getBoundingClientRect().height),
+      )
+      .toBe(0);
+  });
+}
+
+for (const item of [live, movie, series]) {
+  test(`searched ${item.kind} uses the portal category ID in playback breadcrumbs`, async ({
+    page,
+  }) => {
+    const categoryName =
+      item.kind === "series"
+        ? "English TV Shows"
+        : item.kind === "movie"
+          ? "English Movies"
+          : "English Channels";
+    const categoryId = `english-${item.kind}`;
+    const searchedItem = { ...item, category: "", categoryId };
+    const api = await mockApi(page, {
+      catalogItems: [searchedItem],
+      categories: [{ id: categoryId, name: categoryName, kind: item.kind }],
+    });
+    await page.goto(
+      `/?section=${item.kind}&search=${encodeURIComponent(item.name)}`,
+    );
+    await page.getByRole("button", { name: `Open ${item.name}` }).click();
+    await page
+      .getByRole("button", {
+        name: item.kind === "series" ? "Play episode" : "Play",
+        exact: true,
+      })
+      .click();
+    await expect(page.locator(".primary-control")).toBeEnabled();
+    await playableVideo(page);
+    const video = await page.locator("video").elementHandle();
+    await page
+      .getByRole("navigation", { name: "Library" })
+      .getByRole("button", {
+        name: item.kind === "movie" ? "Series" : "Movies",
+        exact: true,
+      })
+      .click();
+    const categoryLink = page
+      .getByRole("navigation", { name: "Playback breadcrumbs" })
+      .getByRole("link", { name: categoryName, exact: true });
+    await expect(categoryLink).toHaveAttribute(
+      "href",
+      new RegExp(`category=${categoryId}`),
+    );
+    await categoryLink.click();
+    await expect(page).toHaveURL(new RegExp(`category=${categoryId}`));
+    await expect(
+      page.getByRole("button", { name: `Open ${item.name}` }),
+    ).toBeVisible();
+    expect(
+      await video!.evaluate(
+        (element) =>
+          element === document.querySelector("video") &&
+          !(element as HTMLVideoElement).paused,
+      ),
+    ).toBe(true);
+    expect(api.sessionItemIds).toHaveLength(1);
+    expect(api.events).not.toContain("DELETE");
+  });
+}
+
+for (const viewport of [
+  { width: 1440, height: 900 },
+  { width: 390, height: 844 },
+]) {
+  test(`episode lists form compact responsive columns at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    await mockApi(page);
+    await page.setViewportSize(viewport);
+    await page.goto("/?section=series");
+    await page.getByRole("button", { name: "Open Night Shift" }).click();
+    const rows = page.locator(".episode-row");
+    await expect(rows).toHaveCount(2);
+    await expect(rows.first()).toBeVisible();
+    const first = await rows.nth(0).boundingBox();
+    const second = await rows.nth(1).boundingBox();
+    expect(first!.width).toBeLessThanOrEqual(341);
+    if (viewport.width > 820) {
+      expect(Math.abs(first!.y - second!.y)).toBeLessThan(2);
+      expect(second!.x).toBeGreaterThan(first!.x);
+    } else {
+      expect(second!.y).toBeGreaterThan(first!.y);
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth),
+      ).toBeLessThanOrEqual(viewport.width);
+    }
+    if (process.env.CAPTURE_SCREENSHOTS) {
+      await expect(page.locator(".inline-expansion")).toHaveAttribute(
+        "style",
+        /height: auto/,
+      );
+      await page.screenshot({
+        path: `/tmp/restream-episodes-${viewport.width}.png`,
+        fullPage: true,
+      });
+    }
+  });
+
+  test(`play and pause flash a fading feedback icon without caption state at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    const api = await mockApi(page);
+    await page.setViewportSize(viewport);
+    await page.goto("/?section=movie");
+    await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+    await page.getByRole("button", { name: "Play", exact: true }).click();
+    await expect(page.locator(".primary-control")).toBeEnabled();
+    await playableVideo(page);
+    await expect(page.locator(".dock-caption")).not.toContainText(
+      /Now playing|Connecting|Paused|Finished/,
+    );
+    await expect(page.locator(".playback-feedback")).toHaveCount(0);
+    await page.locator(".primary-control").click();
+    await expect(
+      page.locator('.playback-feedback[data-action="pause"]'),
+    ).toHaveCount(1);
+    await expect
+      .poll(() =>
+        page
+          .locator("video")
+          .evaluate((element) => (element as HTMLVideoElement).paused),
+      )
+      .toBe(true);
+    await expect(page.locator(".playback-feedback")).toHaveCSS(
+      "pointer-events",
+      "none",
+    );
+    await expect(page.locator(".playback-feedback")).toHaveCount(0);
+    await page.locator(".primary-control").click();
+    await expect(
+      page.locator('.playback-feedback[data-action="play"]'),
+    ).toHaveCount(1);
+    await expect
+      .poll(() =>
+        page
+          .locator("video")
+          .evaluate((element) => (element as HTMLVideoElement).paused),
+      )
+      .toBe(false);
+    await expect(page.locator(".playback-feedback")).toHaveCount(0);
+    if (viewport.width > 820) {
+      await page.locator("video").click();
+      await expect(
+        page.locator('.playback-feedback[data-action="pause"]'),
+      ).toHaveCount(1);
+      await page
+        .getByRole("region", { name: "Player" })
+        .getByRole("button", { name: "Full screen" })
+        .click();
+      await page.locator(".playback-area").focus();
+      await page.keyboard.press("k");
+      await expect(
+        page.locator('.playback-feedback[data-action="play"]'),
+      ).toHaveCount(1);
+      await page.evaluate(() => document.exitFullscreen());
+    }
+    expect(api.sessionItemIds).toEqual([movie.id]);
+    expect(api.events).not.toContain("DELETE");
+  });
+}
+
+test("player stays pinned while browsing and resizing without replacing its video", async ({
+  page,
+}) => {
+  const api = await mockApi(page, {
+    catalogItems: Array.from({ length: 60 }, (_, i) => ({
+      ...movie,
+      id: i ? `pinned-${i}` : movie.id,
+      name: i ? `Pinned film ${i}` : movie.name,
+    })),
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/?section=movie");
+  await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  const video = await page.locator("video").elementHandle();
+  const player = page.getByRole("region", { name: "Player" });
+  await expect(player).toBeVisible();
+  await expect(player.getByRole("heading", { name: movie.name })).toBeVisible();
+  await expect(
+    player.getByRole("button", { name: "Stop playback" }),
+  ).toHaveText("");
+  for (const viewport of [
+    { width: 1440, height: 900 },
+    { width: 390, height: 844 },
+    { width: 844, height: 390 },
+  ]) {
+    await page.setViewportSize(viewport);
+    const before = await player.boundingBox();
+    await page.evaluate(() =>
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" }),
+    );
+    const after = await player.boundingBox();
+    expect(after!.y).toBeCloseTo(before!.y, 0);
+    expect(after!.y).toBeGreaterThanOrEqual(72);
+    expect(after!.y + after!.height).toBeLessThan(viewport.height - 66);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(viewport.width);
+    expect(await video!.evaluate((element) => element.isConnected)).toBe(true);
+    await page.screenshot({
+      path: `/tmp/restream-player-${viewport.width}.png`,
+    });
+  }
+  expect(api.sessionItemIds).toEqual([movie.id]);
+  await page.getByRole("button", { name: "Stop playback" }).click();
+  await expect(player).toHaveCount(0);
+  await expect.poll(() => api.events.includes("DELETE")).toBe(true);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        getComputedStyle(document.documentElement)
+          .getPropertyValue("--player-dock-height")
+          .trim(),
+      ),
+    )
+    .toBe("0px");
+});
+
+test.describe("touch playback", () => {
+  test.use({ hasTouch: true, viewport: { width: 390, height: 844 } });
+
+  test("fullscreen taps reveal controls without pausing and the pause button still works", async ({
+    page,
+  }) => {
+    await mockApi(page);
+    await page.goto("/?section=movie");
+    await page.getByRole("button", { name: "Open The Quiet Coast" }).tap();
+    await page.getByRole("button", { name: "Play", exact: true }).tap();
+    await expect(page.locator(".primary-control")).toBeEnabled();
+    await playableVideo(page);
+    await page.getByRole("button", { name: "Full screen", exact: true }).tap();
+    await expect
+      .poll(() => page.evaluate(() => !!document.fullscreenElement))
+      .toBe(true);
+    await page
+      .locator(".playback-area")
+      .evaluate((area) => (area as HTMLElement).blur());
+    const controls = page.locator(".video-controls");
+    await expect(controls).toHaveAttribute("data-visible", "false", {
+      timeout: 5000,
+    });
+    await page.locator("video").tap();
+    await expect(controls).toHaveAttribute("data-visible", "true");
+    expect(
+      await page
+        .locator("video")
+        .evaluate((video) => (video as HTMLVideoElement).paused),
+    ).toBe(false);
+    await page.locator("video").tap();
+    expect(
+      await page
+        .locator("video")
+        .evaluate((video) => (video as HTMLVideoElement).paused),
+    ).toBe(false);
+    await page.getByRole("button", { name: "Pause", exact: true }).tap();
+    expect(
+      await page
+        .locator("video")
+        .evaluate((video) => (video as HTMLVideoElement).paused),
+    ).toBe(true);
+    await page.getByRole("button", { name: "Play", exact: true }).tap();
+    expect(
+      await page
+        .locator("video")
+        .evaluate((video) => (video as HTMLVideoElement).paused),
+    ).toBe(false);
+    await page.getByRole("button", { name: "Exit full screen" }).tap();
+    await page.locator("video").tap();
+    expect(
+      await page
+        .locator("video")
+        .evaluate((video) => (video as HTMLVideoElement).paused),
+    ).toBe(false);
+  });
+});
 
 test("server snapshot fills library without a client refresh and filters EPG channels", async ({
   page,
@@ -460,8 +1144,8 @@ test("episode rows start playback directly without a second play action", async 
   await page.getByRole("button", { name: /After Hours/ }).click();
   await expect.poll(() => api.sessionItemIds).toEqual(["episode-2"]);
   await expect(page.getByRole("region", { name: "Player" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Close player" })).toHaveCount(
-    0,
+  await expect(page.getByRole("button", { name: "Stop playback" })).toHaveCount(
+    1,
   );
   await expect(
     page.getByRole("button", { name: "Forward 10 seconds" }),
@@ -522,6 +1206,8 @@ test("opening a title uses history and only Play allocates a stream", async ({
   await expect(
     page.getByRole("button", { name: "Open North News" }),
   ).toBeVisible();
+  expect(api.events).not.toContain("DELETE");
+  await page.getByRole("button", { name: "Stop playback" }).click();
   await expect.poll(() => api.events.includes("DELETE")).toBe(true);
 });
 
@@ -914,50 +1600,27 @@ test("channel details contain the full guide with one animated page background",
   });
   await page.goto("/");
   await expect(page.locator(".card-live-icon")).toHaveCount(1);
-  await expect(page.getByRole("img", { name: /streams in use/ })).toBeVisible();
+  await expect(page.locator(".header-status")).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Programme guide", exact: true }),
   ).toHaveCount(0);
   const backdrop = page.locator(".page-backdrop");
-  const imageDimensions = await page.evaluate(async () => {
-    const image = new Image();
-    image.src = "/galaxy-clusters.webp";
-    await image.decode();
-    return { width: image.naturalWidth, height: image.naturalHeight };
-  });
-  expect(imageDimensions.width).toBeGreaterThan(1500);
-  expect(imageDimensions.height).toBeGreaterThan(800);
-
+  const field = backdrop.locator("canvas.galaxy-field");
+  await expect(field).toBeVisible();
   const readMotion = () =>
-    backdrop.evaluate((element) => {
-      const position = (style: CSSStyleDeclaration) => {
-        const matrix = new DOMMatrixReadOnly(
-          style.transform === "none" ? undefined : style.transform,
-        );
-        return [matrix.m41, matrix.m42];
-      };
-      return {
-        galaxy: position(getComputedStyle(element, "::before")),
-        stars: position(
-          getComputedStyle(element.querySelector(".galaxy-stars-near")!),
-        ),
-      };
+    field.evaluate((element) => {
+      const canvas = element as HTMLCanvasElement;
+      const pixels = canvas
+        .getContext("2d")!
+        .getImageData(0, 0, canvas.width, canvas.height).data;
+      let digest = 0;
+      for (let i = 0; i < pixels.length; i += 8)
+        digest = (digest * 31 + pixels[i]) | 0;
+      return { width: canvas.width, height: canvas.height, digest };
     });
   const movement = await readMotion();
   await page.waitForTimeout(1500);
-  const moved = await readMotion();
-  expect(
-    Math.hypot(
-      moved.galaxy[0] - movement.galaxy[0],
-      moved.galaxy[1] - movement.galaxy[1],
-    ),
-  ).toBeGreaterThan(2);
-  expect(
-    Math.hypot(
-      moved.stars[0] - movement.stars[0],
-      moved.stars[1] - movement.stars[1],
-    ),
-  ).toBeGreaterThan(6);
+  expect(await readMotion()).not.toEqual(movement);
   await page.getByRole("button", { name: "Open North News" }).click();
   const guide = page.getByRole("region", { name: "On this channel" });
   await expect(guide).toContainText("Tomorrow Briefing");
@@ -1167,11 +1830,11 @@ test("channel schedule scrolls without a scrollbar on desktop, mobile and during
     guide.getByText("Later show 12", { exact: true }),
   ).toBeInViewport();
   await schedule.focus();
-  await page.keyboard.press("Home");
+  await schedule.press("Home");
   await expect
     .poll(() => schedule.evaluate((element) => element.scrollTop))
     .toBe(0);
-  await page.keyboard.press("End");
+  await schedule.press("End");
   await expect(
     guide.getByText("Later show 12", { exact: true }),
   ).toBeInViewport();
@@ -1390,15 +2053,105 @@ test("rapid channel changes skip an intermediate tune and wait for a late stream
   ).toHaveCount(0);
 });
 
+test("library refresh discovers new series and episodes while preserving playback and season selection", async ({
+  page,
+}) => {
+  let published = false;
+  const newSeries = { ...series, id: "series-2", name: "Northern Lights" };
+  const newEpisode = {
+    ...episodes[2],
+    id: "episode-4",
+    episode: 2,
+    name: "New Arrival",
+  };
+  const api = await mockApi(page, {
+    refreshDelayMs: 200,
+    browseResponse: async () => ({
+      items: published ? [series, newSeries] : [series],
+      page: 1,
+      hasMore: false,
+    }),
+    episodeItems: () => (published ? [...episodes, newEpisode] : episodes),
+  });
+  await page.goto("/?section=series");
+  await page.getByRole("button", { name: "Open Night Shift" }).click();
+  await page.getByRole("combobox", { name: "Season" }).click();
+  await page.getByRole("option", { name: "Season 2" }).click();
+  await page.getByRole("button", { name: "Play episode", exact: true }).click();
+  await expect(page.locator(".primary-control")).toBeEnabled();
+  await playableVideo(page);
+  const original = await page.locator("video").elementHandle();
+  const episodeLoads = api.events.filter(
+    (event) => event === "EPISODES",
+  ).length;
+  const browseLoads = api.events.filter((event) =>
+    event.startsWith("BROWSE:"),
+  ).length;
+  published = true;
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Refresh library" }).click();
+  await expect
+    .poll(() => api.events.filter((event) => event === "EPISODES").length)
+    .toBeGreaterThan(episodeLoads);
+  await expect
+    .poll(
+      () => api.events.filter((event) => event.startsWith("BROWSE:")).length,
+    )
+    .toBeGreaterThan(browseLoads);
+  await expect(
+    page.getByRole("button", { name: "Refresh library" }),
+  ).toBeEnabled();
+  const refreshedEpisodeLoads = api.events.filter(
+    (event) => event === "EPISODES",
+  ).length;
+  const refreshedBrowseLoads = api.events.filter((event) =>
+    event.startsWith("BROWSE:"),
+  ).length;
+  await page.getByRole("button", { name: "Refresh guide" }).click();
+  await expect(page.getByRole("button", { name: "Refresh guide" })).toBeEnabled(
+    { timeout: 8000 },
+  );
+  expect(api.events.filter((event) => event === "EPISODES")).toHaveLength(
+    refreshedEpisodeLoads,
+  );
+  expect(
+    api.events.filter((event) => event.startsWith("BROWSE:")),
+  ).toHaveLength(refreshedBrowseLoads);
+  await page.goBack();
+  await expect(
+    page.getByRole("button", { name: "Open Northern Lights" }),
+  ).toBeVisible();
+  await expect(
+    page.locator(".episode-row").filter({ hasText: "New Arrival" }),
+  ).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Season" })).toHaveText(
+    "Season 2",
+  );
+  await expect(page.locator(".episode-row.selected")).toContainText(
+    "Fresh Start",
+  );
+  expect(
+    await original!.evaluate(
+      (element) =>
+        element === document.querySelector("video") &&
+        !(element as HTMLVideoElement).paused,
+    ),
+  ).toBe(true);
+  expect(api.sessionItemIds).toEqual([episodes[2].id]);
+  expect(api.events).not.toContain("DELETE");
+});
+
 test("settings shows sync details and refreshes library and guide without interrupting playback", async ({
   page,
 }) => {
-  const api = await mockApi(page, { starting: true, refreshDelayMs: 3000 });
+  const api = await mockApi(page, { refreshDelayMs: 3000 });
   await page.goto("/");
   await page.getByRole("button", { name: "Open North News" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect.poll(() => api.sessionItemIds).toEqual([live.id]);
   const video = page.locator("video");
+  await expect(page.locator(".primary-control")).toBeEnabled();
+  await playableVideo(page);
   await video.evaluate((element) =>
     element.setAttribute("data-settings-marker", "same-player"),
   );

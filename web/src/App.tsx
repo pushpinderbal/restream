@@ -1,21 +1,24 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type MouseEvent,
   type RefObject,
 } from "react";
+import { createPortal } from "react-dom";
 import Hls from "hls.js";
 import {
   AnimatePresence,
   LayoutGroup,
   MotionConfig,
   motion,
+  useIsPresent,
+  useReducedMotion,
 } from "motion/react";
 import {
-  AudioLines,
-  Infinity as InfinityIcon,
   Radio,
   Clapperboard,
   ChevronLeft,
@@ -23,11 +26,14 @@ import {
   Film,
   ListFilter,
   MonitorPlay,
+  Pause,
   Play,
   Settings,
+  Square,
 } from "lucide-react";
 import { SettingsPage, type RefreshTarget } from "./components/settings-page";
 import { PlayerControls } from "./components/player-controls";
+import { GalaxyBackdrop } from "./components/galaxy-backdrop";
 import { Button } from "./components/ui/button";
 import { Skeleton } from "./components/ui/skeleton";
 import { BeamSearch } from "./components/spectrumui/beam-search";
@@ -54,15 +60,31 @@ import {
 } from "./api";
 
 type Tab = "live" | "movie" | "series";
+type PlaybackSelection = { item: Item; title: Item };
+type EpisodeDestination = {
+  titleId: string;
+  season: number;
+  episodeId: string;
+};
+type PlaybackDestination = "library" | "category" | "title" | "season";
 function locationSelection() {
   const params = new URLSearchParams(window.location.search);
   const kind = params.get("section");
+  const season = Number(params.get("season"));
   return {
     tab: (kind === "movie" || kind === "series" ? kind : "live") as Tab,
     category: params.get("category") || "*",
     search: params.get("search") || "",
     item: params.get("item") || "",
     settings: params.get("view") === "settings",
+    episodeDestination:
+      params.get("item") && Number.isInteger(season) && season > 0
+        ? {
+            titleId: params.get("item")!,
+            season,
+            episodeId: params.get("episode") || "",
+          }
+        : null,
   };
 }
 function writeLocation(
@@ -72,6 +94,21 @@ function writeLocation(
   replace = false,
   item = "",
   settings = false,
+  episodeDestination: EpisodeDestination | null = null,
+) {
+  window.history[replace ? "replaceState" : "pushState"](
+    {},
+    "",
+    selectionURL(tab, category, search, item, settings, episodeDestination),
+  );
+}
+function selectionURL(
+  tab: Tab,
+  category: string,
+  search: string,
+  item = "",
+  settings = false,
+  episodeDestination: EpisodeDestination | null = null,
 ) {
   const url = new URL(window.location.href);
   if (settings) url.searchParams.set("view", "settings");
@@ -84,7 +121,14 @@ function writeLocation(
   else url.searchParams.delete("search");
   if (item) url.searchParams.set("item", item);
   else url.searchParams.delete("item");
-  window.history[replace ? "replaceState" : "pushState"]({}, "", url);
+  if (item && episodeDestination) {
+    url.searchParams.set("season", String(episodeDestination.season));
+    url.searchParams.set("episode", episodeDestination.episodeId);
+  } else {
+    url.searchParams.delete("season");
+    url.searchParams.delete("episode");
+  }
+  return url;
 }
 const sections = [
   { id: "live" as Tab, label: "Live TV", icon: MonitorPlay },
@@ -116,7 +160,7 @@ function normalizeSearch(text: string) {
 function BrandMark() {
   return (
     <span className="brand-mark" aria-hidden="true">
-      <InfinityIcon size={34} strokeWidth={1.8} />
+      <img src="/favicon.svg?v=orbit" width={36} height={36} alt="" />
     </span>
   );
 }
@@ -148,7 +192,13 @@ function App() {
   const [selected, setSelected] = useState<Item | null>(null);
   const [selectedId, setSelectedId] = useState(() => locationSelection().item);
   const [detailError, setDetailError] = useState("");
+  const [playbackDetailsId, setPlaybackDetailsId] = useState("");
   const [livePlaybackRequested, setLivePlaybackRequested] = useState(false);
+  const [playback, setPlayback] = useState<PlaybackSelection | null>(null);
+  const [episodeDestination, setEpisodeDestination] =
+    useState<EpisodeDestination | null>(
+      () => locationSelection().episodeDestination,
+    );
   const opener = useRef<HTMLButtonElement | null>(null);
   const playbackTransition = useRef<Promise<void>>(Promise.resolve());
   const expandedArea = useRef<HTMLElement | null>(null);
@@ -156,6 +206,7 @@ function App() {
   const selectionRef = useRef(selectedId);
   selectionRef.current = selectedId;
   const [catalogGrid, setCatalogGrid] = useState<HTMLDivElement | null>(null);
+  const [playerDock, setPlayerDock] = useState<HTMLDivElement | null>(null);
   const [gridColumns, setGridColumns] = useState(1);
   const libraryScroll = useRef(0);
   const categoryRail = useRef<HTMLDivElement | null>(null);
@@ -168,6 +219,23 @@ function App() {
   const [visibleCount, setVisibleCount] = useState(72);
   const [categoryRailOpen, setCategoryRailOpen] = useState(false);
   const [categorySearch, setCategorySearch] = useState("");
+
+  useLayoutEffect(() => {
+    if (!playerDock) return;
+    const measure = () => {
+      document.documentElement.style.setProperty(
+        "--player-dock-height",
+        `${playerDock.getBoundingClientRect().height}px`,
+      );
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(playerDock);
+    measure();
+    return () => {
+      observer.disconnect();
+      document.documentElement.style.removeProperty("--player-dock-height");
+    };
+  }, [playerDock]);
 
   useEffect(() => {
     let alive = true;
@@ -226,8 +294,9 @@ function App() {
       setCategory(next.category);
       setSearch(next.search);
       setDebouncedSearch(next.search);
-      if (selectionRef.current !== next.item) setLivePlaybackRequested(false);
       setSelectedId(next.item);
+      setPlaybackDetailsId("");
+      setEpisodeDestination(next.episodeDestination);
       setSelected((old) => (old?.id === next.item ? old : null));
       window.requestAnimationFrame(() =>
         window.scrollTo({ top: libraryScroll.current }),
@@ -382,6 +451,7 @@ function App() {
     debouncedSearch,
     searchRevision,
     status?.configured,
+    status?.libraryUpdatedAt,
     fetchPage,
   ]);
 
@@ -419,7 +489,9 @@ function App() {
       liveSearchIndex
         .filter(
           ({ item, name }) =>
-            (category === "*" || selectedLiveCategoryName === item.category) &&
+            (category === "*" ||
+              item.categoryId === category ||
+              selectedLiveCategoryName === item.category) &&
             liveTerms.every((token) => name.includes(token)),
         )
         .map(({ item }) => item),
@@ -468,7 +540,8 @@ function App() {
     setVisibleCount(72);
     setSelected(null);
     setSelectedId("");
-    setLivePlaybackRequested(false);
+    setPlaybackDetailsId("");
+    setEpisodeDestination(null);
   };
   const navigateSection = (next: Tab | "settings") => {
     if (next === "settings") {
@@ -508,10 +581,38 @@ function App() {
       .then(setStatus)
       .catch(() => {});
   }, []);
+  const requestPlayback = useCallback(
+    (item: Item, title: Item) => {
+      const knownTitle = [...liveItems, ...browseItems].find(
+        (value) => value.id === title.id,
+      );
+      const categoryID =
+        title.categoryId ||
+        knownTitle?.categoryId ||
+        (tab === title.kind && category !== "*" ? category : "");
+      const titleCategory = categories.find(
+        (value) => value.kind === title.kind && value.id === categoryID,
+      );
+      setPlayback({
+        item,
+        title: {
+          ...title,
+          categoryId: categoryID || undefined,
+          category:
+            titleCategory?.name || title.category || knownTitle?.category || "",
+        },
+      });
+      setLivePlaybackRequested(item.kind === "live");
+    },
+    [liveItems, browseItems, categories, tab, category],
+  );
   const closePlayer = useCallback(() => {
+    if (playback?.title.id === selectedId) {
+      setPlayback(null);
+      setLivePlaybackRequested(false);
+    }
     setSelected(null);
     setSelectedId("");
-    setLivePlaybackRequested(false);
     setDetailError("");
     scrolledExpansion.current = "";
     writeLocation(tab, category, search, true);
@@ -523,7 +624,56 @@ function App() {
         opener.current.scrollIntoView({ block: "nearest", behavior: "smooth" });
       target?.focus({ preventScroll: true });
     });
-  }, [tab, category, search]);
+  }, [tab, category, search, playback?.title.id, selectedId]);
+  const stopPlayback = () => {
+    setPlayback(null);
+    setLivePlaybackRequested(false);
+    if (playback?.title.id === selectedId) closePlayer();
+  };
+  const playbackCategory =
+    playback &&
+    categories.find(
+      (value) =>
+        value.kind === playback.title.kind &&
+        (playback.title.categoryId
+          ? value.id === playback.title.categoryId
+          : normalizeSearch(value.name) ===
+            normalizeSearch(playback.title.category)),
+    );
+  const navigatePlayback = (destination: PlaybackDestination) => {
+    if (!playback) return;
+    const nextTab = playback.title.kind as Tab;
+    const nextCategory =
+      destination === "library" ? "*" : playbackCategory?.id || "*";
+    selectCategory(nextTab, nextCategory);
+    if (destination === "title" || destination === "season") {
+      scrolledExpansion.current = "";
+      setDetailError("");
+      setSelected(playback.title);
+      setSelectedId(playback.title.id);
+      setPlaybackDetailsId(playback.title.id);
+      const episodeTarget =
+        playback.title.kind === "series"
+          ? {
+              titleId: playback.title.id,
+              season: playback.item.season ?? 1,
+              episodeId: playback.item.id,
+            }
+          : null;
+      setEpisodeDestination(episodeTarget);
+      writeLocation(
+        nextTab,
+        nextCategory,
+        "",
+        true,
+        playback.title.id,
+        false,
+        episodeTarget,
+      );
+    } else {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  };
   const sectionCategories = useMemo(
     () => categories.filter((value) => value.kind === tab),
     [categories, tab],
@@ -600,7 +750,11 @@ function App() {
     searchPending.current = false;
     setDetailError("");
     setSelected(item);
+    setPlaybackDetailsId("");
+    setEpisodeDestination(null);
     setSelectedId(item.id);
+    if (item.kind === "live" && livePlaybackRequested)
+      requestPlayback(item, item);
     writeLocation(tab, category, search, false, item.id);
   };
   const selectedIndex = displayedItems.findIndex(
@@ -651,10 +805,15 @@ function App() {
               item={selected}
               programs={epgByChannel.get(selected.id) || []}
               now={now}
-              autoPlay={selected.kind === "live" && livePlaybackRequested}
-              onLivePlaybackChange={onLivePlaybackChange}
-              onSessionChange={updateStatus}
-              transitionRef={playbackTransition}
+              playback={playback}
+              refreshRevision={status?.libraryUpdatedAt}
+              showDetails={playbackDetailsId === selected.id}
+              episodeDestination={
+                episodeDestination?.titleId === selected.id
+                  ? episodeDestination
+                  : null
+              }
+              onPlay={requestPlayback}
             />
           ) : detailError ? (
             <div className="inline-detail-state" role="alert">
@@ -674,10 +833,7 @@ function App() {
   return (
     <MotionConfig reducedMotion="user">
       <div className="app-shell">
-        <div className="page-backdrop" aria-hidden="true">
-          <span className="galaxy-stars galaxy-stars-far" />
-          <span className="galaxy-stars galaxy-stars-near" />
-        </div>
+        <GalaxyBackdrop />
         <a className="skip-link" href="#main-content">
           Skip to content
         </a>
@@ -738,21 +894,24 @@ function App() {
                 }}
               />
             )}
-            <div className="header-status" aria-live="polite">
-              {status?.configured && (
-                <span
-                  className={`stream-activity ${status.activeStreams > 0 || status.refreshing ? "active" : "idle"} ${status.activeStreams >= status.maxStreams ? "at-capacity" : ""}`}
-                  role="img"
-                  tabIndex={0}
-                  aria-label={`${status.activeStreams} of ${status.maxStreams} streams in use${status.refreshing ? "; updating library" : ""}`}
-                  title={`${status.activeStreams} of ${status.maxStreams} streams in use${status.refreshing ? " · Updating library" : ""}`}
-                >
-                  <AudioLines size={27} aria-hidden="true" />
-                </span>
-              )}
-            </div>
           </div>
         </header>
+        <div className="player-dock" ref={setPlayerDock} />
+        <AnimatePresence mode="wait" initial={false}>
+          {playback && (
+            <PlaybackPlayer
+              key={`${playback.item.kind}:${playback.item.id}`}
+              selection={playback}
+              category={playbackCategory || null}
+              onNavigate={navigatePlayback}
+              onLivePlaybackChange={onLivePlaybackChange}
+              onSessionChange={updateStatus}
+              transitionRef={playbackTransition}
+              playerDock={playerDock}
+              onClose={stopPlayback}
+            />
+          )}
+        </AnimatePresence>
         <div className="library-layout">
           <main id="main-content" className="main-content">
             {settingsOpen && (
@@ -1107,35 +1266,22 @@ function PlayerPage({
   item,
   programs,
   now,
-  autoPlay,
-  onLivePlaybackChange,
-  onSessionChange,
-  transitionRef,
+  playback,
+  refreshRevision,
+  showDetails,
+  episodeDestination,
+  onPlay,
 }: {
   item: Item;
   programs: Program[];
   now: number;
-  autoPlay: boolean;
-  onLivePlaybackChange: (active: boolean) => void;
-  onSessionChange: () => void;
-  transitionRef: RefObject<Promise<void>>;
+  playback: PlaybackSelection | null;
+  refreshRevision?: string;
+  showDetails: boolean;
+  episodeDestination: EpisodeDestination | null;
+  onPlay: (item: Item, title: Item) => void;
 }) {
-  const playbackArea = useRef<HTMLDivElement>(null);
-  const video = useRef<HTMLVideoElement>(null);
-  const sessionId = useRef<string | null>(null);
-  const seekVersion = useRef(0);
-  const seekingRef = useRef(false);
-  const pendingPlayUrlRef = useRef<string | null>(null);
-  const attachedUrlRef = useRef<string | null>(null);
-  const hlsRef = useRef<Hls | null>(null);
-  const releasedRef = useRef(false);
-  const releasePromiseRef = useRef<Promise<void>>(Promise.resolve());
   const [episode, setEpisode] = useState<Item | null>(null);
-  const [playingEpisode, setPlayingEpisode] = useState<Item | null>(null);
-  const [playRequested, setPlayRequested] = useState(
-    () => item.kind === "live" && autoPlay,
-  );
-  const [playAttempt, setPlayAttempt] = useState(0);
   const [episodes, setEpisodes] = useState<Item[]>([]);
   const [episodesLoading, setEpisodesLoading] = useState(
     item.kind === "series",
@@ -1143,22 +1289,11 @@ function PlayerPage({
   const [episodesError, setEpisodesError] = useState("");
   const [episodeRetry, setEpisodeRetry] = useState(0);
   const [season, setSeason] = useState<number | null>(null);
-  const [session, setSession] = useState<Session | null>(null);
-  const latestSession = useRef<Session | null>(null);
-  latestSession.current = session;
-  const [playbackUrl, setPlaybackUrl] = useState("");
-  const [error, setError] = useState("");
-  const [playing, setPlaying] = useState(false);
-  const [muted, setMuted] = useState(false);
-  const [position, setPosition] = useState(0);
-  const [buffered, setBuffered] = useState<{ start: number; end: number }[]>(
-    [],
-  );
-  const [buffering, setBuffering] = useState(true);
-  const [seeking, setSeeking] = useState(false);
-  const [viewerFinished, setViewerFinished] = useState(false);
-  const activeItem = item.kind === "series" ? playingEpisode : item;
-
+  const episodeSelection = useRef({ season, episode });
+  episodeSelection.current = { season, episode };
+  const appliedDestination = useRef<EpisodeDestination | null>(null);
+  const playRequested = playback?.title.id === item.id;
+  const playingEpisode = playRequested ? playback?.item : null;
   useEffect(() => {
     if (item.kind !== "series") return;
     let alive = true;
@@ -1170,8 +1305,15 @@ function PlayerPage({
       .then((result) => {
         if (alive) {
           setEpisodes(result.items);
-          setSeason(result.items[0]?.season ?? 1);
-          setEpisode(result.items[0] || null);
+          const current = episodeSelection.current;
+          const target =
+            result.items.find((value) => value.id === current.episode?.id) ||
+            result.items.find(
+              (value) => (value.season ?? 1) === current.season,
+            ) ||
+            result.items[0];
+          setSeason(target?.season ?? 1);
+          setEpisode(target || null);
           setEpisodesLoading(false);
         }
       })
@@ -1184,10 +1326,267 @@ function PlayerPage({
     return () => {
       alive = false;
     };
-  }, [item, episodeRetry]);
+  }, [item, episodeRetry, refreshRevision]);
 
   useEffect(() => {
-    if (!activeItem || !playRequested) return;
+    if (
+      !episodeDestination ||
+      !episodes.length ||
+      appliedDestination.current === episodeDestination
+    )
+      return;
+    const target =
+      episodes.find((value) => value.id === episodeDestination.episodeId) ||
+      episodes.find(
+        (value) => (value.season ?? 1) === episodeDestination.season,
+      );
+    if (target) {
+      appliedDestination.current = episodeDestination;
+      setSeason(target.season ?? 1);
+      setEpisode(target);
+    }
+  }, [episodeDestination, episodes]);
+
+  const seasons = [...new Set(episodes.map((value) => value.season ?? 1))].sort(
+    (a, b) => a - b,
+  );
+  const shownEpisodes = episodes.filter(
+    (value) => (value.season ?? 1) === season,
+  );
+  return (
+    <article
+      className={`title-page kind-${item.kind} ${playRequested ? "watching" : ""} ${showDetails ? "show-details" : ""}`}
+    >
+      <div className="title-hero">
+        <div className="title-art">
+          <Artwork item={item} />
+        </div>
+        <div className="title-information">
+          <span className="eyebrow">
+            {item.kind === "series"
+              ? "SERIES"
+              : item.kind === "live"
+                ? "LIVE TV"
+                : "MOVIE"}
+          </span>
+          <h1 tabIndex={-1}>{item.name}</h1>
+          <p className="title-category">
+            {item.category ||
+              (item.kind === "live" ? "Live channel" : "Entertainment")}
+            {item.number && ` · Channel ${item.number}`}
+          </p>
+          {item.description && (
+            <p className="title-description">{item.description}</p>
+          )}
+          {item.kind === "series" && episode && (
+            <p className="selected-episode">
+              Selected · S{episode.season ?? 1} E{episode.episode ?? "—"} ·{" "}
+              {episode.name}
+            </p>
+          )}
+          <Button
+            className="hero-play"
+            disabled={item.kind === "series" && !episode}
+            onClick={() => {
+              const target = item.kind === "series" ? episode : item;
+              if (target) onPlay(target, item);
+            }}
+          >
+            <Play size={17} fill="currentColor" />{" "}
+            {item.kind === "series" ? "Play episode" : "Play"}
+          </Button>
+        </div>
+        {item.kind === "live" && (
+          <section className="title-guide" aria-label="On this channel">
+            <h2>On this channel</h2>
+            <div
+              className="channel-schedule"
+              tabIndex={0}
+              aria-label="Scroll channel schedule"
+            >
+              {programs.some((program) => Date.parse(program.end) > now) ? (
+                <ol>
+                  {programs
+                    .filter((program) => Date.parse(program.end) > now)
+                    .map((program) => {
+                      const onAir = Date.parse(program.start) <= now;
+                      return (
+                        <li
+                          key={`${program.start}:${program.title}`}
+                          className={onAir ? "on-air" : ""}
+                        >
+                          <div className="schedule-time">
+                            <time dateTime={program.start}>
+                              {new Date(program.start).toLocaleDateString([], {
+                                weekday: "short",
+                              })}
+                              {" · "}
+                              {formatTime(program.start)} –{" "}
+                              {formatTime(program.end)}
+                            </time>
+                            {onAir && (
+                              <span className="schedule-on-air">
+                                <Radio size={12} aria-hidden="true" /> On air
+                              </span>
+                            )}
+                          </div>
+                          <strong>{program.title}</strong>
+                          {program.description && <p>{program.description}</p>}
+                        </li>
+                      );
+                    })}
+                </ol>
+              ) : (
+                <p className="epg-unavailable">
+                  The provider hasn’t supplied an upcoming schedule for this
+                  channel.
+                </p>
+              )}
+            </div>
+          </section>
+        )}
+      </div>
+      {item.kind === "series" && (
+        <div className="episode-browser">
+          <div className="episode-heading">
+            <h3>Episodes</h3>
+            {seasons.length > 0 && (
+              <Select
+                value={String(season ?? "")}
+                onValueChange={(value) => {
+                  const nextSeason = Number(value);
+                  setSeason(nextSeason);
+                  setEpisode(
+                    episodes.find(
+                      (value) => (value.season ?? 1) === nextSeason,
+                    ) || null,
+                  );
+                }}
+              >
+                <SelectTrigger className="season-trigger" aria-label="Season">
+                  <SelectValue placeholder="Choose a season" />
+                </SelectTrigger>
+                <SelectContent className="season-menu" position="popper">
+                  {seasons.map((value) => (
+                    <SelectItem key={value} value={String(value)}>
+                      Season {value}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          </div>
+          {episodesLoading ? (
+            <p role="status" className="inline-loading">
+              <Spinner size="small" className="app-spinner" />
+              Loading episodes…
+            </p>
+          ) : episodesError ? (
+            <div role="alert" className="inline-error episode-error">
+              <span>{episodesError}</span>
+              <Button onClick={() => setEpisodeRetry((value) => value + 1)}>
+                Retry episodes
+              </Button>
+            </div>
+          ) : shownEpisodes.length ? (
+            <div className="episode-list">
+              {shownEpisodes.map((value) => (
+                <button
+                  key={value.id}
+                  className={
+                    (playRequested ? playingEpisode?.id : episode?.id) ===
+                    value.id
+                      ? "episode-row selected"
+                      : "episode-row"
+                  }
+                  onClick={() => {
+                    setEpisode(value);
+                    onPlay(value, item);
+                  }}
+                >
+                  <span className="episode-number">
+                    {value.episode ?? "▶"}
+                  </span>
+                  <span>
+                    <strong>{value.name}</strong>
+                    <small>{value.description || "Play episode"}</small>
+                  </span>
+                  <Play size={17} aria-hidden="true" />
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p className="episode-empty">No episodes are available.</p>
+          )}
+        </div>
+      )}
+    </article>
+  );
+}
+
+function PlaybackPlayer({
+  selection,
+  category,
+  onNavigate,
+  onLivePlaybackChange,
+  onSessionChange,
+  transitionRef,
+  playerDock,
+  onClose,
+}: {
+  selection: PlaybackSelection;
+  category: Category | null;
+  onNavigate: (destination: PlaybackDestination) => void;
+  onLivePlaybackChange: (active: boolean) => void;
+  onSessionChange: () => void;
+  transitionRef: RefObject<Promise<void>>;
+  playerDock: HTMLDivElement | null;
+  onClose: () => void;
+}) {
+  const isPresent = useIsPresent();
+  const reducedMotion = useReducedMotion();
+  const item = selection.title;
+  const activeItem = selection.item;
+  const playbackArea = useRef<HTMLDivElement>(null);
+  const video = useRef<HTMLVideoElement>(null);
+  const sessionId = useRef<string | null>(null);
+  const seekVersion = useRef(0);
+  const seekingRef = useRef(false);
+  const pendingPlayUrlRef = useRef<string | null>(null);
+  const attachedUrlRef = useRef<string | null>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const videoPointer = useRef("mouse");
+  const releasedRef = useRef(false);
+  const releasePromiseRef = useRef<Promise<void>>(Promise.resolve());
+  const [playAttempt, setPlayAttempt] = useState(0);
+  const [session, setSession] = useState<Session | null>(null);
+  const latestSession = useRef<Session | null>(null);
+  latestSession.current = session;
+  const [playbackUrl, setPlaybackUrl] = useState("");
+  const [error, setError] = useState("");
+  const [playing, setPlaying] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [position, setPosition] = useState(0);
+  const [liveDelay, setLiveDelay] = useState<number | null>(null);
+  const [buffered, setBuffered] = useState<{ start: number; end: number }[]>(
+    [],
+  );
+  const [buffering, setBuffering] = useState(true);
+  const [seeking, setSeeking] = useState(false);
+  const [viewerFinished, setViewerFinished] = useState(false);
+  const [playbackFeedback, setPlaybackFeedback] = useState<{
+    id: number;
+    action: "play" | "pause";
+  } | null>(null);
+  const feedbackSequence = useRef(0);
+  useLayoutEffect(() => {
+    if (isPresent) return;
+    pendingPlayUrlRef.current = null;
+    video.current?.pause();
+    hlsRef.current?.stopLoad();
+  }, [isPresent]);
+  useEffect(() => {
+    if (!isPresent) return;
     let alive = true;
     let timer: number | undefined;
     let heartbeat: number | undefined;
@@ -1317,17 +1716,7 @@ function PlayerPage({
       window.removeEventListener("pagehide", onPageHide);
       stop();
     };
-  }, [activeItem?.id, playRequested, playAttempt, onSessionChange]);
-  useEffect(() => {
-    if (playRequested)
-      window.requestAnimationFrame(() =>
-        playbackArea.current?.scrollIntoView({
-          block: "nearest",
-          behavior: "smooth",
-        }),
-      );
-  }, [playRequested, activeItem?.id]);
-
+  }, [activeItem?.id, playAttempt, onSessionChange, isPresent]);
   useEffect(() => {
     seekingRef.current = seeking;
   }, [seeking]);
@@ -1342,7 +1731,7 @@ function PlayerPage({
 
   useEffect(() => {
     const element = video.current;
-    if (!playRequested || !element || !playbackUrl) return;
+    if (!element || !playbackUrl) return;
     let hls: Hls | undefined;
     setPlaying(false);
     setBuffering(true);
@@ -1353,7 +1742,7 @@ function PlayerPage({
     if (Hls.isSupported()) {
       hls = new Hls({
         enableWorker: true,
-        startPosition: 0,
+        startPosition: activeItem?.kind === "live" ? -1 : 0,
         maxBufferLength: 45,
         backBufferLength: 120,
         // VOD is an append-only event playlist; never jump to its live edge.
@@ -1378,7 +1767,59 @@ function PlayerPage({
       element.removeAttribute("src");
       element.load();
     };
-  }, [playRequested, playbackUrl, activeItem?.kind]);
+  }, [playbackUrl, activeItem?.kind]);
+
+  // Use HLS's safe live sync point; native HLS exposes its window via seekable.
+  const liveTarget = useCallback(() => {
+    const element = video.current;
+    if (!element || activeItem?.kind !== "live") return null;
+    const sync = hlsRef.current?.liveSyncPosition;
+    if (sync !== null && sync !== undefined && Number.isFinite(sync))
+      return sync;
+    const ranges = element.seekable;
+    if (!ranges.length) return null;
+    const last = ranges.length - 1;
+    return Math.max(ranges.start(last), ranges.end(last) - 0.5);
+  }, [activeItem?.kind]);
+
+  useEffect(() => {
+    const element = video.current;
+    if (!element || !playbackUrl || activeItem?.kind !== "live") {
+      setLiveDelay(null);
+      return;
+    }
+    const update = () => {
+      const target = liveTarget();
+      setLiveDelay(
+        target === null ? null : Math.max(0, target - element.currentTime),
+      );
+    };
+    update();
+    const timer = window.setInterval(update, 1000);
+    element.addEventListener("timeupdate", update);
+    element.addEventListener("progress", update);
+    element.addEventListener("durationchange", update);
+    return () => {
+      clearInterval(timer);
+      element.removeEventListener("timeupdate", update);
+      element.removeEventListener("progress", update);
+      element.removeEventListener("durationchange", update);
+    };
+  }, [playbackUrl, activeItem?.kind, liveTarget]);
+
+  const goLive = async () => {
+    const element = video.current;
+    const target = liveTarget();
+    if (!element || target === null) return;
+    element.currentTime = target;
+    setLiveDelay(0);
+    try {
+      await element.play();
+      setError("");
+    } catch {
+      setError("Press play to resume live TV.");
+    }
+  };
 
   const seek = async (target: number, resume = false) => {
     const id = sessionId.current;
@@ -1446,11 +1887,19 @@ function PlayerPage({
     if (element.paused) {
       try {
         await element.play();
+        if (!releasedRef.current && !element.paused)
+          setPlaybackFeedback({
+            id: ++feedbackSequence.current,
+            action: "play",
+          });
         setError("");
       } catch {
         setError("Playback could not start. Try pressing play again.");
       }
-    } else element.pause();
+    } else {
+      element.pause();
+      setPlaybackFeedback({ id: ++feedbackSequence.current, action: "pause" });
+    }
   };
   const enterFullscreen = async () => {
     try {
@@ -1486,187 +1935,131 @@ function PlayerPage({
     setViewerFinished(true);
     setPlaying(false);
   };
-  const seasons = [...new Set(episodes.map((value) => value.season ?? 1))].sort(
-    (a, b) => a - b,
-  );
-  const shownEpisodes = episodes.filter(
-    (value) => (value.season ?? 1) === season,
-  );
   const vod = activeItem?.kind === "movie" || activeItem?.kind === "episode";
   const streamPreparing = session?.state === "starting";
   const absolutePosition = Math.min(session?.duration || 0, position);
+  const breadcrumbLink = (destination: PlaybackDestination) => {
+    const showTitle = destination === "title" || destination === "season";
+    return {
+      href: selectionURL(
+        item.kind as Tab,
+        destination === "library" ? "*" : category?.id || "*",
+        "",
+        showTitle ? item.id : "",
+        false,
+        showTitle && item.kind === "series"
+          ? {
+              titleId: item.id,
+              season: activeItem.season ?? 1,
+              episodeId: activeItem.id,
+            }
+          : null,
+      ).toString(),
+      onClick: (event: MouseEvent<HTMLAnchorElement>) => {
+        if (
+          event.button !== 0 ||
+          event.metaKey ||
+          event.ctrlKey ||
+          event.shiftKey ||
+          event.altKey
+        )
+          return;
+        event.preventDefault();
+        onNavigate(destination);
+      },
+    };
+  };
 
-  return (
-    <article
-      className={`title-page kind-${item.kind} ${playRequested ? "watching" : ""}`}
-    >
-      <div className="title-hero">
-        <div className="title-art">
-          <Artwork item={item} />
-        </div>
-        <div className="title-information">
-          <span className="eyebrow">
-            {item.kind === "series"
-              ? "SERIES"
-              : item.kind === "live"
-                ? "LIVE TV"
-                : "MOVIE"}
-          </span>
-          <h1 tabIndex={-1}>{item.name}</h1>
-          <p className="title-category">
-            {item.category ||
-              (item.kind === "live" ? "Live channel" : "Entertainment")}
-            {item.number && ` · Channel ${item.number}`}
-          </p>
-          {item.description && (
-            <p className="title-description">{item.description}</p>
-          )}
-          {item.kind === "series" && episode && (
-            <p className="selected-episode">
-              Selected · S{episode.season ?? 1} E{episode.episode ?? "—"} ·{" "}
-              {episode.name}
-            </p>
-          )}
-          <Button
-            className="hero-play"
-            disabled={item.kind === "series" && !episode}
-            onClick={() => {
-              if (item.kind === "series") setPlayingEpisode(episode);
-              if (item.kind === "live") onLivePlaybackChange(true);
-              setPlayRequested(true);
-            }}
-          >
-            <Play size={17} fill="currentColor" />{" "}
-            {item.kind === "series" ? "Play episode" : "Play"}
-          </Button>
-        </div>
-        {item.kind === "live" && (
-          <section className="title-guide" aria-label="On this channel">
-            <h2>On this channel</h2>
-            <div
-              className="channel-schedule"
-              tabIndex={0}
-              aria-label="Scroll channel schedule"
-            >
-              {programs.some((program) => Date.parse(program.end) > now) ? (
-                <ol>
-                  {programs
-                    .filter((program) => Date.parse(program.end) > now)
-                    .map((program) => {
-                      const onAir = Date.parse(program.start) <= now;
-                      return (
-                        <li
-                          key={`${program.start}:${program.title}`}
-                          className={onAir ? "on-air" : ""}
-                        >
-                          <div className="schedule-time">
-                            <time dateTime={program.start}>
-                              {new Date(program.start).toLocaleDateString([], {
-                                weekday: "short",
-                              })}
-                              {" · "}
-                              {formatTime(program.start)} –{" "}
-                              {formatTime(program.end)}
-                            </time>
-                            {onAir && (
-                              <span className="schedule-on-air">
-                                <Radio size={12} aria-hidden="true" /> On air
-                              </span>
-                            )}
-                          </div>
-                          <strong>{program.title}</strong>
-                          {program.description && <p>{program.description}</p>}
-                        </li>
-                      );
-                    })}
-                </ol>
-              ) : (
-                <p className="epg-unavailable">
-                  The provider hasn’t supplied an upcoming schedule for this
-                  channel.
-                </p>
-              )}
-            </div>
-          </section>
-        )}
-      </div>
-      {item.kind === "series" && (
-        <div className="episode-browser">
-          <div className="episode-heading">
-            <h3>Episodes</h3>
-            {seasons.length > 0 && (
-              <Select
-                value={String(season ?? "")}
-                onValueChange={(value) => {
-                  const nextSeason = Number(value);
-                  setSeason(nextSeason);
-                  setEpisode(
-                    episodes.find(
-                      (value) => (value.season ?? 1) === nextSeason,
-                    ) || null,
-                  );
-                }}
+  return playerDock
+    ? createPortal(
+        <motion.section
+          className="watch-section"
+          aria-label="Player"
+          inert={!isPresent}
+          data-closing={!isPresent || undefined}
+          initial={false}
+          animate={{ height: "auto", opacity: 1 }}
+          exit={{ height: 0, opacity: 0 }}
+          transition={{
+            duration: reducedMotion ? 0 : 0.3,
+            ease: [0.22, 1, 0.36, 1],
+          }}
+        >
+          <div className="dock-caption">
+            <div className="dock-heading">
+              <nav
+                className="dock-breadcrumbs"
+                aria-label="Playback breadcrumbs"
               >
-                <SelectTrigger className="season-trigger" aria-label="Season">
-                  <SelectValue placeholder="Choose a season" />
-                </SelectTrigger>
-                <SelectContent className="season-menu" position="popper">
-                  {seasons.map((value) => (
-                    <SelectItem key={value} value={String(value)}>
-                      Season {value}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
+                <ol>
+                  <li>
+                    <Button asChild variant="ghost" className="dock-crumb">
+                      <a {...breadcrumbLink("library")}>
+                        {item.kind === "live"
+                          ? "Live TV"
+                          : item.kind === "series"
+                            ? "Series"
+                            : "Movies"}
+                      </a>
+                    </Button>
+                  </li>
+                  {(category || item.category) && (
+                    <li>
+                      <ChevronRight aria-hidden="true" />
+                      {category ? (
+                        <Button asChild variant="ghost" className="dock-crumb">
+                          <a {...breadcrumbLink("category")}>{category.name}</a>
+                        </Button>
+                      ) : (
+                        <span className="dock-crumb-label">
+                          {item.category}
+                        </span>
+                      )}
+                    </li>
+                  )}
+                  {item.kind === "series" && (
+                    <>
+                      <li>
+                        <ChevronRight aria-hidden="true" />
+                        <Button
+                          asChild
+                          variant="ghost"
+                          className="dock-crumb dock-series-crumb"
+                          title={item.name}
+                        >
+                          <a {...breadcrumbLink("title")}>{item.name}</a>
+                        </Button>
+                      </li>
+                      <li>
+                        <ChevronRight aria-hidden="true" />
+                        <Button asChild variant="ghost" className="dock-crumb">
+                          <a {...breadcrumbLink("season")}>
+                            Season {activeItem.season ?? 1}
+                          </a>
+                        </Button>
+                      </li>
+                    </>
+                  )}
+                </ol>
+              </nav>
+              <h2 className="dock-title" title={activeItem.name}>
+                <a {...breadcrumbLink("title")} title="Open title details">
+                  {activeItem.name}
+                </a>
+              </h2>
+            </div>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="dock-stop"
+              onClick={onClose}
+              aria-label="Stop playback"
+              title="Close player"
+            >
+              <Square className="size-4" strokeWidth={1.5} aria-hidden="true" />
+            </Button>
           </div>
-          {episodesLoading ? (
-            <p role="status" className="inline-loading">
-              <Spinner size="small" className="app-spinner" />
-              Loading episodes…
-            </p>
-          ) : episodesError ? (
-            <div role="alert" className="inline-error episode-error">
-              <span>{episodesError}</span>
-              <Button onClick={() => setEpisodeRetry((value) => value + 1)}>
-                Retry episodes
-              </Button>
-            </div>
-          ) : shownEpisodes.length ? (
-            <div className="episode-list">
-              {shownEpisodes.map((value) => (
-                <button
-                  key={value.id}
-                  className={
-                    (playRequested ? playingEpisode?.id : episode?.id) ===
-                    value.id
-                      ? "episode-row selected"
-                      : "episode-row"
-                  }
-                  onClick={() => {
-                    setEpisode(value);
-                    setPlayingEpisode(value);
-                    setPlayRequested(true);
-                  }}
-                >
-                  <span className="episode-number">
-                    {value.episode ?? "▶"}
-                  </span>
-                  <span>
-                    <strong>{value.name}</strong>
-                    <small>{value.description || "Play episode"}</small>
-                  </span>
-                  <Play size={17} aria-hidden="true" />
-                </button>
-              ))}
-            </div>
-          ) : (
-            <p className="episode-empty">No episodes are available.</p>
-          )}
-        </div>
-      )}
-      {playRequested && activeItem && (
-        <section className="watch-section" aria-label="Player">
           <div
             className="playback-area"
             ref={playbackArea}
@@ -1679,10 +2072,20 @@ function PlayerPage({
                 playsInline
                 controls={false}
                 preload="auto"
-                onClick={() => {
-                  if (!streamPreparing && !seeking) void togglePlay();
+                onPointerDown={(event) => {
+                  videoPointer.current = event.pointerType;
                 }}
-                onDoubleClick={() => void enterFullscreen()}
+                onClick={() => {
+                  if (
+                    videoPointer.current === "mouse" &&
+                    !streamPreparing &&
+                    !seeking
+                  )
+                    void togglePlay();
+                }}
+                onDoubleClick={() => {
+                  if (videoPointer.current === "mouse") void enterFullscreen();
+                }}
                 onWaiting={() => setBuffering(true)}
                 onPlaying={() => setBuffering(false)}
                 onSeeked={() => setBuffering(false)}
@@ -1706,6 +2109,7 @@ function PlayerPage({
                 onCanPlay={() => {
                   setBuffering(false);
                   if (
+                    isPresent &&
                     pendingPlayUrlRef.current &&
                     pendingPlayUrlRef.current === attachedUrlRef.current &&
                     video.current
@@ -1733,6 +2137,35 @@ function PlayerPage({
                 }}
                 aria-label={`${activeItem?.name} video`}
               />
+              {isPresent && playbackFeedback && (
+                <motion.div
+                  key={playbackFeedback.id}
+                  className="playback-feedback"
+                  data-action={playbackFeedback.action}
+                  aria-hidden="true"
+                  initial={{ opacity: 0, scale: reducedMotion ? 1 : 0.85 }}
+                  animate={{
+                    opacity: [0, 1, 1, 0],
+                    scale: reducedMotion ? 1 : [0.85, 1, 1, 1.12],
+                  }}
+                  transition={{
+                    duration: 0.55,
+                    times: [0, 0.16, 0.45, 1],
+                    ease: "easeOut",
+                  }}
+                  onAnimationComplete={() => {
+                    setPlaybackFeedback((current) =>
+                      current?.id === playbackFeedback.id ? null : current,
+                    );
+                  }}
+                >
+                  {playbackFeedback.action === "play" ? (
+                    <Play strokeWidth={1.5} />
+                  ) : (
+                    <Pause strokeWidth={1.5} />
+                  )}
+                </motion.div>
+              )}
               {(streamPreparing || seeking || buffering) &&
                 !error &&
                 !viewerFinished && (
@@ -1763,6 +2196,8 @@ function PlayerPage({
                 duration={session?.duration || 0}
                 buffered={buffered}
                 live={!vod}
+                liveDelay={liveDelay}
+                onGoLive={() => void goLive()}
                 onPlay={() => void togglePlay()}
                 onSeek={(target) => void seek(target)}
                 onMute={() => {
@@ -1780,10 +2215,10 @@ function PlayerPage({
               </div>
             )}
           </div>
-        </section>
-      )}
-    </article>
-  );
+        </motion.section>,
+        playerDock,
+      )
+    : null;
 }
 
 export default App;

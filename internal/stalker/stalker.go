@@ -761,7 +761,11 @@ func (c *Client) Browse(ctx context.Context, query model.BrowseQuery) (model.Bro
 		}
 		season, _ := strconv.Atoi(str(row, "season_number"))
 		episode, _ := strconv.Atoi(str(row, "series_number", "episode_number"))
-		items = append(items, model.Item{ID: itemID, Kind: kind, ProviderID: pid, SeriesID: seriesID, EpisodeID: pid, Name: str(row, "name"), Number: str(row, "number"), Logo: c.asset(str(row, "screenshot_uri", "logo")), Command: str(row, "cmd"), Description: str(row, "description", "plot"), Duration: duration(row), Season: season, Episode: episode})
+		categoryID := str(row, "category_id", "tv_genre_id", "genre_id")
+		if categoryID == "" && category != "*" {
+			categoryID = category
+		}
+		items = append(items, model.Item{ID: itemID, Kind: kind, CategoryID: categoryID, Category: str(row, "category_name", "category_title"), ProviderID: pid, SeriesID: seriesID, EpisodeID: pid, Name: str(row, "name"), Number: str(row, "number"), Logo: c.asset(str(row, "screenshot_uri", "logo")), Command: str(row, "cmd"), Description: str(row, "description", "plot"), Duration: duration(row), Season: season, Episode: episode})
 	}
 	hasMore := len(raw) > 0
 	if total > 0 && pageSize > 0 {
@@ -934,7 +938,8 @@ func (c *Client) live(ctx context.Context) ([]model.Item, error) {
 			epgID = pid
 		}
 		epgIDs[id("live", pid)] = epgID
-		out = append(out, model.Item{ID: id("live", pid), Kind: "live", ProviderID: pid, Name: str(r, "name"), Number: str(r, "number", "ord"), Category: labels[str(r, "tv_genre_id", "category_id")], Logo: c.asset(str(r, "logo", "icon", "screenshot_uri")), Command: cmd})
+		categoryID := str(r, "tv_genre_id", "category_id", "genre_id")
+		out = append(out, model.Item{ID: id("live", pid), Kind: "live", ProviderID: pid, Name: str(r, "name"), Number: str(r, "number", "ord"), CategoryID: categoryID, Category: labels[categoryID], Logo: c.asset(str(r, "logo", "icon", "screenshot_uri")), Command: cmd})
 	}
 	if e := c.lock(ctx); e != nil {
 		return nil, e

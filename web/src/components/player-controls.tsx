@@ -28,6 +28,8 @@ type Props = {
   duration: number;
   buffered: { start: number; end: number }[];
   live: boolean;
+  liveDelay: number | null;
+  onGoLive: () => void;
   onPlay: () => void;
   onSeek: (position: number) => void;
   onMute: () => void;
@@ -78,7 +80,8 @@ export function PlayerControls(props: Props) {
     const element = area.current;
     if (!element) return;
     reveal();
-    const leave = () => {
+    const leave = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse") return;
       if (
         playing &&
         !busy &&
@@ -247,9 +250,9 @@ export function PlayerControls(props: Props) {
           disabled={busy || finished}
         >
           {playing ? (
-            <Pause size={25} fill="currentColor" />
+            <Pause size={25} strokeWidth={1.5} />
           ) : (
-            <Play size={25} fill="currentColor" />
+            <Play size={25} strokeWidth={1.5} />
           )}
         </button>
         {!live && (
@@ -261,7 +264,7 @@ export function PlayerControls(props: Props) {
               disabled={!canSeek}
               onClick={() => onSeek(position - 10)}
             >
-              <RotateCcw size={29} />
+              <RotateCcw size={29} strokeWidth={1.5} />
               <span>10</span>
             </button>
             <button
@@ -271,7 +274,7 @@ export function PlayerControls(props: Props) {
               disabled={!canSeek}
               onClick={() => onSeek(position + 10)}
             >
-              <RotateCw size={29} />
+              <RotateCw size={29} strokeWidth={1.5} />
               <span>10</span>
             </button>
           </>
@@ -282,10 +285,28 @@ export function PlayerControls(props: Props) {
           aria-label={props.muted ? "Unmute" : "Mute"}
           title="Mute (M)"
         >
-          {props.muted ? <VolumeX size={23} /> : <Volume2 size={23} />}
+          {props.muted ? (
+            <VolumeX size={23} strokeWidth={1.5} />
+          ) : (
+            <Volume2 size={23} strokeWidth={1.5} />
+          )}
         </button>
         {live ? (
-          <span className="live-badge">● LIVE</span>
+          <button
+            type="button"
+            className="live-badge"
+            data-behind={props.liveDelay !== null && props.liveDelay > 15}
+            disabled={busy || finished || props.liveDelay === null}
+            onClick={props.onGoLive}
+            aria-label="Go to live"
+            title={
+              props.liveDelay !== null && props.liveDelay > 15
+                ? `${time(props.liveDelay)} behind · Go to live`
+                : "Go to live"
+            }
+          >
+            <span aria-hidden="true">●</span> LIVE
+          </button>
         ) : (
           <span className="time-readout">
             {time(value)} <span>/ {time(duration)}</span>
@@ -297,7 +318,11 @@ export function PlayerControls(props: Props) {
           aria-label={fullscreen ? "Exit full screen" : "Full screen"}
           title="Full screen (F)"
         >
-          {fullscreen ? <Minimize2 size={23} /> : <Maximize2 size={23} />}
+          {fullscreen ? (
+            <Minimize2 size={23} strokeWidth={1.5} />
+          ) : (
+            <Maximize2 size={23} strokeWidth={1.5} />
+          )}
         </button>
       </div>
     </motion.div>

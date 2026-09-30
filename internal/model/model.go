@@ -10,6 +10,7 @@ type Item struct {
 	Kind        string  `json:"kind"` // live, movie, series, episode
 	Name        string  `json:"name"`
 	Category    string  `json:"category"`
+	CategoryID  string  `json:"categoryId,omitempty"`
 	Logo        string  `json:"-"`
 	Image       string  `json:"image,omitempty"` // populated by HTTP API with local image URL
 	Number      string  `json:"number,omitempty"`

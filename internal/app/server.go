@@ -86,6 +86,9 @@ const defaultArtwork = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320
 var fallbackArtwork = imageData{data: []byte(defaultArtwork), mime: "image/svg+xml", fallback: true}
 
 func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) {
+	if cfg.EpisodeCacheTTL <= 0 {
+		cfg.EpisodeCacheTTL = time.Hour
+	}
 	cache, err := openStore(cfg.DataDir, cfg.PortalURL, cfg.MAC)
 	if err != nil {
 		return nil, err
@@ -196,7 +199,7 @@ func (s *Server) static() http.Handler {
 }
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	s.cache.mu.RLock()
-	cat, fullCat, epg := s.cache.catalogPublishedAt, s.cache.catalogAt, s.cache.epgAt
+	cat, fullCat, epg, libraryUpdated := s.cache.catalogPublishedAt, s.cache.catalogAt, s.cache.epgAt, s.cache.libraryRefreshedAt
 	metadataAt := fullCat
 	if _, ok := s.provider.(model.BrowseProvider); ok && s.cache.categoriesAt.Before(metadataAt) {
 		metadataAt = s.cache.categoriesAt
@@ -263,6 +266,9 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	if !cat.IsZero() {
 		out["catalogUpdatedAt"] = cat
+	}
+	if !libraryUpdated.IsZero() {
+		out["libraryUpdatedAt"] = libraryUpdated
 	}
 	if !fullCat.IsZero() {
 		out["catalogRefreshCompletedAt"] = fullCat
@@ -371,10 +377,12 @@ func (s *Server) episodes(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "not_found", "Series not found.")
 		return
 	}
-	items, cached := s.cache.getEpisodes(id, s.cfg.CatalogRefresh)
+	revision := s.cache.libraryRevision()
+	items, cached := s.cache.getEpisodes(id, s.cfg.EpisodeCacheTTL)
 	if !cached {
-		value, err, _ := s.episodeFlights.Do(id, func() (any, error) {
-			cachedItems, exists := s.cache.getEpisodes(id, s.cfg.CatalogRefresh)
+		key := id + "\x00" + revision.Format(time.RFC3339Nano)
+		value, err, _ := s.episodeFlights.Do(key, func() (any, error) {
+			cachedItems, exists := s.cache.getEpisodes(id, s.cfg.EpisodeCacheTTL)
 			if exists {
 				return cachedItems, nil
 			}
@@ -388,7 +396,7 @@ func (s *Server) episodes(w http.ResponseWriter, r *http.Request) {
 				}
 				return nil, err
 			}
-			if err = s.cache.setEpisodes(id, loaded); err != nil {
+			if err = s.cache.setEpisodesAtRevision(id, loaded, revision); err != nil {
 				if !errors.Is(err, errSeriesRemoved) {
 					slog.Warn("Episode load failed", "seriesID", safeEpisodeLogID(id), "stage", "cache", "reason", "write_failed", "elapsed", time.Since(started).Round(time.Millisecond))
 				}
@@ -575,6 +583,9 @@ func (s *Server) doRefresh(catalog, epg bool) error {
 			}
 		}
 		cancel()
+		if err == nil {
+			err = s.cache.invalidateLibrary()
+		}
 		message := ""
 		if err != nil {
 			if s.ctx.Err() != nil {
@@ -674,7 +685,8 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 	}
 	// The fetch belongs to the server lifetime, so disconnecting one browser does
 	// not cancel work shared by other viewers.
-	key := q.Kind + "\x00" + q.Category + "\x00" + q.Search + "\x00" + strconv.Itoa(q.Page)
+	revision := s.cache.libraryRevision()
+	key := q.Kind + "\x00" + q.Category + "\x00" + q.Search + "\x00" + strconv.Itoa(q.Page) + "\x00" + revision.Format(time.RFC3339Nano)
 	s.browseMu.Lock()
 	if s.browseClosed {
 		s.browseMu.Unlock()
@@ -695,19 +707,24 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return nil, err
 		}
-		if q.Category != "*" {
-			s.cache.mu.RLock()
-			for _, c := range s.cache.categories {
-				if c.Kind == q.Kind && c.ID == q.Category {
-					for n := range loaded.Items {
-						loaded.Items[n].Category = c.Name
-					}
-					break
-				}
+		s.cache.mu.RLock()
+		categoryNames := make(map[string]string)
+		for _, c := range s.cache.categories {
+			if c.Kind == q.Kind {
+				categoryNames[c.ID] = c.Name
 			}
-			s.cache.mu.RUnlock()
 		}
-		if err = s.cache.setBrowse(q, loaded, s.cfg.CatalogRefresh); err != nil {
+		s.cache.mu.RUnlock()
+		for n := range loaded.Items {
+			item := &loaded.Items[n]
+			if item.CategoryID == "" && q.Category != "*" {
+				item.CategoryID = q.Category
+			}
+			if name := categoryNames[item.CategoryID]; name != "" {
+				item.Category = name
+			}
+		}
+		if err = s.cache.setBrowseAtRevision(q, loaded, s.cfg.CatalogRefresh, revision); err != nil {
 			return nil, err
 		}
 		return loaded, nil
