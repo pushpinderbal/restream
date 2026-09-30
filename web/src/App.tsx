@@ -1758,9 +1758,11 @@ function PlaybackPlayer({
     if (!element || !playbackUrl || !isPresent || viewerFinished) return;
     let disposed = false;
     let hls: Hls | undefined;
+    let nativeHls = !!element.canPlayType("application/vnd.apple.mpegurl");
     const clearMedia = () => {
       if (disposed) return;
       disposed = true;
+      element.removeEventListener("error", onMediaError);
       attachedUrlRef.current = null;
       hlsRef.current = null;
       hls?.destroy();
@@ -1775,10 +1777,7 @@ function PlaybackPlayer({
     element.pause();
     element.removeAttribute("src");
     element.load();
-    // Native HLS avoids a JS player and worker on browsers that support it.
-    if (element.canPlayType("application/vnd.apple.mpegurl")) {
-      element.src = playbackUrl;
-    } else {
+    const startHls = (position = activeItem.kind === "live" ? -1 : 0) => {
       void import("hls.js")
         .then(({ default: Hls }) => {
           // The player may close or switch sources while the chunk is loading.
@@ -1791,7 +1790,7 @@ function PlaybackPlayer({
             enableWorker: true,
             // The ESM distribution requires an explicit worker URL.
             workerPath: hlsWorkerUrl,
-            startPosition: activeItem.kind === "live" ? -1 : 0,
+            startPosition: position,
             maxBufferLength: 30,
             maxMaxBufferLength: 30,
             backBufferLength: 30,
@@ -1818,7 +1817,32 @@ function PlaybackPlayer({
             setError("Playback could not load. Please try this stream again.");
           }
         });
-    }
+    };
+    const onMediaError = () => {
+      if (disposed) return;
+      if (nativeHls) {
+        // canPlayType reports general support, not support for this stream.
+        // Chrome's native HLS rejects some streams that HLS.js can decode.
+        nativeHls = false;
+        const position = element.currentTime;
+        const shouldPlay =
+          pendingPlayUrlRef.current === playbackUrl || !element.paused;
+        element.pause();
+        element.removeAttribute("src");
+        element.load();
+        setPlaying(false);
+        setBuffering(true);
+        setError("");
+        if (shouldPlay) pendingPlayUrlRef.current = playbackUrl;
+        startHls(activeItem.kind === "live" ? -1 : position);
+      } else if (latestSession.current?.state === "ready") {
+        setError("The video could not be played.");
+      }
+    };
+    element.addEventListener("error", onMediaError);
+    // Keep native playback lightweight, with a decoder fallback if it fails.
+    if (nativeHls) element.src = playbackUrl;
+    else startHls();
     return () => {
       clearMedia();
       if (clearMediaRef.current === clearMedia) clearMediaRef.current = null;
@@ -2192,10 +2216,6 @@ function PlaybackPlayer({
                     setPosition(
                       (session?.offset || 0) + event.currentTarget.currentTime,
                     );
-                }}
-                onError={() => {
-                  if (session?.state === "ready")
-                    setError("The video could not be played.");
                 }}
                 aria-label={`${activeItem?.name} video`}
               />

@@ -108,7 +108,7 @@ const progressing = () => {
   );
 };
 
-async function checkNativePlayback() {
+async function checkNativePlayback(failNative = false) {
   const nativePage = await browser.newPage();
   const supported = await nativePage.evaluate(
     () =>
@@ -125,10 +125,18 @@ async function checkNativePlayback() {
   }
   let nativeSeeks = 0;
   const nativeErrors = [];
+  const workers = new Set();
+  nativePage.on("worker", (worker) => {
+    workers.add(worker);
+    worker.on("close", () => workers.delete(worker));
+  });
   nativePage.on("pageerror", (error) => nativeErrors.push(error.message));
   nativePage.on("request", (request) => {
     if (/\/api\/sessions\/[^/]+\/seek$/.test(request.url())) nativeSeeks++;
-    if (/\/assets\/hls(?:[.-])/.test(new URL(request.url()).pathname))
+    if (
+      !failNative &&
+      /\/assets\/hls(?:[.-])/.test(new URL(request.url()).pathname)
+    )
       nativeErrors.push("Native playback loaded the JS decoder");
   });
   nativePage.on("response", async (response) => {
@@ -143,10 +151,26 @@ async function checkNativePlayback() {
     await nativePage.goto(`${baseURL}/?section=movie`);
     await nativePage.getByRole("button", { name: "Open Test movie" }).click();
     await nativePage.getByRole("button", { name: "Play", exact: true }).click();
+    if (failNative) {
+      await expect(nativePage.locator("video")).toHaveAttribute(
+        "src",
+        /\/api\/streams\//,
+      );
+      // Simulate a stream-specific native decode failure, then decode the
+      // real FFmpeg output through HLS.js in the same session.
+      await nativePage.locator("video").evaluate((video) => {
+        video.dispatchEvent(new Event("error"));
+      });
+    }
     await nativePage.waitForFunction(progressing, undefined, {
       timeout: 15000,
     });
     const source = (await nativePage.evaluate(videoState)).src;
+    if (failNative) {
+      if (!source.startsWith("blob:"))
+        throw new Error("Native failure did not attach the HLS decoder");
+      await expect.poll(() => workers.size).toBe(1);
+    }
     const nativeArea = nativePage.locator(".playback-area");
     await nativeArea.hover();
     await nativePage
@@ -215,13 +239,14 @@ async function checkNativePlayback() {
     });
     await nativePage.getByRole("button", { name: "Stop playback" }).click();
     await expect(nativePage.locator("video")).toHaveCount(0);
+    await expect.poll(() => workers.size, { timeout: 5000 }).toBe(0);
     await nativePage.waitForFunction(
       async () =>
         (await (await fetch("/api/status")).json()).activeStreams === 0,
     );
     if (nativeErrors.length) throw new Error(nativeErrors.join("\n"));
     console.log(
-      "Native HLS decodes, pauses, seeks locally within its media window, resumes after a server seek, and releases playback",
+      `${failNative ? "Native HLS fallback" : "Native HLS"} decodes, pauses, seeks locally within its media window, resumes after a server seek, and releases playback`,
     );
   } finally {
     await nativePage.close();
@@ -516,6 +541,7 @@ try {
   if (browserErrors.length) throw new Error(browserErrors.join("\n"));
   console.log("Leaving player released stream slot; no browser errors");
   await checkNativePlayback();
+  await checkNativePlayback(true);
 } finally {
   for (const id of sessionIds) {
     await fetch(`${baseURL}/api/sessions/${encodeURIComponent(id)}`, {

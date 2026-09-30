@@ -101,6 +101,7 @@ async function mockApi(
   page: Page,
   options: {
     nativeHls?: boolean;
+    nativePlaybackFailure?: boolean;
     initialEmpty?: boolean;
     capacity?: boolean;
     producerEnded?: boolean;
@@ -129,7 +130,7 @@ async function mockApi(
 ) {
   // Workflow fixtures exercise controlled media state; real-playback.mjs
   // covers HLS decoding. Avoid starting an actual decoder on empty playlists.
-  await page.addInitScript((nativeHls) => {
+  await page.addInitScript(({ nativeHls, nativePlaybackFailure }) => {
     const canPlayType = HTMLMediaElement.prototype.canPlayType;
     HTMLMediaElement.prototype.canPlayType = function (type) {
       return type === "application/vnd.apple.mpegurl"
@@ -138,7 +139,18 @@ async function mockApi(
           : ""
         : canPlayType.call(this, type);
     };
-  }, options.nativeHls !== false);
+    if (nativeHls && !nativePlaybackFailure) {
+      // Empty workflow playlists are not real media. Keep their native errors
+      // out of tests that explicitly control canplay, pause, and seek state.
+      document.addEventListener("error", (event) => {
+        if (event.target instanceof HTMLMediaElement)
+          event.stopImmediatePropagation();
+      }, true);
+    }
+  }, {
+    nativeHls: options.nativeHls !== false,
+    nativePlaybackFailure: !!options.nativePlaybackFailure,
+  });
   let catalogReady = !options.initialEmpty;
   let active = false;
   let nextId = 0;
@@ -2370,6 +2382,40 @@ test("native HLS playback keeps the decoder and worker out of browser requests",
   await page.getByRole("button", { name: "Stop playback" }).click();
   await expect(page.locator("video")).toHaveCount(0);
   expect(decoderRequests).toEqual([]);
+});
+
+test("a native HLS failure loads the decoder without allocating another stream", async ({
+  page,
+}) => {
+  const api = await mockApi(page, { nativePlaybackFailure: true });
+  await page.route("**/api/streams/**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/vnd.apple.mpegurl",
+      body: "invalid manifest",
+    }),
+  );
+  const decoderRequests: string[] = [];
+  const errors: string[] = [];
+  page.on("request", (request) => {
+    if (/\/assets\/hls-[^/]+\.js$/.test(new URL(request.url()).pathname))
+      decoderRequests.push(request.url());
+  });
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto("/?section=movie");
+  await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  // A browser can advertise native support and still reject this manifest.
+  await expect(page.getByRole("alert")).toContainText("Playback stopped");
+  expect(decoderRequests).toHaveLength(1);
+  expect(api.events.filter((event) => event === "POST")).toHaveLength(1);
+  await expect
+    .poll(() => page.locator("video").getAttribute("src"))
+    .toBeNull();
+  await page.getByRole("button", { name: "Stop playback" }).click();
+  await expect(page.locator("video")).toHaveCount(0);
+  expect(api.events.filter((event) => event === "DELETE")).toHaveLength(1);
+  expect(errors).toEqual([]);
 });
 
 test("closing while the HLS decoder downloads prevents a late media attachment", async ({
