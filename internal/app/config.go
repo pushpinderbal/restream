@@ -18,7 +18,7 @@ type Config struct {
 	MaxStreams                                                             int
 	SessionTTL, CatalogRefresh, EPGRefresh, RequestInterval                time.Duration
 	EpisodeCacheTTL                                                        time.Duration
-	FFmpegPath, FFprobePath, TranscodeMode                                 string
+	TranscodeMode                                                          string
 }
 
 func LoadConfig() (Config, error) {
@@ -26,7 +26,7 @@ func LoadConfig() (Config, error) {
 		ListenAddr: env("LISTEN_ADDR", ":8080"), DataDir: env("DATA_DIR", "./data"), WebDir: env("WEB_DIR", "./web/dist"),
 		PortalURL: strings.TrimSpace(os.Getenv("STALKER_PORTAL_URL")), MAC: strings.TrimSpace(os.Getenv("STALKER_MAC")),
 		Timezone: env("STALKER_TIMEZONE", "UTC"), UserAgent: os.Getenv("STALKER_USER_AGENT"), SerialNumber: os.Getenv("STALKER_SERIAL_NUMBER"), DeviceID: os.Getenv("STALKER_DEVICE_ID"), DeviceID2: os.Getenv("STALKER_DEVICE_ID2"),
-		FFmpegPath: env("FFMPEG_PATH", "ffmpeg"), FFprobePath: env("FFPROBE_PATH", "ffprobe"), TranscodeMode: env("TRANSCODE_MODE", "auto"),
+		TranscodeMode: env("TRANSCODE_MODE", "auto"),
 	}
 	var err error
 	responseMB, err := strconv.ParseInt(env("STALKER_MAX_RESPONSE_MB", "64"), 10, 32)

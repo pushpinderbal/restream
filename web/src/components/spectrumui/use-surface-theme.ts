@@ -26,10 +26,15 @@ function read(): "dark" | "light" {
 }
 
 const onServer = () => "dark" as const;
+const noSubscription = () => () => {};
 
 export function useSurfaceTheme(
   theme: SurfaceTheme = "auto",
 ): "dark" | "light" {
-  const resolved = useSyncExternalStore(subscribe, read, onServer);
+  const resolved = useSyncExternalStore(
+    theme === "auto" ? subscribe : noSubscription,
+    read,
+    onServer,
+  );
   return theme === "auto" ? resolved : theme;
 }

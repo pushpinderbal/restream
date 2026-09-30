@@ -8,7 +8,7 @@ import {
   Wifi,
   TriangleAlert,
 } from "lucide-react";
-import { LoadingButton } from "./spectrumui/loading-button-dependencies";
+import { Button } from "./ui/button";
 import { Spinner } from "./spectrumui/spinner-dependencies";
 import type { RefreshState, Status } from "../api";
 
@@ -174,7 +174,7 @@ export function SettingsPage({
                     <span
                       className={`settings-sync-state ${busy ? "syncing" : state?.error ? "sync-error" : ""}`}
                     >
-                      <LoadingButton
+                      <Button
                         variant="ghost"
                         size="icon"
                         className="settings-sync-refresh"
@@ -199,7 +199,7 @@ export function SettingsPage({
                           className={busy ? "animate-spin" : undefined}
                           aria-hidden="true"
                         />
-                      </LoadingButton>
+                      </Button>
                       <span role="status">
                         {busy
                           ? "Syncing"

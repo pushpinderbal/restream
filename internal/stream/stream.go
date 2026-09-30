@@ -31,8 +31,6 @@ type Config struct {
 	MaxStreams    int
 	SessionTTL    time.Duration
 	DataDir       string
-	FFmpegPath    string
-	FFprobePath   string
 	TranscodeMode string // auto, copy, transcode
 }
 
@@ -89,12 +87,6 @@ func New(cfg Config, resolve Resolver) (*Manager, error) {
 	if cfg.SessionTTL <= 0 {
 		cfg.SessionTTL = 45 * time.Second
 	}
-	if cfg.FFmpegPath == "" {
-		cfg.FFmpegPath = "ffmpeg"
-	}
-	if cfg.FFprobePath == "" {
-		cfg.FFprobePath = "ffprobe"
-	}
 	if cfg.TranscodeMode == "" {
 		cfg.TranscodeMode = "auto"
 	}
@@ -103,10 +95,10 @@ func New(cfg Config, resolve Resolver) (*Manager, error) {
 	default:
 		return nil, fmt.Errorf("%w: transcode mode", ErrInvalid)
 	}
-	if _, err := exec.LookPath(cfg.FFmpegPath); err != nil {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return nil, fmt.Errorf("ffmpeg unavailable: %w", err)
 	}
-	encoders, err := exec.Command(cfg.FFmpegPath, "-hide_banner", "-encoders").Output()
+	encoders, err := exec.Command("ffmpeg", "-hide_banner", "-encoders").Output()
 	if err != nil {
 		return nil, fmt.Errorf("cannot inspect ffmpeg encoders: %w", err)
 	}
@@ -255,8 +247,7 @@ func (m *Manager) Stop(id string) error {
 	if e == nil {
 		return ErrNotFound
 	}
-	<-e.gen.done
-	_ = os.RemoveAll(e.gen.dir)
+	discard(e.gen)
 	m.mu.Lock()
 	m.stopping--
 	m.mu.Unlock()
@@ -327,7 +318,12 @@ func (m *Manager) update(e *entry, g *generation, fn func(*Session)) {
 	}
 }
 
-func discard(g *generation) { <-g.done; _ = os.RemoveAll(g.dir) }
+func discard(g *generation) {
+	<-g.done
+	_ = os.RemoveAll(g.dir)
+	// Remove the session directory only once every generation has been discarded.
+	_ = os.Remove(filepath.Dir(g.dir))
+}
 
 func (m *Manager) retire(g *generation) { discard(g); m.mu.Lock(); m.stopping--; m.mu.Unlock() }
 
@@ -435,7 +431,7 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 		args = append(args, "-hls_playlist_type", "event", "-hls_list_size", "0", "-hls_flags", "temp_file")
 	}
 	args = append(args, "-hls_segment_filename", filepath.Join(g.dir, "seg-%06d.ts"), filepath.Join(g.dir, "index.m3u8"))
-	cmd := exec.CommandContext(ctx, m.cfg.FFmpegPath, args...)
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	// Diagnostics can contain upstream URLs and authorization headers. Only classify them.
 	stderr := &boundedOutput{limit: 16 * 1024}
 	cmd.Stderr = stderr
@@ -476,6 +472,7 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 		case <-tick.C:
 			if !ready && playable(g.dir) {
 				ready = true
+				tick.Stop()
 				startupTimer.Stop()
 				m.update(e, g, func(s *Session) { s.State = "ready" })
 			}
@@ -623,11 +620,6 @@ func validHeader(k, v string) bool {
 	return true
 }
 
-func (m *Manager) probe(ctx context.Context, source model.Source) (string, float64) {
-	mode, duration, _ := m.probeWithDiagnostics(ctx, source)
-	return mode, duration
-}
-
 func (m *Manager) probeWithDiagnostics(ctx context.Context, source model.Source) (string, float64, string) {
 	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -643,7 +635,7 @@ func (m *Manager) probeWithDiagnostics(ctx context.Context, source model.Source)
 		args = append(args, "-headers", hs.String())
 	}
 	args = append(args, source.URL)
-	cmd := exec.CommandContext(pctx, m.cfg.FFprobePath, args...)
+	cmd := exec.CommandContext(pctx, "ffprobe", args...)
 	stderr := &boundedOutput{limit: 16 * 1024}
 	cmd.Stderr = stderr
 	out, err := cmd.Output()

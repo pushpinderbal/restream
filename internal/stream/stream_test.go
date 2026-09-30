@@ -69,10 +69,6 @@ func TestFFmpegSessionLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	mode, probed := m.probe(context.Background(), model.Source{URL: upstream.URL + "/source.mp4"})
-	if mode != "copy" || probed < 7.5 || probed > 8.5 {
-		t.Fatalf("probe: mode=%s duration=%v", mode, probed)
-	}
 	item := model.Item{ID: "v", Kind: "movie", Duration: 60}
 	s, err := m.Start(context.Background(), item, 0)
 	if err != nil {
@@ -87,6 +83,12 @@ func TestFFmpegSessionLifecycle(t *testing.T) {
 	s = waitState(t, m, s.ID, "ready", "ended")
 	if s.Duration < 7.5 || s.Duration > 8.5 {
 		t.Fatalf("probed duration: %v", s.Duration)
+	}
+	m.mu.Lock()
+	probe := m.sessions[s.ID].probe
+	m.mu.Unlock()
+	if probe == nil || probe.mode != "copy" {
+		t.Fatalf("compatible source was not copied: %+v", probe)
 	}
 	media := httptest.NewServer(m.MediaHandler())
 	defer media.Close()
@@ -137,6 +139,9 @@ func TestFFmpegSessionLifecycle(t *testing.T) {
 	}
 	if m.Active() != 0 {
 		t.Fatal("slot not released")
+	}
+	if _, err := os.Stat(filepath.Join(m.dir, s.ID)); !os.IsNotExist(err) {
+		t.Fatalf("stopped session files remain: %v", err)
 	}
 	if _, err = m.Get(s.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("get after stop: %v", err)

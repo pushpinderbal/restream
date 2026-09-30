@@ -1,17 +1,23 @@
-FROM oven/bun:1.4.0 AS frontend
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.0 AS frontend
 WORKDIR /build/web
 COPY web/package.json web/bun.lock ./
-RUN bun install --frozen-lockfile
-COPY web/ ./
+RUN --mount=type=cache,target=/root/.bun/install/cache bun install --frozen-lockfile
+COPY web/index.html web/tsconfig*.json web/vite.config.ts ./
+COPY web/src/ ./src/
+COPY web/public/ ./public/
 RUN bun run build
 
-FROM golang:1.27-alpine3.24 AS backend
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.24 AS backend
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /restream ./cmd/restream
+ARG TARGETOS
+ARG TARGETARCH
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /restream ./cmd/restream
 
 FROM alpine:3.24 AS runtime
 LABEL org.opencontainers.image.title="Restream" \

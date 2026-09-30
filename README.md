@@ -1,75 +1,92 @@
 # Restream
 
-Restream is a browser player for one Stalker/MAG IPTV portal. Watch live TV, movies, and series from devices on your network without installing an IPTV app on each one.
+Restream is a web proxy for your Stalker/MAG IPTV provider. Multiple users can watch live TV, movies, and series from the same provider account in a web browser.
 
-```text
-Browsers <-- HTTP(S) --> Restream <-- Stalker portal --> Provider
-                           |
-                           +-- SQLite cache in /data
-                           +-- FFmpeg --> HLS playback
-```
+Each active player uses an upstream stream. Simultaneous viewing is limited by your provider's stream allocation and Restream's `MAX_STREAMS` setting. Paused players still count toward that limit.
 
-## Run with Docker Compose
+You need your provider's portal URL and registered MAC address, plus any serial number or device IDs your provider requires.
+
+## Run with Docker
+
+Replace the example portal URL and MAC address with your provider's details:
 
 ```sh
-git clone https://github.com/pushpinderbal/restream.git
-cd restream
-cp .env.example .env
+docker run -d \
+  --name restream \
+  --restart unless-stopped \
+  --stop-timeout 20 \
+  -p 8080:8080 \
+  -v restream-data:/data \
+  -e STALKER_PORTAL_URL='http://your-provider.example' \
+  -e STALKER_MAC='00:11:22:33:44:55' \
+  -e MAX_STREAMS=1 \
+  ghcr.io/pushpinderbal/restream:latest
 ```
 
-Set `STALKER_PORTAL_URL` and `STALKER_MAC` in `.env` to your portal URL and registered MAC address, then run:
+## Or use Docker Compose
+
+Save this as `compose.yaml` and enter your provider's details in `environment`:
+
+```yaml
+services:
+  restream:
+    image: ghcr.io/pushpinderbal/restream:latest
+    ports:
+      - "8080:8080"
+    environment:
+      STALKER_PORTAL_URL: "http://your-provider.example"
+      STALKER_MAC: "00:11:22:33:44:55"
+      STALKER_TIMEZONE: "UTC"
+      MAX_STREAMS: "1"
+    volumes:
+      - restream-data:/data
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+volumes:
+  restream-data:
+```
+
+Start it with:
 
 ```sh
 docker compose up -d
 ```
 
-Compose pulls `ghcr.io/pushpinderbal/restream:latest`. Open `http://localhost:8080` or your server's LAN address. Keep `.env` private. See [.env.example](.env.example) for optional portal device identity and refresh settings.
+Open `http://localhost:8080`, or `http://<server-address>:8080` from another device. Choose **Live TV**, **Movies**, or **Series**, open a title, and press **Play**. Use **Settings** to check or refresh the library and programme guide. Stop playback to release a stream for another viewer.
 
-Choose Live TV, Movies, or Series, browse or search, then open a title and press **Play**.
+Restream has no sign-in screen. Keep access private or protect it with authentication before making it available outside your network.
 
-Open **Settings** to check library and programme guide sync states, last successful and upcoming refreshes, guide coverage, and stream usage. Use the refresh icon beside each sync state to start a background refresh without interrupting playback. The icon spins and its state changes to **Syncing** while the refresh runs. A successful library refresh updates live channels and categories and expires cached movie, series, and episode lists. Open lists reload automatically; other lists fetch fresh data when next visited. Refreshes respect provider cooldowns. Intervals and playback limits are configured in `.env`.
+## Environment variables
 
-To update the published app:
+Pass these with Docker's `-e` option or add them to the Compose `environment` section. Defaults below are for the Docker image and apply when a setting is omitted or empty. Duration values use units such as `250ms`, `45s`, `1m`, and `24h`.
 
-```sh
-docker compose pull
-docker compose up -d
-```
+`-` means no default is supplied.
 
-## Develop with Docker Compose
+| Variable | Default | Description |
+| --- | --- | --- |
+| `STALKER_PORTAL_URL` | - | (required) Your provider's portal URL, such as `http://your-provider.example`. |
+| `STALKER_MAC` | - | (required) The MAC address registered with your provider. |
+| `STALKER_TIMEZONE` | `UTC` | Timezone used with the provider, such as `America/Toronto`. |
+| `STALKER_SERIAL_NUMBER` | - | Registered device serial number. Required only if your provider asks for it. |
+| `STALKER_DEVICE_ID` | - | Registered device ID. Required only if your provider asks for it. |
+| `STALKER_DEVICE_ID2` | - | Second registered device ID. Required only if your provider asks for it. |
+| `STALKER_USER_AGENT` | Built-in MAG user agent | Override the device identification only if your provider requires a specific value. |
+| `MAX_STREAMS` | `1` | Maximum simultaneous players. Increase only within your provider's allowance. Must be at least 1. |
+| `CATALOG_REFRESH_INTERVAL` | `24h` | How often to refresh the library and how long to keep saved movie/series listings. Minimum `1m`. |
+| `EPG_REFRESH_INTERVAL` | `6h` | How often to refresh the programme guide. Minimum `1m`. |
+| `EPISODE_CACHE_TTL` | `1h` | How long to keep an episode list before checking for updates when it is opened again. Minimum `1m`. |
+| `STALKER_EPG_HOURS` | `6` | Hours of programme guide information to request. Range: 1–168. |
+| `STALKER_REQUEST_TIMEOUT` | `1m` | Maximum wait for a provider request. Minimum `1s`. |
+| `STALKER_REQUEST_INTERVAL` | `250ms` | Minimum delay between provider requests. Minimum `100ms`. |
+| `STALKER_MAX_RESPONSE_MB` | `64` | Maximum size of a provider response in MB. Range: 1–512. |
+| `SESSION_TTL` | `45s` | Release a stream after its browser stops checking in. Minimum `30s`. |
+| `TRANSCODE_MODE` | `auto` | `auto`: convert video when needed; `copy`: pass it through without conversion; `transcode`: always convert it. |
+| `LISTEN_ADDR` | `:8080` | Address and port inside the container. Match the container port in your Docker port mapping if changed. |
+| `DATA_DIR` | `/data` | Storage for saved library information and temporary playback files. Match your volume mount if changed. |
+| `WEB_DIR` | `/app/web` | Location of the browser interface files. Change only if you provide those files at a different location. |
 
-Use the standalone `compose.dev.yaml` for local development. Configure `.env` as above, then run from the repository root:
-
-```sh
-docker compose -f compose.dev.yaml up --build --watch
-```
-
-Or use `mise run dev` if you have [mise](https://mise.jdx.dev/) installed. Development only requires Docker Compose 2.32 or newer; Go, Bun, and FFmpeg run inside the containers.
-
-Open `http://localhost:5173` or your development machine's LAN address on port 5173. The frontend proxies API requests and video playback to the development backend over the Compose network.
-
-- React and CSS edits hot reload from the mounted `web/` directory, without a container rebuild.
-- Go source changes automatically rebuild and restart the backend through Compose Watch. Active playback stops when the backend restarts.
-- Changes to `web/package.json` or `web/bun.lock` restart the frontend and reinstall dependencies.
-- Development uses separate data and dependency volumes from the published app. The backend build skips the production UI bundle.
-
-Stop development with Ctrl+C, or remove its containers while retaining cached data:
-
-```sh
-docker compose -f compose.dev.yaml down
-```
-
-The equivalent mise commands are `mise run dev:logs` and `mise run dev:down`. Plain `docker compose up -d` continues to run the published app on port 8080. Use the development file by itself, rather than combining it with `compose.yaml`.
-
-To work on the UI using a locally installed Bun instead, keep a backend running on `localhost:8080` and run `mise run dev:ui`, or run `bun install --frozen-lockfile` followed by `bun run dev` from `web/`.
-
-## How it works
-
-Restream caches live channels, guide data, categories, and requested movie and series pages in SQLite under `/data`. It fetches movie and series pages as people browse; it does not download the full catalog at startup. Movie and series pages expire after `CATALOG_REFRESH_INTERVAL` (default `24h`). Episode lists are shared after the first visit and expire independently after `EPISODE_CACHE_TTL` (default `1h`); reopening a series after expiry checks for new episodes. Successful manual and scheduled library refreshes expire these lists immediately while retaining title records used by active playback. Keep the `/data` volume to retain the cache across restarts.
-
-Each viewer uses a separate upstream stream. `MAX_STREAMS` (default: `1`) limits simultaneous players, including paused players; when all slots are in use, the browser shows a warning. Set the limit within your provider's allowance.
-
-Restream has no built-in client authentication. If you expose it beyond your LAN, put authentication in front of it and proxy the entire site, including `/api/streams/`. Run one container replica because playback slots and FFmpeg sessions are local to that container.
+FFmpeg and FFprobe are included in the Docker image and used automatically.
 
 ## License
 

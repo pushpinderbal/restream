@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -9,7 +11,8 @@ import {
   type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
-import Hls from "hls.js";
+import type Hls from "hls.js";
+import hlsWorkerUrl from "hls.js/dist/hls.worker.js?url";
 import {
   AnimatePresence,
   LayoutGroup,
@@ -31,7 +34,7 @@ import {
   Settings,
   Square,
 } from "lucide-react";
-import { SettingsPage, type RefreshTarget } from "./components/settings-page";
+import type { RefreshTarget } from "./components/settings-page";
 import { PlayerControls } from "./components/player-controls";
 import { GalaxyBackdrop } from "./components/galaxy-backdrop";
 import { Button } from "./components/ui/button";
@@ -58,6 +61,12 @@ import {
   type Session,
   type Status,
 } from "./api";
+
+const SettingsPage = lazy(() =>
+  import("./components/settings-page").then((module) => ({
+    default: module.SettingsPage,
+  })),
+);
 
 type Tab = "live" | "movie" | "series";
 type PlaybackSelection = { item: Item; title: Item };
@@ -833,7 +842,7 @@ function App() {
   return (
     <MotionConfig reducedMotion="user">
       <div className="app-shell">
-        <GalaxyBackdrop />
+        <GalaxyBackdrop active={!playback} />
         <a className="skip-link" href="#main-content">
           Skip to content
         </a>
@@ -915,12 +924,14 @@ function App() {
         <div className="library-layout">
           <main id="main-content" className="main-content">
             {settingsOpen && (
-              <SettingsPage
-                status={status}
-                statusError={statusError}
-                checkedAt={statusCheckedAt}
-                onRefresh={forceRefresh}
-              />
+              <Suspense fallback={<Skeleton className="h-48 w-full" />}>
+                <SettingsPage
+                  status={status}
+                  statusError={statusError}
+                  checkedAt={statusCheckedAt}
+                  onRefresh={forceRefresh}
+                />
+              </Suspense>
             )}
             <div hidden={settingsOpen} className="library-content">
               {loading ? (
@@ -1555,6 +1566,7 @@ function PlaybackPlayer({
   const pendingPlayUrlRef = useRef<string | null>(null);
   const attachedUrlRef = useRef<string | null>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const clearMediaRef = useRef<(() => void) | null>(null);
   const videoPointer = useRef("mouse");
   const releasedRef = useRef(false);
   const releasePromiseRef = useRef<Promise<void>>(Promise.resolve());
@@ -1582,16 +1594,13 @@ function PlaybackPlayer({
   useLayoutEffect(() => {
     if (isPresent) return;
     pendingPlayUrlRef.current = null;
-    video.current?.pause();
-    hlsRef.current?.stopLoad();
+    clearMediaRef.current?.();
   }, [isPresent]);
   useEffect(() => {
     if (!isPresent) return;
     let alive = true;
     let timer: number | undefined;
     let heartbeat: number | undefined;
-    let pollBusy = false;
-    let pollAfter = 0;
     let currentId: string | null = null;
     let postStarted = false;
     let postDone = false;
@@ -1614,7 +1623,8 @@ function PlaybackPlayer({
       stopped = true;
       releaseKeepalive = keepalive;
       alive = false;
-      if (timer) clearInterval(timer);
+      clearMediaRef.current?.();
+      if (timer) clearTimeout(timer);
       if (heartbeat) clearInterval(heartbeat);
       if (currentId && !releasedRef.current) {
         releasedRef.current = true;
@@ -1662,32 +1672,46 @@ function PlaybackPlayer({
             setError(value.error || "This stream is unavailable.");
             return;
           }
-          timer = window.setInterval(() => {
-            if (pollBusy || seekingRef.current || releasedRef.current) return;
-            if (
-              latestSession.current?.state !== "starting" &&
-              Date.now() < pollAfter
-            )
+          const poll = () => {
+            if (!alive || releasedRef.current) return;
+            if (seekingRef.current) {
+              timer = window.setTimeout(poll, 300);
               return;
-            pollAfter = Date.now() + 2000;
-            pollBusy = true;
+            }
             const version = seekVersion.current;
             void request<Session>(
               `/api/sessions/${encodeURIComponent(value.id)}`,
             )
               .then((next) => {
                 if (!alive || version !== seekVersion.current) return;
-                setSession(next);
-                if (next.state === "failed")
+                setSession((current) =>
+                  current &&
+                  current.id === next.id &&
+                  current.state === next.state &&
+                  current.url === next.url &&
+                  current.offset === next.offset &&
+                  current.duration === next.duration &&
+                  current.error === next.error
+                    ? current
+                    : next,
+                );
+                if (next.state === "failed") {
+                  clearMediaRef.current?.();
                   setError(next.error || "This stream failed.");
+                }
               })
               .catch((cause) => {
                 if (alive) setError(message(cause));
               })
               .finally(() => {
-                pollBusy = false;
+                if (alive && !releasedRef.current)
+                  timer = window.setTimeout(
+                    poll,
+                    latestSession.current?.state === "starting" ? 300 : 2000,
+                  );
               });
-          }, 300);
+          };
+          timer = window.setTimeout(poll, 300);
           heartbeat = window.setInterval(() => {
             if (!releasedRef.current)
               void request<void>(
@@ -1731,35 +1755,14 @@ function PlaybackPlayer({
 
   useEffect(() => {
     const element = video.current;
-    if (!element || !playbackUrl) return;
+    if (!element || !playbackUrl || !isPresent || viewerFinished) return;
+    let disposed = false;
     let hls: Hls | undefined;
-    setPlaying(false);
-    setBuffering(true);
-    attachedUrlRef.current = playbackUrl;
-    element.pause();
-    element.removeAttribute("src");
-    element.load();
-    if (Hls.isSupported()) {
-      hls = new Hls({
-        enableWorker: true,
-        startPosition: activeItem?.kind === "live" ? -1 : 0,
-        maxBufferLength: 45,
-        backBufferLength: 120,
-        // VOD is an append-only event playlist; never jump to its live edge.
-        liveSyncOnStallIncrease: activeItem?.kind === "live" ? 1 : 0,
-        liveSyncDuration: activeItem?.kind === "live" ? undefined : 86400,
-      });
-      hlsRef.current = hls;
-      hls.loadSource(playbackUrl);
-      hls.attachMedia(element);
-      hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal)
-          setError("Playback stopped. Please try this stream again.");
-      });
-    } else if (element.canPlayType("application/vnd.apple.mpegurl"))
-      element.src = playbackUrl;
-    else setError("This browser does not support HLS playback.");
-    return () => {
+    let nativeHls = !!element.canPlayType("application/vnd.apple.mpegurl");
+    const clearMedia = () => {
+      if (disposed) return;
+      disposed = true;
+      element.removeEventListener("error", onMediaError);
       attachedUrlRef.current = null;
       hlsRef.current = null;
       hls?.destroy();
@@ -1767,7 +1770,84 @@ function PlaybackPlayer({
       element.removeAttribute("src");
       element.load();
     };
-  }, [playbackUrl, activeItem?.kind]);
+    clearMediaRef.current = clearMedia;
+    setPlaying(false);
+    setBuffering(true);
+    attachedUrlRef.current = playbackUrl;
+    element.pause();
+    element.removeAttribute("src");
+    element.load();
+    const startHls = (position = activeItem.kind === "live" ? -1 : 0) => {
+      void import("hls.js")
+        .then(({ default: Hls }) => {
+          // The player may close or switch sources while the chunk is loading.
+          if (disposed) return;
+          if (!Hls.isSupported()) {
+            setError("This browser does not support HLS playback.");
+            return;
+          }
+          hls = new Hls({
+            enableWorker: true,
+            // The ESM distribution requires an explicit worker URL.
+            workerPath: hlsWorkerUrl,
+            startPosition: position,
+            maxBufferLength: 30,
+            maxMaxBufferLength: 30,
+            backBufferLength: 30,
+            frontBufferFlushThreshold: 30,
+            // VOD is an append-only event playlist; never jump to its live edge.
+            liveSyncOnStallIncrease: activeItem.kind === "live" ? 1 : 0,
+            liveSyncDuration: activeItem.kind === "live" ? undefined : 86400,
+          });
+          hlsRef.current = hls;
+          hls.on(Hls.Events.ERROR, (_event, data) => {
+            if (data.fatal) {
+              // HLS may still finish its error dispatch before releasing context.
+              queueMicrotask(clearMedia);
+              setBuffering(false);
+              setError("Playback stopped. Please try this stream again.");
+            }
+          });
+          hls.loadSource(playbackUrl);
+          hls.attachMedia(element);
+        })
+        .catch(() => {
+          if (!disposed) {
+            setBuffering(false);
+            setError("Playback could not load. Please try this stream again.");
+          }
+        });
+    };
+    const onMediaError = () => {
+      if (disposed) return;
+      if (nativeHls) {
+        // canPlayType reports general support, not support for this stream.
+        // Chrome's native HLS rejects some streams that HLS.js can decode.
+        nativeHls = false;
+        const position = element.currentTime;
+        const shouldPlay =
+          pendingPlayUrlRef.current === playbackUrl || !element.paused;
+        element.pause();
+        element.removeAttribute("src");
+        element.load();
+        setPlaying(false);
+        setBuffering(true);
+        setError("");
+        if (shouldPlay) pendingPlayUrlRef.current = playbackUrl;
+        startHls(activeItem.kind === "live" ? -1 : position);
+      } else if (latestSession.current?.state === "ready") {
+        setError("The video could not be played.");
+      }
+    };
+    element.addEventListener("error", onMediaError);
+    // Keep native playback lightweight, with a decoder fallback if it fails.
+    if (nativeHls) element.src = playbackUrl;
+    else startHls();
+    return () => {
+      clearMedia();
+      if (clearMediaRef.current === clearMedia) clearMediaRef.current = null;
+    };
+  }, [playbackUrl, activeItem.kind, isPresent, viewerFinished]);
 
   // Use HLS's safe live sync point; native HLS exposes its window via seekable.
   const liveTarget = useCallback(() => {
@@ -1791,7 +1871,9 @@ function PlaybackPlayer({
     const update = () => {
       const target = liveTarget();
       setLiveDelay(
-        target === null ? null : Math.max(0, target - element.currentTime),
+        target === null
+          ? null
+          : Math.max(0, Math.round(target - element.currentTime)),
       );
     };
     update();
@@ -1832,15 +1914,17 @@ function PlaybackPlayer({
     const element = video.current;
     const local = desired - session.offset;
     const details = hlsRef.current?.levels[hlsRef.current.loadLevel]?.details;
-    const ranges = element?.seekable;
+    // Native EVENT playback can expose buffered media before seekable ranges.
+    const windows = element ? [element.seekable, element.buffered] : [];
     const available =
       attachedUrlRef.current === session.url &&
       local >= 0 &&
       ((details && local < details.edge - 0.25) ||
-        (ranges &&
+        windows.some((ranges) =>
           Array.from({ length: ranges.length }, (_, i) => i).some(
             (i) => local >= ranges.start(i) && local < ranges.end(i) - 0.25,
-          )));
+          ),
+        ));
     if (element && available) {
       element.currentTime = local;
       setPosition(desired);
@@ -1931,6 +2015,8 @@ function PlaybackPlayer({
       sessionId.current = null;
       onSessionChange();
     }
+    clearMediaRef.current?.();
+    pendingPlayUrlRef.current = null;
     if (item.kind === "live") onLivePlaybackChange(false);
     setViewerFinished(true);
     setPlaying(false);
@@ -2130,10 +2216,6 @@ function PlaybackPlayer({
                     setPosition(
                       (session?.offset || 0) + event.currentTarget.currentTime,
                     );
-                }}
-                onError={() => {
-                  if (session?.state === "ready")
-                    setError("The video could not be played.");
                 }}
                 aria-label={`${activeItem?.name} video`}
               />
