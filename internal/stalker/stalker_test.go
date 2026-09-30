@@ -84,7 +84,7 @@ func TestPortalWorkflow(t *testing.T) {
 				return
 			}
 			if q.Get("p") == "1" {
-				respond(map[string]any{"total_items": 2, "data": []any{map[string]any{"id": "100", "name": "Film One", "cmd": "/media/file_100.mpg"}, map[string]any{"id": "101", "name": "Film Two", "cmd": "/media/file_101.mpg"}}})
+				respond(map[string]any{"total_items": 2, "data": []any{map[string]any{"id": "100", "name": "Film One", "category_id": "20", "cmd": "/media/file_100.mpg"}, map[string]any{"id": "101", "name": "Film Two", "category_id": 20, "cmd": "/media/file_101.mpg"}}})
 			} else {
 				respond(map[string]any{"data": []any{}})
 			}
@@ -92,7 +92,7 @@ func TestPortalWorkflow(t *testing.T) {
 			if q.Get("movie_id") != "" {
 				respond(map[string]any{"data": []any{}})
 			} else {
-				respond(map[string]any{"total_items": 1, "data": []any{map[string]any{"id": "200", "name": "The Show"}}})
+				respond(map[string]any{"total_items": 1, "data": []any{map[string]any{"id": "200", "name": "The Show", "genre_id": "30"}}})
 			}
 		case "itv/get_epg_info":
 			if q.Get("period") != "24" {
@@ -137,6 +137,10 @@ func TestPortalWorkflow(t *testing.T) {
 		t.Fatalf("series: %+v %v", shows, e)
 	}
 	items = append(items, movies.Items...)
+	searchMovies, searchErr := c.Browse(ctx, model.BrowseQuery{Kind: "movie", Category: "*", Search: "Film", Page: 1})
+	if searchErr != nil || len(searchMovies.Items) != 2 || searchMovies.Items[0].CategoryID != "20" || searchMovies.Items[1].CategoryID != "20" || shows.Items[0].CategoryID != "30" || items[0].CategoryID != "10" {
+		t.Fatalf("portal navigation categories lost: search=%+v series=%+v live=%+v err=%v", searchMovies, shows, items[0], searchErr)
+	}
 	items = append(items, shows.Items...)
 	found := map[string]model.Item{}
 	for _, x := range items {

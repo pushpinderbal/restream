@@ -76,6 +76,23 @@ func TestCachedEpisodePlaybackRetainsProviderIdentityAfterRestart(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Keep metadata fresh so restarting uses the saved episode list without
+	// triggering a library refresh, which deliberately expires saved lists.
+	provider := &fixtureProvider{}
+	live, err := provider.Catalog(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.setCatalog(live); err != nil {
+		t.Fatal(err)
+	}
+	categories, err := provider.Categories(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.setCategories(categories); err != nil {
+		t.Fatal(err)
+	}
 	series := model.Item{ID: "series:229631", Kind: "series", Name: "Show", ProviderID: "229631"}
 	if err := cache.setBrowse(model.BrowseQuery{Kind: "series", Category: "*", Page: 1}, model.BrowsePage{Page: 1, Items: []model.Item{series}}, time.Hour); err != nil {
 		t.Fatal(err)
@@ -96,7 +113,7 @@ func TestCachedEpisodePlaybackRetainsProviderIdentityAfterRestart(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	s, err := New(cfg, &fixtureProvider{}, manager)
+	s, err := New(cfg, provider, manager)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,7 +29,9 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 		t.Skip("ffprobe required")
 	}
 	movie := filepath.Join(t.TempDir(), "sample.mp4")
-	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "24", "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", "-movflags", "+faststart", movie)
+	// Leave enough footage after the browser's late seek to check that settings
+	// and library filtering preserve playback before the fixture reaches its end.
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "60", "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", "-movflags", "+faststart", movie)
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("generate test media: %v: %s", err, b)
 	}
@@ -126,7 +128,7 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 		t.Fatal(status, body)
 	}
 	session = awaitPlayable(t, server.URL, session.ID)
-	if session.Duration < 23 || session.Duration > 25 {
+	if session.Duration < 59 || session.Duration > 61 {
 		t.Fatalf("duration not probed: %+v", session)
 	}
 	assertLocalMedia(t, server.URL, session.URL, portal.URL)

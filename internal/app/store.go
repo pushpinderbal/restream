@@ -72,6 +72,7 @@ type store struct {
 	programs                                           []model.Program
 	categories                                         []model.Category
 	catalogAt, epgAt, categoriesAt, catalogPublishedAt time.Time
+	libraryRefreshedAt                                 time.Time
 	portalCooldownUntil                                time.Time
 	catalogJSON, epgJSON                               []byte
 	catalogETag, epgETag                               string
@@ -81,7 +82,7 @@ var errSeriesRemoved = errors.New("series no longer in catalog")
 
 // Increment when category or browse query semantics change. Existing live,
 // EPG, episode, and item records remain useful across these upgrades.
-const browseCacheVersion = "2"
+const browseCacheVersion = "3"
 
 func fingerprint(portal, mac string) string {
 	sum := sha256.Sum256([]byte(portal + "\x00" + mac))
@@ -375,7 +376,7 @@ func (s *store) load() error {
 			return err
 		}
 	}
-	for key, dest := range map[string]*time.Time{"live_at": &s.catalogAt, "epg_at": &s.epgAt, "categories_at": &s.categoriesAt, "cooldown": &s.portalCooldownUntil} {
+	for key, dest := range map[string]*time.Time{"live_at": &s.catalogAt, "epg_at": &s.epgAt, "categories_at": &s.categoriesAt, "library_refreshed_at": &s.libraryRefreshedAt, "cooldown": &s.portalCooldownUntil} {
 		var v string
 		err = s.db.QueryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(&v)
 		if err == nil {
@@ -586,6 +587,74 @@ func (s *store) setCategories(c []model.Category) error {
 	s.catalogPublishedAt = now
 	return nil
 }
+
+// Keep item records for active playback, but expire all lists atomically.
+// The revision also prevents older in-flight requests from repopulating them.
+func (s *store) invalidateLibrary() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`DELETE FROM pages`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE episodes SET fetched_at=0`); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if err = putMeta(tx, "library_refreshed_at", now.Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	for id := range s.episodesAt {
+		s.episodesAt[id] = time.Time{}
+	}
+	s.libraryRefreshedAt = now
+	return nil
+}
+
+func (s *store) libraryRevision() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.libraryRefreshedAt
+}
+
+// Caller holds mu. A response fetched before refresh still needs playback
+// records for its titles, but must not replace records from newer responses.
+func (s *store) retainMissingItems(items []model.Item) error {
+	missing := make([]model.Item, 0)
+	for _, item := range items {
+		if _, exists := s.byID[item.ID]; !exists {
+			missing = append(missing, item)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, item := range missing {
+		if err = insertItem(tx, item); err != nil {
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	for _, item := range missing {
+		s.byID[item.ID] = item
+	}
+	return nil
+}
+
 func (s *store) browse(q model.BrowseQuery, ttl time.Duration) (model.BrowsePage, bool, error) {
 	var b []byte
 	var at int64
@@ -606,12 +675,19 @@ func (s *store) browse(q model.BrowseQuery, ttl time.Duration) (model.BrowsePage
 	return page, true, nil
 }
 func (s *store) setBrowse(q model.BrowseQuery, p model.BrowsePage, ttl time.Duration) error {
+	return s.setBrowseAtRevision(q, p, ttl, s.libraryRevision())
+}
+
+func (s *store) setBrowseAtRevision(q model.BrowseQuery, p model.BrowsePage, ttl time.Duration, revision time.Time) error {
 	b, err := encodePage(p)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.libraryRefreshedAt.Equal(revision) {
+		return s.retainMissingItems(p.Items)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -663,8 +739,15 @@ func (s *store) setRetryDeadline(_ bool, at time.Time, shared bool) error {
 	return nil
 }
 func (s *store) setEpisodes(id string, items []model.Item) error {
+	return s.setEpisodesAtRevision(id, items, s.libraryRevision())
+}
+
+func (s *store) setEpisodesAtRevision(id string, items []model.Item, revision time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.libraryRefreshedAt.Equal(revision) {
+		return s.retainMissingItems(items)
+	}
 	series, ok := s.byID[id]
 	if !ok || series.Kind != "series" {
 		return errSeriesRemoved

@@ -15,6 +15,7 @@ export type Item = {
   kind: Kind;
   name: string;
   category: string;
+  categoryId?: string;
   image?: string;
   number?: string;
   description?: string;
@@ -30,6 +31,7 @@ export type Program = {
   end: string;
 };
 export type Status = {
+  libraryUpdatedAt?: string;
   configured: boolean;
   refreshing: boolean;
   catalogUpdatedAt?: string;
