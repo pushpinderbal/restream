@@ -39,7 +39,8 @@ jobs:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
       - name: Run integration tests and build frontend
-        run: mise run test ::: frontend
+        run: |
+          mise run test ::: frontend
 
   publish:
     name: Build and publish image
