@@ -24,6 +24,10 @@ jobs:
         uses: actions/checkout@v7
       - name: Install tools with mise
         uses: jdx/mise-action@v5
+      - name: Install playback test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Cache Go dependencies and builds
         uses: actions/cache@v5
         with:
