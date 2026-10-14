@@ -1,0 +1,120 @@
+{
+  "metadataConfigured": false,
+  "errors": [],
+  "interactions": [
+    "Opening CP24 details does not create watch history.",
+    "Actual Live TV playback appears in Recently played.",
+    "Used real player keyboard seeking inside the movie buffer, paused after 15 seconds, without a server seek.",
+    "Actual Movies playback appears in Recently played.",
+    "Actual Series playback appears in Recently played.",
+    "Reload preserved movie progress; Resume posted a nonzero source offset and decoded real video.",
+    "Up next resolved the next real provider episode and played it successfully; completion flags were seeded for this review.",
+    "Recently played reopened the watched series season and episode without allocating a stream; browser Back restored Dashboard.",
+    "Verified 900/821/390/320px layouts and all five accessible mobile navigation buttons.",
+    "Clear history survived reload; personal sections disappeared while real provider discovery remained available."
+  ],
+  "verifiedPlayback": [
+    {
+      "kind": "live",
+      "title": "CP24 4K",
+      "action": "play",
+      "width": 1280,
+      "height": 720,
+      "currentTime": 0.53
+    },
+    {
+      "kind": "movie",
+      "title": "Practical Magic 2",
+      "action": "play",
+      "width": 1920,
+      "height": 800,
+      "currentTime": 0.55
+    },
+    {
+      "kind": "series",
+      "title": "Designated Survivor - ENGLISH TV SHOWS",
+      "action": "play",
+      "width": 624,
+      "height": 352,
+      "currentTime": 0.56
+    },
+    {
+      "kind": "movie",
+      "title": "Practical Magic 2",
+      "action": "resume",
+      "width": 1920,
+      "height": 800,
+      "currentTime": 0.86
+    },
+    {
+      "kind": "series",
+      "title": "Designated Survivor - ENGLISH TV SHOWS",
+      "action": "up next",
+      "width": 720,
+      "height": 405,
+      "currentTime": 0.58
+    }
+  ],
+  "sessionStarts": [
+    {
+      "itemId": "live:2508",
+      "start": 0
+    },
+    {
+      "itemId": "movie:339812",
+      "start": 0
+    },
+    {
+      "itemId": "episode:76301:6549:153532",
+      "start": 0
+    },
+    {
+      "itemId": "movie:339812",
+      "start": 16.251107
+    },
+    {
+      "itemId": "episode:76301:6549:153533",
+      "start": 0
+    }
+  ],
+  "seededCompletion": [
+    {
+      "title": "Designated Survivor - ENGLISH TV SHOWS",
+      "episode": "Episode 1. Designated Survivor: Season 1 1080.mp4",
+      "season": 1,
+      "episodeNumber": 1,
+      "note": "Completion seeded from a genuinely played provider episode; not a full episode viewing."
+    },
+    {
+      "title": "Designated Survivor - ENGLISH TV SHOWS",
+      "episode": "Episode 2. Designated Survivor: Season 1 1080.mp4",
+      "season": 1,
+      "episodeNumber": 2,
+      "note": "Completion seeded from a genuinely played provider episode; not a full episode viewing."
+    }
+  ],
+  "viewportChecks": [
+    {
+      "width": 900,
+      "horizontalOverflow": false
+    },
+    {
+      "width": 821,
+      "horizontalOverflow": false
+    },
+    {
+      "width": 390,
+      "horizontalOverflow": false
+    },
+    {
+      "width": 320,
+      "horizontalOverflow": false
+    }
+  ],
+  "discovery": {
+    "trendingMovies": 0,
+    "trendingSeries": 0,
+    "exploreMovies": 18,
+    "exploreSeries": 18
+  }
+}

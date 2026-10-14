@@ -1,3 +1,4 @@
 1. Do not write unit tests for everything. Prefer integration tests.
 2. Prefer trusted libraries over hand-rolling complexity.
 3. Use SpectrumUI components, ShadCN, Radis and Tailwind type frameworks.
+4. For UI work, run the app and test it in a browser, including primary interactions and desktop/mobile layouts.

@@ -26,6 +26,8 @@ function ArtworkImage({ item, className }: { item: Item; className: string }) {
   const [loaded, setLoaded] = useState(false);
   const fallback = `/artwork-${item.kind === "live" ? "live" : "title"}.svg`;
   const source = !failed && item.image ? item.image : fallback;
+  const channelLogoLoaded =
+    item.kind === "live" && source !== fallback && loaded;
 
   useLayoutEffect(() => {
     setLoaded(!!element.current?.complete && element.current.naturalWidth > 0);
@@ -34,7 +36,7 @@ function ArtworkImage({ item, className }: { item: Item; className: string }) {
   return (
     <SkeletonReveal
       loading={!loaded}
-      className="artwork-reveal"
+      className={`artwork-reveal${channelLogoLoaded ? " has-channel-logo" : ""}`}
       revealDuration={320}
       skeleton={<span className="artwork-skeleton" />}
     >

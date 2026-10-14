@@ -28,6 +28,7 @@ import {
   ChevronRight,
   Film,
   ListFilter,
+  LayoutDashboard,
   MonitorPlay,
   Pause,
   Play,
@@ -41,6 +42,8 @@ import { Button } from "./components/ui/button";
 import { Skeleton } from "./components/ui/skeleton";
 import { BeamSearch } from "./components/spectrumui/beam-search";
 import { Artwork } from "./components/artwork";
+import { Dashboard } from "./components/dashboard";
+import { useWatchHistory, type WatchHistoryEntry } from "./watch-history";
 import { Spinner } from "./components/spectrumui/spinner-dependencies";
 import {
   Select,
@@ -77,7 +80,7 @@ function hasMediaSource() {
 }
 
 type Tab = "live" | "movie" | "series";
-type PlaybackSelection = { item: Item; title: Item };
+type PlaybackSelection = { item: Item; title: Item; start?: number };
 type EpisodeDestination = {
   titleId: string;
   season: number;
@@ -94,6 +97,7 @@ function locationSelection() {
     search: params.get("search") || "",
     item: params.get("item") || "",
     settings: params.get("view") === "settings",
+    dashboard: params.get("view") === "dashboard",
     episodeDestination:
       params.get("item") && Number.isInteger(season) && season > 0
         ? {
@@ -112,11 +116,20 @@ function writeLocation(
   item = "",
   settings = false,
   episodeDestination: EpisodeDestination | null = null,
+  dashboard = false,
 ) {
   window.history[replace ? "replaceState" : "pushState"](
     {},
     "",
-    selectionURL(tab, category, search, item, settings, episodeDestination),
+    selectionURL(
+      tab,
+      category,
+      search,
+      item,
+      settings,
+      episodeDestination,
+      dashboard,
+    ),
   );
 }
 function selectionURL(
@@ -126,9 +139,11 @@ function selectionURL(
   item = "",
   settings = false,
   episodeDestination: EpisodeDestination | null = null,
+  dashboard = false,
 ) {
   const url = new URL(window.location.href);
   if (settings) url.searchParams.set("view", "settings");
+  else if (dashboard) url.searchParams.set("view", "dashboard");
   else url.searchParams.delete("view");
   if (tab === "live") url.searchParams.delete("section");
   else url.searchParams.set("section", tab);
@@ -148,6 +163,7 @@ function selectionURL(
   return url;
 }
 const sections = [
+  { id: "dashboard" as const, label: "Dashboard", icon: LayoutDashboard },
   { id: "live" as Tab, label: "Live TV", icon: MonitorPlay },
   { id: "movie" as Tab, label: "Movies", icon: Film },
   { id: "series" as Tab, label: "Series", icon: Clapperboard },
@@ -190,6 +206,10 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(
     () => locationSelection().settings,
   );
+  const [dashboardOpen, setDashboardOpen] = useState(
+    () => locationSelection().dashboard,
+  );
+  const watchHistory = useWatchHistory();
   const [liveItems, setLiveItems] = useState<Item[]>([]);
   const [programs, setPrograms] = useState<Program[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -308,6 +328,7 @@ function App() {
       searchPending.current = false;
       setTab(next.tab);
       setSettingsOpen(next.settings);
+      setDashboardOpen(next.dashboard);
       setCategory(next.category);
       setSearch(next.search);
       setDebouncedSearch(next.search);
@@ -388,14 +409,24 @@ function App() {
         true,
         selectedId,
         settingsOpen,
+        episodeDestination,
+        dashboardOpen,
       );
     }, 400);
     return () => clearTimeout(timer);
-  }, [search, tab, category, selectedId, settingsOpen]);
+  }, [
+    search,
+    tab,
+    category,
+    selectedId,
+    settingsOpen,
+    episodeDestination,
+    dashboardOpen,
+  ]);
 
   const fetchPage = useCallback(
     (page: number, generation: number, pagesToLoad = 3) => {
-      if (tab === "live") return;
+      if (tab === "live" || dashboardOpen) return;
       browseAbort.current?.abort();
       const controller = new AbortController();
       browseAbort.current = controller;
@@ -449,7 +480,7 @@ function App() {
         }
       })();
     },
-    [tab, category, debouncedSearch],
+    [tab, category, debouncedSearch, dashboardOpen],
   );
   useEffect(() => {
     browseGeneration.current++;
@@ -548,6 +579,7 @@ function App() {
   }, []);
   const selectCategory = (nextTab: Tab, nextCategory = "*") => {
     setSettingsOpen(false);
+    setDashboardOpen(false);
     searchPending.current = false;
     writeLocation(nextTab, nextCategory, "");
     setTab(nextTab);
@@ -560,12 +592,25 @@ function App() {
     setPlaybackDetailsId("");
     setEpisodeDestination(null);
   };
-  const navigateSection = (next: Tab | "settings") => {
-    if (next === "settings") {
+  const navigateSection = (next: Tab | "dashboard" | "settings") => {
+    if (next === "dashboard") {
+      if (dashboardOpen) return;
+      searchPending.current = false;
+      writeLocation(tab, category, search, false, "", false, null, true);
+      setDashboardOpen(true);
+      setSettingsOpen(false);
+      setSelected(null);
+      setSelectedId("");
+      setPlaybackDetailsId("");
+      setEpisodeDestination(null);
+      setDetailError("");
+      window.scrollTo({ top: 0 });
+    } else if (next === "settings") {
       if (settingsOpen) return;
       libraryScroll.current = window.scrollY;
       writeLocation(tab, category, search, false, selectedId, true);
       setSettingsOpen(true);
+      setDashboardOpen(false);
       window.scrollTo({ top: 0 });
     } else if (settingsOpen && next === tab) {
       writeLocation(tab, category, search, false, selectedId);
@@ -575,6 +620,27 @@ function App() {
       );
     } else selectCategory(next);
   };
+  const openDetails = (title: Item, episodeItem: Item | null = null) => {
+    const nextTab = title.kind as Tab;
+    selectCategory(nextTab);
+    const episodeTarget =
+      title.kind === "series" && episodeItem
+        ? {
+            titleId: title.id,
+            season: episodeItem.season || 1,
+            episodeId: episodeItem.id,
+          }
+        : null;
+    opener.current = null;
+    scrolledExpansion.current = "";
+    setDetailError("");
+    setSelected(title);
+    setSelectedId(title.id);
+    setEpisodeDestination(episodeTarget);
+    writeLocation(nextTab, "*", "", true, title.id, false, episodeTarget);
+  };
+  const openHistory = (entry: WatchHistoryEntry, title: Item) =>
+    openDetails(title, entry.item);
   const checkStatus = useCallback(async () => {
     try {
       const next = await request<Status>("/api/status");
@@ -599,7 +665,7 @@ function App() {
       .catch(() => {});
   }, []);
   const requestPlayback = useCallback(
-    (item: Item, title: Item) => {
+    (item: Item, title: Item, start = 0) => {
       const knownTitle = [...liveItems, ...browseItems].find(
         (value) => value.id === title.id,
       );
@@ -612,6 +678,7 @@ function App() {
       );
       setPlayback({
         item,
+        start: item.kind === "live" ? 0 : Math.max(0, start),
         title: {
           ...title,
           categoryId: categoryID || undefined,
@@ -646,6 +713,59 @@ function App() {
     setPlayback(null);
     setLivePlaybackRequested(false);
     if (playback?.title.id === selectedId) closePlayer();
+  };
+  const verifyDashboardTitle = async (title: Item) => {
+    const { item } = await request<{ item: Item }>(
+      `/api/items/${encodeURIComponent(title.id)}`,
+    );
+    if (item.kind !== title.kind || item.kind === "episode")
+      throw new Error("This title is no longer available.");
+    return item;
+  };
+  const dashboardEpisode = async (title: Item, wanted?: Item) => {
+    const result = await request<{ items: Item[] }>(
+      `/api/series/${encodeURIComponent(title.id)}/episodes?season=${wanted?.season || (wanted ? 1 : "first")}`,
+    );
+    const episodes = (result.items || [])
+      .filter((item) => item.kind === "episode")
+      .sort(
+        (a, b) =>
+          (a.season || 1) - (b.season || 1) ||
+          (a.episode || 0) - (b.episode || 0),
+      );
+    const episode = wanted
+      ? episodes.find((item) => item.id === wanted.id) ||
+        episodes.find(
+          (item) =>
+            wanted.episode !== undefined &&
+            item.episode === wanted.episode &&
+            (item.season || 1) === (wanted.season || 1),
+        )
+      : episodes[0];
+    if (!episode) throw new Error("This episode is no longer available.");
+    return episode;
+  };
+  const playDashboardTitle = async (title: Item) => {
+    const verified = await verifyDashboardTitle(title);
+    const target =
+      verified.kind === "series" ? await dashboardEpisode(verified) : verified;
+    requestPlayback(target, verified);
+    window.scrollTo({ top: 0 });
+  };
+  const resumeDashboardTitle = async (entry: WatchHistoryEntry) => {
+    const title = await verifyDashboardTitle(entry.title);
+    const target =
+      title.kind === "series"
+        ? await dashboardEpisode(title, entry.item)
+        : title;
+    requestPlayback(target, title, entry.completed ? 0 : entry.position);
+    window.scrollTo({ top: 0 });
+  };
+  const playDashboardEpisode = async (title: Item, episode: Item) => {
+    const verified = await verifyDashboardTitle(title);
+    const target = await dashboardEpisode(verified, episode);
+    requestPlayback(target, verified);
+    window.scrollTo({ top: 0 });
   };
   const playbackCategory =
     playback &&
@@ -721,7 +841,7 @@ function App() {
   }, [tab, category]);
   useEffect(() => {
     const target = loadSentinel;
-    if (!target || browseLoading || browseError) return;
+    if (!target || dashboardOpen || browseLoading || browseError) return;
     const hasNext = tab === "live" ? items.length > visibleCount : hasMore;
     if (!hasNext) return;
     let active = true;
@@ -744,6 +864,7 @@ function App() {
     browseError,
     browseLoading,
     browsePage,
+    dashboardOpen,
     fetchPage,
     hasMore,
     items.length,
@@ -849,7 +970,7 @@ function App() {
   );
   return (
     <MotionConfig reducedMotion="user">
-      <div className="app-shell">
+      <div className={`app-shell${dashboardOpen ? " dashboard-active" : ""}`}>
         <GalaxyBackdrop active={!playback} />
         <a className="skip-link" href="#main-content">
           Skip to content
@@ -869,7 +990,9 @@ function App() {
                   const active =
                     section.id === "settings"
                       ? settingsOpen
-                      : !settingsOpen && tab === section.id;
+                      : section.id === "dashboard"
+                        ? dashboardOpen
+                        : !settingsOpen && !dashboardOpen && tab === section.id;
                   return (
                     <button
                       key={section.id}
@@ -896,7 +1019,7 @@ function App() {
                 })}
               </nav>
             </LayoutGroup>
-            {!settingsOpen && (
+            {!settingsOpen && !dashboardOpen && (
               <BeamSearch
                 className="header-search"
                 theme="dark"
@@ -917,12 +1040,15 @@ function App() {
         <AnimatePresence mode="wait" initial={false}>
           {playback && (
             <PlaybackPlayer
-              key={`${playback.item.kind}:${playback.item.id}`}
+              key={`${playback.item.kind}:${playback.item.id}:${playback.start || 0}`}
               selection={playback}
               category={playbackCategory || null}
               onNavigate={navigatePlayback}
               onLivePlaybackChange={onLivePlaybackChange}
               onSessionChange={updateStatus}
+              onPlaybackStarted={watchHistory.record}
+              onPlaybackProgress={watchHistory.updateProgress}
+              onFlushProgress={watchHistory.flushProgress}
               transitionRef={playbackTransition}
               playerDock={playerDock}
               onClose={stopPlayback}
@@ -931,6 +1057,29 @@ function App() {
         </AnimatePresence>
         <div className="library-layout">
           <main id="main-content" className="main-content">
+            {dashboardOpen && (
+              <Dashboard
+                entries={watchHistory.entries}
+                persistent={watchHistory.persistent}
+                configured={status?.configured !== false}
+                liveItems={liveItems}
+                programs={programs}
+                now={now}
+                onBrowse={(kind) => {
+                  selectCategory(kind);
+                  window.scrollTo({ top: 0 });
+                }}
+                onOpen={openHistory}
+                onResume={resumeDashboardTitle}
+                onPlay={playDashboardTitle}
+                onPlayEpisode={playDashboardEpisode}
+                onOpenTitle={async (item) => {
+                  openDetails(await verifyDashboardTitle(item));
+                }}
+                onRemove={watchHistory.remove}
+                onClear={watchHistory.clear}
+              />
+            )}
             {settingsOpen && (
               <Suspense fallback={<Skeleton className="h-48 w-full" />}>
                 <SettingsPage
@@ -941,7 +1090,10 @@ function App() {
                 />
               </Suspense>
             )}
-            <div hidden={settingsOpen} className="library-content">
+            <div
+              hidden={settingsOpen || dashboardOpen}
+              className="library-content"
+            >
               {loading ? (
                 <div
                   className="loading-library"
@@ -975,6 +1127,8 @@ function App() {
                   <motion.div
                     key={tab}
                     className="section-view"
+                    role="region"
+                    aria-label={`${sections.find((section) => section.id === tab)?.label} library`}
                     initial={{ opacity: 0, y: 8, filter: "blur(3px)" }}
                     animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
                     exit={{ opacity: 0, y: -5, filter: "blur(2px)" }}
@@ -1261,7 +1415,9 @@ function App() {
             const active =
               section.id === "settings"
                 ? settingsOpen
-                : !settingsOpen && tab === section.id;
+                : section.id === "dashboard"
+                  ? dashboardOpen
+                  : !settingsOpen && !dashboardOpen && tab === section.id;
             return (
               <button
                 key={section.id}
@@ -1308,6 +1464,16 @@ function PlayerPage({
   const [episodesError, setEpisodesError] = useState("");
   const [episodeRetry, setEpisodeRetry] = useState(0);
   const [season, setSeason] = useState<number | null>(null);
+  const [requestedSeason, setRequestedSeason] = useState<number | null>(
+    episodeDestination?.season ?? null,
+  );
+  const [seasonOptions, setSeasonOptions] = useState<number[]>([]);
+  const episodeCache = useRef(
+    new Map<
+      string,
+      { items: Item[]; seasons?: number[]; season?: number; at: number }
+    >(),
+  );
   const episodeSelection = useRef({ season, episode });
   episodeSelection.current = { season, episode };
   const appliedDestination = useRef<EpisodeDestination | null>(null);
@@ -1315,37 +1481,69 @@ function PlayerPage({
   const playingEpisode = playRequested ? playback?.item : null;
   useEffect(() => {
     if (item.kind !== "series") return;
-    let alive = true;
+    const controller = new AbortController();
     setEpisodesError("");
     setEpisodesLoading(true);
-    void request<{ items: Item[] }>(
-      `/api/series/${encodeURIComponent(item.id)}/episodes`,
+    setEpisode(null);
+    const key = `${item.id}:${refreshRevision}:${requestedSeason ?? "first"}`;
+    const apply = (result: {
+      items: Item[];
+      seasons?: number[];
+      season?: number;
+    }) => {
+      if (!controller.signal.aborted) {
+        setEpisodes(result.items);
+        setSeasonOptions(
+          result.seasons ??
+            [...new Set(result.items.map((value) => value.season ?? 1))].sort(
+              (a, b) => a - b,
+            ),
+        );
+        const current = episodeSelection.current;
+        const target =
+          result.items.find((value) => value.id === current.episode?.id) ||
+          result.items.find(
+            (value) => (value.season ?? 1) === current.season,
+          ) ||
+          result.items[0];
+        setSeason(result.season ?? target?.season ?? requestedSeason ?? 1);
+        setEpisode(target || null);
+        setEpisodesLoading(false);
+      }
+    };
+    const cached = episodeCache.current.get(key);
+    if (cached && Date.now() - cached.at < 60000) {
+      apply(cached);
+      return () => controller.abort();
+    }
+    void request<{ items: Item[]; seasons?: number[]; season?: number }>(
+      `/api/series/${encodeURIComponent(item.id)}/episodes?season=${requestedSeason ?? "first"}`,
+      { signal: controller.signal },
     )
       .then((result) => {
-        if (alive) {
-          setEpisodes(result.items);
-          const current = episodeSelection.current;
-          const target =
-            result.items.find((value) => value.id === current.episode?.id) ||
-            result.items.find(
-              (value) => (value.season ?? 1) === current.season,
-            ) ||
-            result.items[0];
-          setSeason(target?.season ?? 1);
-          setEpisode(target || null);
-          setEpisodesLoading(false);
-        }
+        if (controller.signal.aborted) return;
+        episodeCache.current.set(key, { ...result, at: Date.now() });
+        if (result.season !== undefined)
+          episodeCache.current.set(
+            `${item.id}:${refreshRevision}:${result.season}`,
+            { ...result, at: Date.now() },
+          );
+        apply(result);
       })
       .catch((cause) => {
-        if (alive) {
+        if (!controller.signal.aborted) {
           setEpisodesError(message(cause));
           setEpisodesLoading(false);
         }
       });
     return () => {
-      alive = false;
+      controller.abort();
     };
-  }, [item, episodeRetry, refreshRevision]);
+  }, [item.id, item.kind, episodeRetry, refreshRevision, requestedSeason]);
+
+  useEffect(() => {
+    if (episodeDestination) setRequestedSeason(episodeDestination.season);
+  }, [episodeDestination]);
 
   useEffect(() => {
     if (
@@ -1366,9 +1564,7 @@ function PlayerPage({
     }
   }, [episodeDestination, episodes]);
 
-  const seasons = [...new Set(episodes.map((value) => value.season ?? 1))].sort(
-    (a, b) => a - b,
-  );
+  const seasons = seasonOptions;
   const shownEpisodes = episodes.filter(
     (value) => (value.season ?? 1) === season,
   );
@@ -1475,6 +1671,7 @@ function PlayerPage({
                 onValueChange={(value) => {
                   const nextSeason = Number(value);
                   setSeason(nextSeason);
+                  setRequestedSeason(nextSeason);
                   setEpisode(
                     episodes.find(
                       (value) => (value.season ?? 1) === nextSeason,
@@ -1549,6 +1746,9 @@ function PlaybackPlayer({
   onNavigate,
   onLivePlaybackChange,
   onSessionChange,
+  onPlaybackStarted,
+  onPlaybackProgress,
+  onFlushProgress,
   transitionRef,
   playerDock,
   onClose,
@@ -1558,6 +1758,14 @@ function PlaybackPlayer({
   onNavigate: (destination: PlaybackDestination) => void;
   onLivePlaybackChange: (active: boolean) => void;
   onSessionChange: () => void;
+  onPlaybackStarted: (selection: PlaybackSelection) => void;
+  onPlaybackProgress: (
+    selection: PlaybackSelection,
+    position: number,
+    duration: number,
+    completed?: boolean,
+  ) => void;
+  onFlushProgress: () => void;
   transitionRef: RefObject<Promise<void>>;
   playerDock: HTMLDivElement | null;
   onClose: () => void;
@@ -1566,6 +1774,8 @@ function PlaybackPlayer({
   const reducedMotion = useReducedMotion();
   const item = selection.title;
   const activeItem = selection.item;
+  const historyRecorded = useRef(false);
+  const historyFinished = useRef(false);
   const playbackArea = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   const sessionId = useRef<string | null>(null);
@@ -1580,9 +1790,34 @@ function PlaybackPlayer({
   const releasedRef = useRef(false);
   const releasePromiseRef = useRef<Promise<void>>(Promise.resolve());
   const [playAttempt, setPlayAttempt] = useState(0);
+  const playbackStart = useRef(selection.start || 0);
   const [session, setSession] = useState<Session | null>(null);
   const latestSession = useRef<Session | null>(null);
   latestSession.current = session;
+  const saveProgress = useCallback(
+    (completed = false) => {
+      const element = video.current;
+      const current = latestSession.current;
+      if (
+        !historyRecorded.current ||
+        (historyFinished.current && !completed) ||
+        !element ||
+        !current ||
+        activeItem.kind === "live" ||
+        attachedUrlRef.current !== current.url
+      )
+        return;
+      onPlaybackProgress(
+        selection,
+        current.offset + element.currentTime,
+        current.duration || activeItem.duration || 0,
+        completed,
+      );
+    },
+    [activeItem.kind, activeItem.duration, onPlaybackProgress, selection],
+  );
+  const saveProgressRef = useRef(saveProgress);
+  saveProgressRef.current = saveProgress;
   const [playbackUrl, setPlaybackUrl] = useState("");
   const [error, setError] = useState("");
   const [playing, setPlaying] = useState(false);
@@ -1602,11 +1837,15 @@ function PlaybackPlayer({
   const feedbackSequence = useRef(0);
   useLayoutEffect(() => {
     if (isPresent) return;
+    saveProgressRef.current();
+    onFlushProgress();
     pendingPlayUrlRef.current = null;
     clearMediaRef.current?.();
-  }, [isPresent]);
+  }, [isPresent, onFlushProgress]);
   useEffect(() => {
     if (!isPresent) return;
+    historyRecorded.current = false;
+    historyFinished.current = false;
     let alive = true;
     let timer: number | undefined;
     let heartbeat: number | undefined;
@@ -1631,6 +1870,8 @@ function PlaybackPlayer({
     };
     const stop = (keepalive = false) => {
       if (stopped) return;
+      saveProgressRef.current();
+      onFlushProgress();
       stopped = true;
       releaseKeepalive = keepalive;
       alive = false;
@@ -1667,6 +1908,7 @@ function PlaybackPlayer({
       postStarted = true;
       return jsonRequest<Session>("/api/sessions", "POST", {
         itemId: activeItem.id,
+        start: playbackStart.current,
       })
         .then((value) => {
           postDone = true;
@@ -1767,7 +2009,14 @@ function PlaybackPlayer({
       window.removeEventListener("pagehide", onPageHide);
       stop();
     };
-  }, [activeItem?.id, playAttempt, onSessionChange, isPresent]);
+  }, [
+    activeItem?.id,
+    selection.start,
+    playAttempt,
+    onSessionChange,
+    onFlushProgress,
+    isPresent,
+  ]);
   useEffect(() => {
     seekingRef.current = seeking;
   }, [seeking]);
@@ -1924,6 +2173,8 @@ function PlaybackPlayer({
   };
 
   const seek = async (target: number, resume = false) => {
+    saveProgress();
+    onFlushProgress();
     const id = sessionId.current;
     if (!id || !session || seekingRef.current) return;
     if (!Number.isFinite(session.duration) || session.duration <= 0) return;
@@ -2030,6 +2281,9 @@ function PlaybackPlayer({
     }
   };
   const finishPlayback = () => {
+    saveProgress(true);
+    historyFinished.current = true;
+    onFlushProgress();
     const id = sessionId.current;
     if (id && !releasedRef.current) {
       releasedRef.current = true;
@@ -2195,8 +2449,18 @@ function PlaybackPlayer({
                   if (videoPointer.current === "mouse") void enterFullscreen();
                 }}
                 onWaiting={() => setBuffering(true)}
-                onPlaying={() => setBuffering(false)}
-                onSeeked={() => setBuffering(false)}
+                onPlaying={() => {
+                  setBuffering(false);
+                  if (isPresent && !historyRecorded.current) {
+                    historyRecorded.current = true;
+                    onPlaybackStarted(selection);
+                  }
+                }}
+                onSeeked={() => {
+                  setBuffering(false);
+                  saveProgress();
+                  onFlushProgress();
+                }}
                 onProgress={(event) => {
                   const ranges = event.currentTarget.buffered;
                   if (attachedUrlRef.current === session?.url) {
@@ -2213,7 +2477,11 @@ function PlaybackPlayer({
                 onPlay={() => {
                   setPlaying(true);
                 }}
-                onPause={() => setPlaying(false)}
+                onPause={() => {
+                  setPlaying(false);
+                  saveProgress();
+                  onFlushProgress();
+                }}
                 onCanPlay={() => {
                   setBuffering(false);
                   if (
@@ -2234,6 +2502,7 @@ function PlaybackPlayer({
                 }}
                 onEnded={finishPlayback}
                 onTimeUpdate={(event) => {
+                  saveProgress();
                   if (attachedUrlRef.current === session?.url)
                     setPosition(
                       (session?.offset || 0) + event.currentTarget.currentTime,
@@ -2283,7 +2552,10 @@ function PlaybackPlayer({
                   <div className="playback-ended">
                     <p>You’ve reached the end</p>
                     <Button
-                      onClick={() => setPlayAttempt((value) => value + 1)}
+                      onClick={() => {
+                        playbackStart.current = 0;
+                        setPlayAttempt((value) => value + 1);
+                      }}
                     >
                       <Play size={17} fill="currentColor" /> Play again
                     </Button>

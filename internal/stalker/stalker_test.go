@@ -60,7 +60,7 @@ func TestPortalWorkflow(t *testing.T) {
 		}
 		switch typ + "/" + action {
 		case "itv/get_all_channels":
-			respond(map[string]any{"data": []any{map[string]any{"id": "1", "name": "News", "cmd": "ffmpeg http://old/live", "tv_genre_id": "10", "logo": "logos/news.png", "cmds": []any{map[string]any{"ch_id": "901"}}}}})
+			respond(map[string]any{"data": []any{map[string]any{"id": "1", "name": "News", "cmd": "ffmpeg http://old/live", "tv_genre_id": "10", "logo": "news.png", "cmds": []any{map[string]any{"ch_id": "901"}}}}})
 		case "itv/get_categories":
 			respond([]any{})
 		case "itv/get_genres":
@@ -148,6 +148,17 @@ func TestPortalWorkflow(t *testing.T) {
 	}
 	if found["live:1"].Category != "News & Current Affairs" || found["movie:101"].Name != "Film Two" || found["series:200"].Kind != "series" {
 		t.Fatalf("bad catalog: %+v", items)
+	}
+	if found["live:1"].Logo != server.URL+"/stalker_portal/misc/logos/320/news.png" {
+		t.Fatal("filename logo resolved outside the portal logo directory")
+	}
+	navigation, err := c.Seasons(ctx, found["series:200"])
+	if err != nil || len(navigation) != 2 || navigation[1].Season != 1 {
+		t.Fatal("season navigation", navigation, err)
+	}
+	oneSeason, err := c.SeasonEpisodes(ctx, found["series:200"], navigation[1])
+	if err != nil || len(oneSeason) != 1 || oneSeason[0].Name != "Opening" || oneSeason[0].Season != 1 || oneSeason[0].ID != "episode:200:3793:601" {
+		t.Fatal("selected season", oneSeason, err)
 	}
 	ep, e := c.Episodes(ctx, found["series:200"])
 	if e != nil {

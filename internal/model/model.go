@@ -22,6 +22,9 @@ type Item struct {
 	ProviderID  string  `json:"-"`
 	SeriesID    string  `json:"-"`
 	EpisodeID   string  `json:"-"`
+	SourceType  string  `json:"-"`
+	Year        int     `json:"year,omitempty"`
+	TMDBID      int     `json:"-"`
 }
 
 // Category is portal navigation metadata. SourceType records which MAG API
@@ -75,6 +78,13 @@ type Provider interface {
 	Episodes(context.Context, Item) ([]Item, error)
 	EPG(context.Context) ([]Program, error)
 	Resolve(context.Context, Item) (Source, error)
+}
+
+// SeasonProvider lets the browser fetch navigation first and only load the
+// selected season. List rows may also be episodes on portals without seasons.
+type SeasonProvider interface {
+	Seasons(context.Context, Item) ([]Item, error)
+	SeasonEpisodes(context.Context, Item, Item) ([]Item, error)
 }
 
 // PortalCooldownProvider is optional. It lets a provider apply a persisted

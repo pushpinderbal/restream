@@ -55,6 +55,7 @@ type Client struct {
 
 var _ model.Provider = (*Client)(nil)
 var _ model.BrowseProvider = (*Client)(nil)
+var _ model.SeasonProvider = (*Client)(nil)
 
 const (
 	defaultMaxResponseBytes int64 = 64 << 20
@@ -561,7 +562,8 @@ func rows(js json.RawMessage) ([]map[string]json.RawMessage, int, error) {
 	return nil, 0, nil
 }
 func (c *Client) asset(s string) string {
-	if s == "" {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" || s == "null" || s == "false" {
 		return ""
 	}
 	ref, e := url.Parse(s)
@@ -575,6 +577,29 @@ func (c *Client) asset(s string) string {
 	base.RawQuery = ""
 	base.Fragment = ""
 	return base.ResolveReference(ref).String()
+}
+
+func (c *Client) channelArtwork(row map[string]json.RawMessage) string {
+	for _, key := range []string{"logo", "icon", "logo_url", "icon_url", "screenshot_uri"} {
+		value := str(row, key)
+		resolved := c.asset(value)
+		if resolved == "" {
+			continue
+		}
+		ref, err := url.Parse(value)
+		if err == nil && ref.Scheme == "" && ref.Host == "" && !strings.Contains(ref.Path, "/") {
+			// MAG channel logos may be filenames rather than URLs. The portal
+			// frontend serves them from its resized channel-logo directory.
+			base := *c.endpoint
+			root := strings.TrimSuffix(base.Path, "/server/load.php")
+			root = strings.TrimSuffix(root, "/portal.php")
+			base.Path = path.Join(root, "misc/logos/320", ref.Path)
+			base.RawQuery, base.Fragment = ref.RawQuery, ""
+			return base.String()
+		}
+		return resolved
+	}
+	return ""
 }
 func id(kind, s string) string { return kind + ":" + s }
 
@@ -765,7 +790,9 @@ func (c *Client) Browse(ctx context.Context, query model.BrowseQuery) (model.Bro
 		if categoryID == "" && category != "*" {
 			categoryID = category
 		}
-		items = append(items, model.Item{ID: itemID, Kind: kind, CategoryID: categoryID, Category: str(row, "category_name", "category_title"), ProviderID: pid, SeriesID: seriesID, EpisodeID: pid, Name: str(row, "name"), Number: str(row, "number"), Logo: c.asset(str(row, "screenshot_uri", "logo")), Command: str(row, "cmd"), Description: str(row, "description", "plot"), Duration: duration(row), Season: season, Episode: episode})
+		year, _ := strconv.Atoi(str(row, "year", "release_year"))
+		tmdbID, _ := strconv.Atoi(str(row, "tmdb_id", "tmdb"))
+		items = append(items, model.Item{ID: itemID, Kind: kind, CategoryID: categoryID, Category: str(row, "category_name", "category_title"), ProviderID: pid, SeriesID: seriesID, EpisodeID: pid, Name: str(row, "name"), Number: str(row, "number"), Logo: c.asset(str(row, "screenshot_uri", "logo")), Command: str(row, "cmd"), Description: str(row, "description", "plot"), Duration: duration(row), Season: season, Episode: episode, Year: year, TMDBID: tmdbID})
 	}
 	hasMore := len(raw) > 0
 	if total > 0 && pageSize > 0 {
@@ -939,7 +966,7 @@ func (c *Client) live(ctx context.Context) ([]model.Item, error) {
 		}
 		epgIDs[id("live", pid)] = epgID
 		categoryID := str(r, "tv_genre_id", "category_id", "genre_id")
-		out = append(out, model.Item{ID: id("live", pid), Kind: "live", ProviderID: pid, Name: str(r, "name"), Number: str(r, "number", "ord"), CategoryID: categoryID, Category: labels[categoryID], Logo: c.asset(str(r, "logo", "icon", "screenshot_uri")), Command: cmd})
+		out = append(out, model.Item{ID: id("live", pid), Kind: "live", ProviderID: pid, Name: str(r, "name"), Number: str(r, "number", "ord"), CategoryID: categoryID, Category: labels[categoryID], Logo: c.channelArtwork(r), Command: cmd})
 	}
 	if e := c.lock(ctx); e != nil {
 		return nil, e
@@ -1173,7 +1200,7 @@ func (c *Client) Episodes(ctx context.Context, series model.Item) ([]model.Item,
 		// A season marker can be explicit, or a row without a command that leads to episodes.
 		seasonID := row.ProviderID
 		displaySeason := seasonNumber(row, idx+1)
-		if (row.Kind == "season" || row.Command == "") && seasonID != "" {
+		if (row.Kind == "season" || row.Command == "" && row.Episode == 0) && seasonID != "" {
 			episodes, e := c.ordered(ctx, "vod", "", sid, seasonID, "0")
 			if e != nil {
 				return nil, e
@@ -1204,6 +1231,75 @@ func (c *Client) Episodes(ctx context.Context, series model.Item) ([]model.Item,
 }
 
 var seasonTitle = regexp.MustCompile(`(?i)(?:^|\b)(?:season\s*|s)([0-9]+)(?:\b|$)`)
+
+// Seasons loads navigation without walking through every season of a show.
+func (c *Client) Seasons(ctx context.Context, series model.Item) ([]model.Item, error) {
+	if series.Kind != "series" {
+		return nil, errors.New("seasons require a series")
+	}
+	sid := series.ProviderID
+	if sid == "" {
+		sid = strings.TrimPrefix(series.ID, "series:")
+	}
+	source := "vod"
+	list, err := c.ordered(ctx, source, "", sid, "0", "0")
+	if err != nil {
+		return nil, err
+	}
+	if len(list) == 0 {
+		source = "series"
+		list, err = c.ordered(ctx, source, "", sid, "0", "0")
+		if err != nil {
+			return nil, err
+		}
+	}
+	for idx := range list {
+		row := &list[idx]
+		row.SourceType = source
+		if row.Kind == "season" || row.Command == "" && row.Episode == 0 {
+			row.Kind = "season"
+			row.Season = seasonNumber(*row, idx+1)
+			row.ID = "season:" + sid + ":" + row.ProviderID
+		} else {
+			if row.Season == 0 {
+				row.Season = 1
+			}
+			if row.Logo == "" {
+				row.Logo = series.Logo
+			}
+		}
+	}
+	return list, nil
+}
+
+func (c *Client) SeasonEpisodes(ctx context.Context, series, season model.Item) ([]model.Item, error) {
+	sid := series.ProviderID
+	if sid == "" {
+		sid = strings.TrimPrefix(series.ID, "series:")
+	}
+	source := season.SourceType
+	if source == "" {
+		source = "vod"
+	}
+	list, err := c.ordered(ctx, source, "", sid, season.ProviderID, "0")
+	if err != nil {
+		return nil, err
+	}
+	for idx := range list {
+		row := &list[idx]
+		row.Kind = "episode"
+		row.SeriesID = sid
+		row.Season = season.Season
+		row.ID = "episode:" + sid + ":" + season.ProviderID + ":" + row.ProviderID
+		if row.Name == "" {
+			row.Name = fmt.Sprintf("Episode %d", idx+1)
+		}
+		if row.Logo == "" {
+			row.Logo = series.Logo
+		}
+	}
+	return list, nil
+}
 
 func seasonNumber(row model.Item, fallback int) int {
 	if row.Season > 0 {

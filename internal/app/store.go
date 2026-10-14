@@ -27,6 +27,8 @@ type diskItem struct {
 	ProviderID string     `json:"providerId,omitempty"`
 	SeriesID   string     `json:"seriesId,omitempty"`
 	EpisodeID  string     `json:"episodeId,omitempty"`
+	SourceType string     `json:"sourceType,omitempty"`
+	TMDBID     int        `json:"tmdbId,omitempty"`
 }
 type diskCategory struct {
 	model.Category
@@ -112,7 +114,8 @@ func openStore(dir, portal, mac string) (*store, error) {
  CREATE INDEX IF NOT EXISTS pages_fetched_at ON pages(fetched_at);
  CREATE TABLE IF NOT EXISTS categories(kind TEXT NOT NULL,id TEXT NOT NULL,data BLOB NOT NULL,PRIMARY KEY(kind,id));
  CREATE TABLE IF NOT EXISTS episodes(series_id TEXT PRIMARY KEY,data BLOB NOT NULL,fetched_at INTEGER NOT NULL DEFAULT 0);
- CREATE TABLE IF NOT EXISTS epg(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL);`); err != nil {
+ CREATE TABLE IF NOT EXISTS epg(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL);
+ CREATE TABLE IF NOT EXISTS discovery(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL);`); err != nil {
 		return fail(err)
 	}
 	if err = os.Chmod(path, 0600); err != nil {
@@ -277,7 +280,7 @@ func (s *store) clearForProvider() error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"items", "pages", "categories", "episodes", "epg", "meta"} {
+	for _, table := range []string{"items", "pages", "categories", "episodes", "epg", "discovery", "meta"} {
 		if _, err = tx.Exec("DELETE FROM " + table); err != nil {
 			return err
 		}
@@ -396,7 +399,7 @@ func putMeta(tx *sql.Tx, key, value string) error {
 	return err
 }
 func packOne(i model.Item) diskItem {
-	return diskItem{i, i.Logo, i.Command, i.ProviderID, i.SeriesID, i.EpisodeID}
+	return diskItem{i, i.Logo, i.Command, i.ProviderID, i.SeriesID, i.EpisodeID, i.SourceType, i.TMDBID}
 }
 func unpackOne(d diskItem) model.Item {
 	i := d.Item
@@ -405,6 +408,8 @@ func unpackOne(d diskItem) model.Item {
 	i.ProviderID = d.ProviderID
 	i.SeriesID = d.SeriesID
 	i.EpisodeID = d.EpisodeID
+	i.SourceType = d.SourceType
+	i.TMDBID = d.TMDBID
 	return i
 }
 func pack(items []model.Item) []diskItem {
@@ -734,12 +739,16 @@ func (s *store) setPortalCooldown(at time.Time) error {
 }
 
 func (s *store) setEpisodesAtRevision(id string, items []model.Item, revision time.Time) error {
+	return s.setEpisodeListAtRevision(id, id, items, revision)
+}
+
+func (s *store) setEpisodeListAtRevision(seriesID, key string, items []model.Item, revision time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.libraryRefreshedAt.Equal(revision) {
 		return s.retainMissingItems(items)
 	}
-	series, ok := s.byID[id]
+	series, ok := s.byID[seriesID]
 	if !ok || series.Kind != "series" {
 		return errSeriesRemoved
 	}
@@ -752,10 +761,13 @@ func (s *store) setEpisodesAtRevision(id string, items []model.Item, revision ti
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`INSERT OR REPLACE INTO episodes(series_id,data,fetched_at)VALUES(?,?,?)`, id, b, time.Now().UnixNano()); err != nil {
+	if _, err = tx.Exec(`INSERT OR REPLACE INTO episodes(series_id,data,fetched_at)VALUES(?,?,?)`, key, b, time.Now().UnixNano()); err != nil {
 		return err
 	}
 	for _, i := range items {
+		if i.Kind == "season" {
+			continue
+		}
 		if err = insertItem(tx, i); err != nil {
 			return err
 		}
@@ -763,9 +775,12 @@ func (s *store) setEpisodesAtRevision(id string, items []model.Item, revision ti
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	s.episodes[id] = items
-	s.episodesAt[id] = time.Now()
+	s.episodes[key] = items
+	s.episodesAt[key] = time.Now()
 	for _, i := range items {
+		if i.Kind == "season" {
+			continue
+		}
 		s.byID[i.ID] = i
 	}
 	return nil
