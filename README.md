@@ -55,11 +55,9 @@ docker compose up -d
 
 Open `http://localhost:8080`, or `http://<server-address>:8080` from another device. Choose **Live TV**, **Movies**, or **Series**, open a title, and press **Play**. Use **Settings** to check or refresh the library and programme guide. Stop playback to release a stream for another viewer.
 
-**Dashboard** combines featured artwork, Continue watching, Up next, discovery, Live now and Recently played. Watch history and progress are saved in this browser when playback starts; Resume uses the original video position. Up next finds the next available episode of a completed show, including across seasons. Opening a title card shows its details without starting playback. Remove individual history entries or use **Clear history** to reset personal state. History is shared by people using the same browser profile and site address and does not sync across devices.
+**Dashboard** offers Continue watching, Up next and Recently played. History and progress stay in this browser; use **Clear history** to reset them.
 
-Trending uses TMDB's weekly movie and TV feeds, matched on the server to confirmed provider listings. Unavailable, unchecked and ambiguous titles are excluded. Metadata and availability matches are cached in SQLite; background refreshes are bounded and do not import the whole provider catalogue or every season. Provider listings and the programme guide supply Explore and Live now while metadata is unconfigured or warming up.
-
-To enable Trending, set `TMDB_API_READ_ACCESS_TOKEN` to your TMDB API Read Access Token, or set `TMDB_API_KEY` to your own v3 API key, then restart Restream. Keep credentials in the server environment. Artwork is proxied locally, and the browser never receives the credential. Obtain credentials through your [TMDB account settings](https://www.themoviedb.org/settings/api); use of TMDB data and artwork requires [TMDB attribution](https://developer.themoviedb.org/docs/faq).
+**Trending** shows only provider-available titles. Set `TMDB_API_READ_ACCESS_TOKEN` or `TMDB_API_KEY` from your [TMDB account settings](https://www.themoviedb.org/settings/api), then restart Restream to enable it. Without a key, the dashboard shows **Explore**.
 
 Restream has no sign-in screen. Keep access private or protect it with authentication before making it available outside your network.
 
@@ -91,7 +89,7 @@ Pass these with Docker's `-e` option or add them to the Compose `environment` se
 | `LISTEN_ADDR` | `:8080` | Address and port inside the container. Match the container port in your Docker port mapping if changed. |
 | `DATA_DIR` | `/data` | Storage for saved library information and temporary playback files. Match your volume mount if changed. |
 | `WEB_DIR` | `/app/web` | Location of the browser interface files. Change only if you provide those files at a different location. |
-| `TMDB_API_READ_ACCESS_TOKEN` | - | Optional TMDB application read token for server-side discovery and artwork. |
+| `TMDB_API_READ_ACCESS_TOKEN` | - | Optional TMDB read token for Trending. |
 | `TMDB_API_KEY` | - | Optional TMDB v3 API key; used when no read token is set. |
 
 FFmpeg and FFprobe are included in the Docker image and used automatically.
