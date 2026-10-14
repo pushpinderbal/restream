@@ -57,6 +57,7 @@ type Server struct {
 	imageCache             *ristretto.Cache[string, imageData]
 	imageFlights           singleflight.Group
 	imageFailureTTL        time.Duration
+	discoveryService       *discoveryService
 }
 
 type refreshState struct {
@@ -100,6 +101,12 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{cfg: cfg, provider: provider, streams: streams, cache: cache, ctx: ctx, cancel: cancel, imageClient: &http.Client{Timeout: 12 * time.Second}, imageCache: imageCache, imageFailureTTL: defaultImageFailureTTL}
+	if err := s.initDiscovery(); err != nil {
+		cancel()
+		imageCache.Close()
+		_ = cache.close()
+		return nil, err
+	}
 	s.refreshWake = [2]chan struct{}{make(chan struct{}, 1), make(chan struct{}, 1)}
 	cache.mu.RLock()
 	slog.Info("Cache restored", "liveChannels", len(cache.items), "categories", len(cache.categories), "programs", len(cache.programs))
@@ -127,6 +134,8 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	mux.HandleFunc("GET /api/catalog", s.catalog)
 	mux.HandleFunc("GET /api/categories", s.categories)
 	mux.HandleFunc("GET /api/browse", s.browse)
+	mux.HandleFunc("GET /api/discovery", s.discover)
+	mux.HandleFunc("GET /api/discovery/images/{id}/{type}", s.discoveryImage)
 	mux.HandleFunc("GET /api/epg", s.epg)
 	mux.HandleFunc("GET /api/series/{id}/episodes", s.episodes)
 	mux.HandleFunc("GET /api/items/{id}", s.item)
@@ -159,9 +168,13 @@ func (s *Server) Close() {
 	s.browseMu.Lock()
 	s.browseClosed = true
 	s.browseMu.Unlock()
+	s.discoveryService.mu.Lock()
+	s.discoveryService.closed = true
+	s.discoveryService.mu.Unlock()
 	s.cancel()
 	s.wg.Wait()
 	s.browseWG.Wait()
+	s.discoveryService.wg.Wait()
 	s.imageCache.Close()
 	_ = s.cache.close()
 }
@@ -376,6 +389,10 @@ func (s *Server) episodes(w http.ResponseWriter, r *http.Request) {
 	item, ok := s.cache.item(id)
 	if !ok || item.Kind != "series" {
 		fail(w, 404, "not_found", "Series not found.")
+		return
+	}
+	if r.URL.Query().Has("season") {
+		s.seasonEpisodes(w, r, item)
 		return
 	}
 	revision := s.cache.libraryRevision()

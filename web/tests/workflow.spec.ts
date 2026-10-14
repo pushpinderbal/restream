@@ -49,6 +49,7 @@ const episodes = [
   },
 ];
 const now = Date.now();
+const historyKey = "restream.watch-history.v1";
 const programs = [
   {
     channelId: "live-1",
@@ -112,12 +113,14 @@ async function mockApi(
     unconfigured?: boolean;
     cooldown?: boolean;
     createDelayMs?: number;
+    createGate?: Promise<void>;
     releaseDelayMs?: number;
     episodesFailureOnce?: boolean;
     episodeItems?: () => Record<string, unknown>[];
     catalogItems?: Record<string, unknown>[];
     categories?: { id: string; name: string; kind: string }[];
     guidePrograms?: Array<(typeof programs)[number] & { description?: string }>;
+    discoveryResponse?: Record<string, unknown>;
     browseResponse?: (params: URLSearchParams) => Promise<{
       items?: Record<string, unknown>[];
       page?: number;
@@ -176,6 +179,8 @@ async function mockApi(
     catalog: "2026-09-28T12:00:00Z",
     epg: "2026-09-28T12:00:00Z",
   };
+  const sessionStarts: number[] = [];
+  const sessionOffsets = new Map<string, number>();
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     const path = url.pathname;
@@ -275,6 +280,17 @@ async function mockApi(
     }
     if (path === "/api/epg")
       return json({ programs: options.guidePrograms ?? programs });
+    if (path === "/api/discovery")
+      return json(
+        options.discoveryResponse ?? {
+          configured: false,
+          refreshing: false,
+          trendingMovies: [],
+          trendingSeries: [],
+          exploreMovies: [{ item: movie, name: movie.name }],
+          exploreSeries: [{ item: series, name: series.name }],
+        },
+      );
     if (path.startsWith("/api/items/")) {
       const id = decodeURIComponent(path.slice("/api/items/".length));
       const item = (options.catalogItems ?? [live, movie, series]).find(
@@ -312,6 +328,7 @@ async function mockApi(
     if (path === "/api/sessions" && method === "POST") {
       events.push("POST");
       sessionItemIds.push(route.request().postDataJSON().itemId);
+      sessionStarts.push(route.request().postDataJSON().start ?? 0);
       if (options.capacity || active)
         return json(
           {
@@ -323,18 +340,21 @@ async function mockApi(
         );
       active = true;
       nextId++;
+      const offset = Number(route.request().postDataJSON().start) || 0;
+      sessionOffsets.set(`session-${nextId}`, offset);
       polls = 0;
       if (options.createDelayMs)
         await new Promise((resolve) =>
           setTimeout(resolve, options.createDelayMs),
         );
+      if (options.createGate) await options.createGate;
       return json(
         {
           id: `session-${nextId}`,
           url: `/api/streams/session-${nextId}/0/index.m3u8`,
           state: options.starting ? "starting" : "ready",
           duration: 1800,
-          offset: 0,
+          offset,
         },
         201,
       );
@@ -351,7 +371,7 @@ async function mockApi(
             ? "ended"
             : "ready",
         duration: 1800,
-        offset: 0,
+        offset: sessionOffsets.get(id!) ?? 0,
       });
     }
     if (/^\/api\/sessions\/session-\d+$/.test(path) && method === "DELETE") {
@@ -383,6 +403,7 @@ async function mockApi(
   return {
     events,
     sessionItemIds,
+    sessionStarts,
     publishSnapshot: () => {
       catalogReady = true;
     },
@@ -2079,9 +2100,13 @@ test("rapid channel changes skip an intermediate tune and wait for a late stream
 }) => {
   const middle = { ...live, id: "live-2", name: "World Report" };
   const last = { ...live, id: "live-3", name: "Metro Sports" };
+  let releaseInitial!: () => void;
+  const createGate = new Promise<void>((resolve) => {
+    releaseInitial = resolve;
+  });
   const api = await mockApi(page, {
     catalogItems: [live, middle, last],
-    createDelayMs: 1000,
+    createGate,
     releaseDelayMs: 150,
   });
   await page.goto("/");
@@ -2099,6 +2124,7 @@ test("rapid channel changes skip an intermediate tune and wait for a late stream
       response.request().postDataJSON().itemId === last.id,
   );
   await page.getByRole("button", { name: "Open Metro Sports" }).click();
+  releaseInitial();
   expect((await tuned).status()).toBe(201);
   expect(api.sessionItemIds).toEqual([live.id, last.id]);
   await expect(
@@ -2573,4 +2599,487 @@ test("a fatal HLS manifest failure clears media and remains retryable", async ({
     page.getByRole("button", { name: "Try again", exact: true }),
   ).toBeEnabled();
   expect(errors).toEqual([]);
+});
+
+test("season episodes load on demand and returning to a season uses the browser cache", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  const requested: string[] = [];
+  await page.route("**/api/series/series-1/episodes?*", async (route) => {
+    const query = new URL(route.request().url()).searchParams.get("season")!;
+    requested.push(query);
+    const season = query === "first" ? 1 : Number(query);
+    if (season === 2) await new Promise((resolve) => setTimeout(resolve, 300));
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: episodes.filter((episode) => (episode.season ?? 1) === season),
+        season,
+        seasons: [1, 2],
+      }),
+    });
+  });
+  await page.goto("/?section=series");
+  await page.getByRole("button", { name: "Open Night Shift" }).click();
+  await expect(page.getByRole("button", { name: /First Light/ })).toBeVisible();
+  expect(requested).toEqual(["first"]);
+  const selector = page.getByRole("combobox", { name: "Season" });
+  await selector.click();
+  await page.getByRole("option", { name: "Season 2" }).click();
+  await expect(
+    page.getByRole("button", { name: "Play episode", exact: true }),
+  ).toBeDisabled();
+  await expect(page.getByRole("button", { name: /Fresh Start/ })).toBeVisible();
+  expect(requested).toEqual(["first", "2"]);
+  await selector.click();
+  await page.getByRole("option", { name: "Season 1" }).click();
+  await expect(page.getByRole("button", { name: /First Light/ })).toBeVisible();
+  expect(requested).toEqual(["first", "2"]);
+  expect(api.events).not.toContain("POST");
+});
+
+test("an empty dashboard offers all three libraries on desktop and mobile", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  await page.goto("/?view=dashboard");
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toHaveCount(0);
+  for (const label of ["Live TV", "Movies", "Series"]) {
+    await page.getByRole("button", { name: `Browse ${label}` }).click();
+    await expect(
+      page.getByRole("navigation", { name: "Library" }).getByRole("button", {
+        name: label,
+        exact: true,
+      }),
+    ).toHaveAttribute("aria-current", "page");
+    await page.getByRole("button", { name: "Dashboard", exact: true }).click();
+  }
+  await expect(page.getByRole("button", { name: "Clear history" })).toHaveCount(
+    0,
+  );
+  expect(api.events).not.toContain("POST");
+  for (const width of [900, 821, 390, 320]) {
+    await page.setViewportSize({ width, height: 844 });
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth > innerWidth,
+      ),
+    ).toBe(false);
+  }
+  const mobile = page.getByRole("navigation", { name: "Primary navigation" });
+  await expect(mobile.getByRole("button")).toHaveCount(5);
+  await mobile.getByRole("button", { name: "Movies", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Open The Quiet Coast" }),
+  ).toBeVisible();
+  await mobile.getByRole("button", { name: "Dashboard", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toHaveCount(0);
+});
+
+test("dashboard history records playing media, survives reloads, reopens a season and clears", async ({
+  page,
+}) => {
+  test.setTimeout(60000);
+  const api = await mockApi(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open North News" }).click();
+  await page.getByRole("button", { name: "Dashboard", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toHaveCount(0);
+  expect(api.events).not.toContain("POST");
+
+  for (const [label, title] of [
+    ["Live TV", live],
+    ["Movies", movie],
+  ] as const) {
+    await page.getByRole("button", { name: `Browse ${label}` }).click();
+    await page.getByRole("button", { name: `Open ${title.name}` }).click();
+    await page.getByRole("button", { name: "Play", exact: true }).click();
+    await expect(page.locator("video")).toHaveAttribute("src", /index\.m3u8/);
+    // A ready session alone does not count as watched.
+    expect(
+      await page.evaluate(
+        (key) =>
+          JSON.parse(localStorage.getItem(key) || '{"entries":[]}').entries
+            .length,
+        historyKey,
+      ),
+    ).toBe(title.kind === "live" ? 0 : 1);
+    await playableVideo(page);
+    await playableVideo(page); // Buffer recovery must not duplicate history.
+    await page.getByRole("button", { name: "Stop playback" }).click();
+    await page.getByRole("button", { name: "Dashboard", exact: true }).click();
+    await expect(
+      page
+        .getByRole("region", { name: "Recently played" })
+        .getByRole("button", { name: `Open ${title.name}` }),
+    ).toBeVisible();
+  }
+
+  await page.getByRole("button", { name: "Browse Series" }).click();
+  await page.getByRole("button", { name: "Open Night Shift" }).click();
+  await page.getByRole("combobox", { name: "Season" }).click();
+  await page.getByRole("option", { name: "Season 2" }).click();
+  await page.getByRole("button", { name: /Fresh Start/ }).click();
+  await expect(page.locator("video")).toHaveAttribute("src", /index\.m3u8/);
+  await playableVideo(page);
+  await page.getByRole("button", { name: "Stop playback" }).click();
+  await page.getByRole("button", { name: "Dashboard", exact: true }).click();
+  await page.reload();
+  await expect(
+    page
+      .getByRole("region", { name: "Recently played" })
+      .locator(".discovery-recent-card"),
+  ).toHaveCount(3);
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toContainText("S2 · E1");
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toContainText("Fresh Start");
+  const sessions = api.sessionItemIds.length;
+  await page
+    .getByRole("region", { name: "Recently played" })
+    .getByRole("button", { name: "Open Night Shift" })
+    .click();
+  await expect(page.getByRole("combobox", { name: "Season" })).toHaveText(
+    "Season 2",
+  );
+  await expect(page.locator(".episode-row.selected")).toContainText(
+    "Fresh Start",
+  );
+  expect(api.sessionItemIds).toHaveLength(sessions);
+  await page.goBack();
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await page
+    .getByRole("button", { name: "Remove North News from history" })
+    .click();
+  await expect(
+    page
+      .getByRole("region", { name: "Recently played" })
+      .getByRole("button", { name: "Open North News", exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole("button", { name: "Clear history" }).click();
+  await page.reload();
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toHaveCount(0);
+  expect(
+    await page.evaluate((key) => localStorage.getItem(key), historyKey),
+  ).toBeNull();
+});
+
+test("series history updates to the latest episode without duplicating the show", async ({
+  page,
+}) => {
+  await mockApi(page);
+  await page.goto("/?section=series");
+  for (const name of ["First Light", "After Hours"]) {
+    await page.getByRole("button", { name: "Open Night Shift" }).click();
+    await page.getByRole("button", { name: new RegExp(name) }).click();
+    await expect(page.locator("video")).toHaveAttribute("src", /index\.m3u8/);
+    await playableVideo(page);
+    await page.getByRole("button", { name: "Stop playback" }).click();
+  }
+  await page.getByRole("button", { name: "Dashboard", exact: true }).click();
+  await expect(
+    page
+      .getByRole("region", { name: "Recently played" })
+      .locator(".discovery-recent-card"),
+  ).toHaveCount(1);
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toContainText("S1 · E2");
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toContainText("After Hours");
+});
+
+test("failed playback is not recorded in dashboard history", async ({
+  page,
+}) => {
+  await mockApi(page, { capacity: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open North News" }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("No room available");
+  await page.getByRole("button", { name: "Stop playback" }).click();
+  await page.getByRole("button", { name: "Dashboard", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toHaveCount(0);
+});
+
+test("dashboard safely handles corrupt storage and unavailable titles", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  await page.addInitScript(
+    ({ key, movie, watchedAt }) => {
+      localStorage.setItem(
+        key,
+        JSON.stringify({
+          version: 1,
+          entries: [
+            { title: movie, item: movie, watchedAt },
+            { title: movie, item: movie, watchedAt: 1e20 },
+            null,
+            { title: { kind: "bad" }, item: movie, watchedAt },
+          ],
+        }),
+      );
+    },
+    { key: historyKey, movie: { ...movie, id: "gone-movie" }, watchedAt: now },
+  );
+  await page.goto("/?view=dashboard");
+  await expect(
+    page
+      .getByRole("region", { name: "Recently played" })
+      .locator(".discovery-recent-card"),
+  ).toHaveCount(1);
+  await page
+    .getByRole("region", { name: "Recently played" })
+    .getByRole("button", { name: "Open The Quiet Coast" })
+    .click();
+  await expect(page.getByRole("alert")).toContainText("is no longer available");
+  expect(api.events).not.toContain("POST");
+  await page
+    .getByRole("button", { name: "Remove The Quiet Coast from history" })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toHaveCount(0);
+});
+
+test("dashboard remains usable when browser storage is blocked", async ({
+  page,
+}) => {
+  await mockApi(page);
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "localStorage", {
+      get: () => {
+        throw new DOMException("Blocked", "SecurityError");
+      },
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open North News" }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await expect(page.locator("video")).toHaveAttribute("src", /index\.m3u8/);
+  await playableVideo(page);
+  await page.getByRole("button", { name: "Stop playback" }).click();
+  await page.getByRole("button", { name: "Dashboard", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Open North News" }),
+  ).toBeVisible();
+  await expect(page.locator(".discovery-heading")).toContainText(
+    "saved for this visit",
+  );
+  await page.getByRole("button", { name: "Clear history" }).click();
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toHaveCount(0);
+});
+
+test("dashboard resumes the full source position and Play again starts at zero", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  await page.addInitScript(
+    ({ key, movie, watchedAt }) => {
+      if (!localStorage.getItem(key))
+        localStorage.setItem(
+          key,
+          JSON.stringify({
+            version: 1,
+            entries: [
+              {
+                title: movie,
+                item: movie,
+                watchedAt,
+                position: 300,
+                duration: 1800,
+                completed: false,
+              },
+            ],
+          }),
+        );
+    },
+    { key: historyKey, movie, watchedAt: now },
+  );
+  await page.goto("/?view=dashboard");
+  const continuing = page.getByRole("region", { name: "Continue watching" });
+  await expect(continuing).toBeVisible();
+  await continuing
+    .getByRole("button", { name: /Resume The Quiet Coast/ })
+    .click();
+  await expect.poll(() => api.sessionStarts).toEqual([300]);
+  await expect(page.locator("video")).toHaveAttribute("src", /index\.m3u8/);
+  await playableVideo(page, 30);
+  await page.getByRole("button", { name: "Pause", exact: true }).click();
+  expect(
+    await page.evaluate(
+      (key) => JSON.parse(localStorage.getItem(key)!).entries[0].position,
+      historyKey,
+    ),
+  ).toBe(330);
+  await page.locator("video").evaluate((video) => {
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      value: 1500,
+    });
+    video.dispatchEvent(new Event("timeupdate"));
+    video.dispatchEvent(new Event("ended"));
+  });
+  await expect(page.getByRole("button", { name: "Play again" })).toBeVisible();
+  expect(
+    await page.evaluate(
+      (key) => JSON.parse(localStorage.getItem(key)!).entries[0].completed,
+      historyKey,
+    ),
+  ).toBe(true);
+  await page.getByRole("button", { name: "Play again" }).click();
+  await expect.poll(() => api.sessionStarts).toEqual([300, 0]);
+  await page.getByRole("button", { name: "Stop playback" }).click();
+});
+
+test("dashboard Up next crosses a provider season boundary and plays the actual next episode", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  const requested: string[] = [];
+  await page.route("**/api/series/series-1/episodes?*", async (route) => {
+    const season = new URL(route.request().url()).searchParams.get("season")!;
+    requested.push(season);
+    const selected = season === "first" ? 1 : Number(season);
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: episodes.filter((episode) => (episode.season ?? 1) === selected),
+        season: selected,
+        seasons: [1, 2],
+      }),
+    });
+  });
+  await page.addInitScript(
+    ({ key, series, episode, watchedAt }) => {
+      localStorage.setItem(
+        key,
+        JSON.stringify({
+          version: 1,
+          entries: [
+            {
+              title: series,
+              item: episode,
+              watchedAt,
+              position: 1800,
+              duration: 1800,
+              completed: true,
+            },
+          ],
+        }),
+      );
+    },
+    { key: historyKey, series, episode: episodes[1], watchedAt: now },
+  );
+  await page.goto("/?view=dashboard");
+  const next = page.getByRole("complementary", { name: "Up next" });
+  await expect(next).toContainText("Fresh Start");
+  await expect(
+    page.getByRole("region", { name: "Continue watching" }),
+  ).toHaveCount(0);
+  expect(requested).toEqual(["1", "2"]);
+  expect(api.events).not.toContain("POST");
+  await next.getByRole("button", { name: /Play/ }).click();
+  await expect.poll(() => api.sessionItemIds).toEqual(["episode-3"]);
+  await expect.poll(() => api.sessionStarts).toEqual([0]);
+  await page.getByRole("button", { name: "Stop playback" }).click();
+});
+
+test("dashboard clearance during playback is not undone by progress or stopping", async ({
+  page,
+}) => {
+  await mockApi(page);
+  await page.goto("/?section=movie");
+  await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await expect(page.locator("video")).toHaveAttribute("src", /index\.m3u8/);
+  await playableVideo(page, 100);
+  await page.getByRole("button", { name: "Dashboard", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "Player", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Clear history" }).click();
+  await playableVideo(page, 200);
+  await page.getByRole("button", { name: "Stop playback" }).click();
+  expect(
+    await page.evaluate((key) => localStorage.getItem(key), historyKey),
+  ).toBeNull();
+  await expect(
+    page.getByRole("region", { name: "Continue watching" }),
+  ).toHaveCount(0);
+});
+
+test("dashboard discovery has real title actions and keeps personal sections absent without history", async ({
+  page,
+}) => {
+  const api = await mockApi(page, {
+    discoveryResponse: {
+      configured: true,
+      refreshing: false,
+      trendingMovies: [
+        {
+          tmdbId: 17,
+          item: movie,
+          name: movie.name,
+          overview: movie.description,
+          poster: "/artwork-title.svg",
+          backdrop: "/artwork-title.svg",
+          year: 2026,
+          rating: 7.8,
+        },
+      ],
+      trendingSeries: [
+        {
+          tmdbId: 19,
+          item: series,
+          name: series.name,
+          poster: "/artwork-title.svg",
+          backdrop: "/artwork-title.svg",
+        },
+      ],
+      exploreMovies: [],
+      exploreSeries: [],
+    },
+  });
+  await page.goto("/?view=dashboard");
+  await expect(
+    page.getByRole("heading", { name: "Dashboard", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Continue watching" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("region", { name: "Recently played" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("The Quiet Coast", { exact: true }).first(),
+  ).toBeVisible();
+  expect(api.events).not.toContain("POST");
+  await page
+    .getByRole("button", { name: /Play The Quiet Coast/ })
+    .first()
+    .click();
+  await expect.poll(() => api.sessionItemIds).toEqual(["movie-1"]);
+  await expect(
+    page.getByRole("region", { name: "Player", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Stop playback" }).click();
 });

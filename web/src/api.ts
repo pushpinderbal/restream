@@ -10,6 +10,27 @@ export type BrowsePage = {
   total: number;
   hasMore: boolean;
 };
+export type DiscoveryTitle = {
+  tmdbId?: number;
+  item: Item;
+  name: string;
+  overview?: string;
+  poster?: string;
+  backdrop?: string;
+  year?: number;
+  rating?: number;
+  genres?: string[];
+};
+export type Discovery = {
+  configured: boolean;
+  refreshing: boolean;
+  updatedAt?: string;
+  error?: string;
+  trendingMovies: DiscoveryTitle[];
+  trendingSeries: DiscoveryTitle[];
+  exploreMovies: DiscoveryTitle[];
+  exploreSeries: DiscoveryTitle[];
+};
 export type Item = {
   id: string;
   kind: Kind;

@@ -19,6 +19,7 @@ type Config struct {
 	SessionTTL, CatalogRefresh, EPGRefresh, RequestInterval                time.Duration
 	EpisodeCacheTTL                                                        time.Duration
 	TranscodeMode                                                          string
+	TMDBReadAccessToken, TMDBAPIKey                                        string
 }
 
 func LoadConfig() (Config, error) {
@@ -26,7 +27,8 @@ func LoadConfig() (Config, error) {
 		ListenAddr: env("LISTEN_ADDR", ":8080"), DataDir: env("DATA_DIR", "./data"), WebDir: env("WEB_DIR", "./web/dist"),
 		PortalURL: strings.TrimSpace(os.Getenv("STALKER_PORTAL_URL")), MAC: strings.TrimSpace(os.Getenv("STALKER_MAC")),
 		Timezone: env("STALKER_TIMEZONE", "UTC"), UserAgent: os.Getenv("STALKER_USER_AGENT"), SerialNumber: os.Getenv("STALKER_SERIAL_NUMBER"), DeviceID: os.Getenv("STALKER_DEVICE_ID"), DeviceID2: os.Getenv("STALKER_DEVICE_ID2"),
-		TranscodeMode: env("TRANSCODE_MODE", "auto"),
+		TranscodeMode:       env("TRANSCODE_MODE", "auto"),
+		TMDBReadAccessToken: strings.TrimSpace(os.Getenv("TMDB_API_READ_ACCESS_TOKEN")), TMDBAPIKey: strings.TrimSpace(os.Getenv("TMDB_API_KEY")),
 	}
 	var err error
 	responseMB, err := strconv.ParseInt(env("STALKER_MAX_RESPONSE_MB", "64"), 10, 32)
