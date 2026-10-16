@@ -1,16 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ArrowRight,
+  ChevronLeft,
   ChevronRight,
   Clapperboard,
-  Clock3,
   Film,
-  Flame,
   Info,
   MonitorPlay,
   Play,
-  Radio,
-  RotateCcw,
   X,
 } from "lucide-react";
 import {
@@ -23,6 +20,7 @@ import {
 import { isContinueWatching, type WatchHistoryEntry } from "../watch-history";
 import { Artwork } from "./artwork";
 import { Button } from "./ui/button";
+import { SectionTabs } from "./ui/section-tabs";
 import "./discovery-dashboard.css";
 
 type LibraryKind = "live" | "movie" | "series";
@@ -31,7 +29,7 @@ type EpisodePage = { items: Item[]; seasons?: number[]; season?: number };
 const sections = [
   { kind: "live", label: "Live TV", icon: MonitorPlay },
   { kind: "movie", label: "Movies", icon: Film },
-  { kind: "series", label: "Series", icon: Clapperboard },
+  { kind: "series", label: "Shows", icon: Clapperboard },
 ] as const;
 
 function episodeLabel(item: Item) {
@@ -50,10 +48,110 @@ function byEpisode(a: Item, b: Item) {
   );
 }
 
+function ContentRail({
+  label,
+  className,
+  children,
+}: {
+  label: string;
+  className: string;
+  children: ReactNode;
+}) {
+  const rail = useRef<HTMLDivElement>(null);
+  const [scrollable, setScrollable] = useState({
+    previous: false,
+    next: false,
+  });
+  useEffect(() => {
+    const element = rail.current;
+    if (!element) return;
+    const update = () => {
+      const previous = element.scrollLeft > 2;
+      const next =
+        element.scrollLeft + element.clientWidth < element.scrollWidth - 2;
+      setScrollable((current) =>
+        current.previous === previous && current.next === next
+          ? current
+          : { previous, next },
+      );
+    };
+    update();
+    element.addEventListener("scroll", update, { passive: true });
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => {
+      element.removeEventListener("scroll", update);
+      observer.disconnect();
+    };
+  }, [children]);
+  const scroll = (direction: number) => {
+    const element = rail.current;
+    if (element)
+      element.scrollBy({
+        left: direction * element.clientWidth * 0.8,
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+          ? "instant"
+          : "smooth",
+      });
+  };
+  return (
+    <div className="discovery-rail-shell">
+      <div
+        ref={rail}
+        className={className}
+        role="group"
+        aria-label={label}
+        tabIndex={0}
+      >
+        {children}
+      </div>
+      {(scrollable.previous || scrollable.next) && (
+        <div
+          className="discovery-rail-controls"
+          role="group"
+          aria-label={`${label} scrolling`}
+        >
+          <Button
+            variant="ghost"
+            size="icon"
+            className="discovery-rail-control discovery-rail-previous"
+            aria-label={`Scroll ${label.toLowerCase()} left`}
+            disabled={!scrollable.previous}
+            onClick={() => scroll(-1)}
+          >
+            <ChevronLeft
+              className="size-7"
+              size={26}
+              strokeWidth={1.5}
+              aria-hidden="true"
+            />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="discovery-rail-control discovery-rail-next"
+            aria-label={`Scroll ${label.toLowerCase()} right`}
+            disabled={!scrollable.next}
+            onClick={() => scroll(1)}
+          >
+            <ChevronRight
+              className="size-7"
+              size={26}
+              strokeWidth={1.5}
+              aria-hidden="true"
+            />
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Dashboard({
   entries,
   persistent,
   configured,
+  playbackActive = false,
   liveItems,
   programs,
   now,
@@ -65,10 +163,12 @@ export function Dashboard({
   onPlay,
   onPlayEpisode,
   onOpenTitle,
+  isDashboardAllowed = () => true,
 }: {
   entries: WatchHistoryEntry[];
   persistent: boolean;
   configured: boolean;
+  playbackActive?: boolean;
   liveItems: Item[];
   programs: Program[];
   now: number;
@@ -80,6 +180,7 @@ export function Dashboard({
   onPlay: (item: Item) => Promise<void>;
   onPlayEpisode: (title: Item, episode: Item) => Promise<void>;
   onOpenTitle: (item: Item) => Promise<void>;
+  isDashboardAllowed?: (item: Item) => boolean;
 }) {
   const [discovery, setDiscovery] = useState<Discovery | null>(null);
   const [discoveryLoading, setDiscoveryLoading] = useState(configured);
@@ -101,6 +202,13 @@ export function Dashboard({
     },
     [],
   );
+  useEffect(() => {
+    if (!playbackActive) return;
+    pending.current?.abort();
+    operation.current++;
+    setOpening("");
+    setError("");
+  }, [playbackActive]);
 
   useEffect(() => {
     if (!configured) {
@@ -194,12 +302,12 @@ export function Dashboard({
       if (!controller.signal.aborted) setUpNext(next);
     };
     setUpNext([]);
-    if (configured && completedSeries.length) void load();
+    if (!playbackActive && configured && completedSeries.length) void load();
     return () => controller.abort();
     // Progress writes rerender the dashboard; only a different completed
     // episode needs another provider lookup.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [configured, completedKey]);
+  }, [configured, completedKey, playbackActive]);
 
   const continueWatching = entries.filter(isContinueWatching).slice(0, 6);
   const recent = entries
@@ -207,6 +315,7 @@ export function Dashboard({
     .slice(0, 6);
   const livePrograms = useMemo(() => {
     const current = new Map<string, Program>();
+    if (playbackActive) return current;
     for (const program of programs) {
       if (
         Date.parse(program.start) <= now &&
@@ -217,8 +326,9 @@ export function Dashboard({
         current.set(program.channelId, program);
     }
     return current;
-  }, [programs, now]);
+  }, [programs, now, playbackActive]);
   const liveNow = useMemo(() => {
+    if (playbackActive) return [];
     const recentIds = new Set(
       entries
         .filter((entry) => entry.title.kind === "live")
@@ -231,12 +341,20 @@ export function Dashboard({
       ...withGuide.filter((item) => !recentIds.has(item.id)),
       ...liveItems.filter((item) => !guidedIds.has(item.id)),
     ].slice(0, 6);
-  }, [entries, liveItems, livePrograms]);
-  const trendingMovies = discovery?.trendingMovies || [];
-  const trendingSeries = discovery?.trendingSeries || [];
+  }, [entries, liveItems, livePrograms, playbackActive]);
+  const trendingMovies = (discovery?.trendingMovies || []).filter((title) =>
+    isDashboardAllowed(title.item),
+  );
+  const trendingSeries = (discovery?.trendingSeries || []).filter((title) =>
+    isDashboardAllowed(title.item),
+  );
   const hasTrending = trendingMovies.length > 0 || trendingSeries.length > 0;
-  const exploreMovies = discovery?.exploreMovies || [];
-  const exploreSeries = discovery?.exploreSeries || [];
+  const exploreMovies = (discovery?.exploreMovies || []).filter((title) =>
+    isDashboardAllowed(title.item),
+  );
+  const exploreSeries = (discovery?.exploreSeries || []).filter((title) =>
+    isDashboardAllowed(title.item),
+  );
   const movies = hasTrending ? trendingMovies : exploreMovies;
   const series = hasTrending ? trendingSeries : exploreSeries;
   const displayedKind =
@@ -246,6 +364,11 @@ export function Dashboard({
         ? "movie"
         : discoveryKind;
   const titles = (displayedKind === "movie" ? movies : series).slice(0, 12);
+
+  useEffect(() => {
+    if (displayedKind !== discoveryKind) setDiscoveryKind(displayedKind);
+  }, [displayedKind, discoveryKind]);
+
   const featureCandidates = [
     ...trendingMovies,
     ...trendingSeries,
@@ -254,11 +377,8 @@ export function Dashboard({
   ];
   const feature =
     featureCandidates.find((title) => title.backdrop) || featureCandidates[0];
-  const featureTrending =
-    !!feature &&
-    [...trendingMovies, ...trendingSeries].some(
-      (title) => title.item.id === feature.item.id,
-    );
+  const featureArtwork =
+    feature?.backdrop || feature?.poster || feature?.item.image;
   const hasTMDB = featureCandidates.some((title) => title.tmdbId !== undefined);
 
   const run = async (key: string, action: () => Promise<void>) => {
@@ -271,7 +391,7 @@ export function Dashboard({
       if (operation.current === id)
         setError(
           cause instanceof ApiError && cause.status === 404
-            ? "This title is no longer available. Explore the library to find something else."
+            ? "This title is no longer available."
             : cause instanceof Error
               ? cause.message
               : "Couldn’t start playback. Please try again.",
@@ -286,17 +406,19 @@ export function Dashboard({
     const controller = new AbortController();
     pending.current = controller;
     await run(entry.title.id, async () => {
+      const openedAt = operation.current;
       const { item } = await request<{ item: Item }>(
         `/api/items/${encodeURIComponent(entry.title.id)}`,
         { signal: controller.signal },
       );
       if (item.kind !== entry.title.kind)
         throw new ApiError("Title unavailable", 404);
-      if (!controller.signal.aborted) onOpen(entry, item);
+      if (!controller.signal.aborted && operation.current === openedAt)
+        onOpen(entry, item);
     });
   };
 
-  const channelCard = (item: Item, compact = false) => {
+  const channelCard = (item: Item) => {
     const program = livePrograms.get(item.id);
     const elapsed = program
       ? Math.max(
@@ -312,7 +434,7 @@ export function Dashboard({
     return (
       <button
         key={item.id}
-        className={`discovery-channel${compact ? " discovery-channel-compact" : ""}`}
+        className="discovery-channel"
         type="button"
         aria-label={`Watch ${item.name}`}
         disabled={!configured || opening === item.id}
@@ -342,379 +464,341 @@ export function Dashboard({
   };
 
   return (
-    <div className="dashboard discovery-dashboard">
-      <div className="discovery-heading">
-        <div>
-          <h1>Dashboard</h1>
-          <p>
-            {entries.length
-              ? "Pick up where you left off. Find your next favourite."
-              : "Your next great watch starts here."}
-          </p>
-        </div>
-        <div className="discovery-heading-actions">
-          <span className="discovery-history-note">
-            {persistent
-              ? "History stays in this browser"
-              : "History saved for this visit"}
-          </span>
-          {entries.length > 0 && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                pending.current?.abort();
-                operation.current++;
-                setOpening("");
-                setError("");
-                onClear();
-              }}
-            >
-              Clear history
-            </Button>
+    <div
+      className={`dashboard discovery-dashboard${playbackActive ? " discovery-playback-active" : ""}`}
+      role="region"
+      aria-label="Home"
+    >
+      {!playbackActive && (
+        <>
+          {!configured && (
+            <div className="notice" role="status">
+              Provider not configured
+            </div>
           )}
-        </div>
-      </div>
-      {!configured && (
-        <div className="notice" role="status">
-          Ask your administrator to set up the library before watching.
-        </div>
-      )}
-      {error && (
-        <div className="notice" role="alert">
-          {error}
-        </div>
-      )}
-      {discoveryFailed && (
-        <p className="discovery-fetch-note" role="status">
-          Discovery is temporarily unavailable. You can still browse your
-          library.
-        </p>
-      )}
+          {error && (
+            <div className="notice" role="alert">
+              {error}
+            </div>
+          )}
+          {discoveryFailed && (
+            <p className="discovery-fetch-note" role="status">
+              Discovery unavailable
+            </p>
+          )}
 
-      <div className="discovery-lead">
-        {feature ? (
-          <section
-            className={`discovery-feature${feature.backdrop ? " has-backdrop" : ""}`}
-            aria-label={`Featured ${feature.name}`}
-          >
-            {feature.backdrop && (
-              <img
-                className="discovery-feature-backdrop"
-                src={feature.backdrop}
-                alt=""
-                decoding="async"
-                onError={(event) => {
-                  event.currentTarget.style.visibility = "hidden";
-                }}
-              />
-            )}
-            {!feature.backdrop && (
-              <div className="discovery-feature-poster">
-                <Artwork
-                  item={{
-                    ...feature.item,
-                    image: feature.poster || feature.item.image,
+          <div className="discovery-lead">
+            {featureArtwork && (
+              <div className="discovery-lead-art" aria-hidden="true">
+                <img
+                  key={featureArtwork}
+                  src={featureArtwork}
+                  alt=""
+                  decoding="async"
+                  onError={(event) => {
+                    event.currentTarget.style.visibility = "hidden";
                   }}
                 />
               </div>
             )}
-            <div className="discovery-feature-copy">
-              <span className="discovery-eyebrow">
-                {featureTrending ? (
-                  <Flame size={15} aria-hidden="true" />
-                ) : (
-                  <Film size={15} aria-hidden="true" />
-                )}
-                {featureTrending
-                  ? "Trending · Available here"
-                  : "From your library"}
-              </span>
-              <h2>{feature.name}</h2>
-              <div className="discovery-feature-meta">
-                <span>
-                  {feature.item.kind === "series" ? "Series" : "Movie"}
-                </span>
-                {!!feature.year && <span>{feature.year}</span>}
-                {!!feature.rating && (
-                  <span>{feature.rating.toFixed(1)} / 10</span>
-                )}
-                {!!feature.genres?.length && (
-                  <span>{feature.genres.slice(0, 2).join(" · ")}</span>
-                )}
-              </div>
-              <p>
-                {feature.overview ||
-                  feature.item.description ||
-                  "Something new to get lost in. Available to watch in your library."}
-              </p>
-              <div className="discovery-feature-actions">
-                <Button
-                  size="lg"
-                  aria-label={
-                    feature.item.kind === "series"
-                      ? `View episodes of ${feature.name}`
-                      : `Play ${feature.name}`
-                  }
-                  disabled={!configured || opening === feature.item.id}
-                  onClick={() =>
-                    void run(feature.item.id, () =>
-                      feature.item.kind === "series"
-                        ? onOpenTitle(feature.item)
-                        : onPlay(feature.item),
-                    )
-                  }
-                >
-                  {feature.item.kind === "series" ? (
-                    <Clapperboard size={17} aria-hidden="true" />
-                  ) : (
-                    <Play size={17} fill="currentColor" aria-hidden="true" />
-                  )}
-                  {opening === feature.item.id
-                    ? "Opening…"
-                    : feature.item.kind === "series"
-                      ? "View episodes"
-                      : "Play movie"}
-                </Button>
-                <Button
-                  variant="secondary"
-                  size="lg"
-                  aria-label={`Open ${feature.name}`}
-                  onClick={() =>
-                    void run(feature.item.id, () => onOpenTitle(feature.item))
-                  }
-                  disabled={!configured || opening === feature.item.id}
-                >
-                  <Info size={17} aria-hidden="true" /> Details
-                </Button>
-              </div>
-            </div>
-          </section>
-        ) : discoveryLoading ? (
-          <div
-            className="discovery-feature discovery-feature-loading"
-            role="status"
-            aria-label="Loading discovery"
-          >
-            <span className="artwork-skeleton" />
-            <p>Finding something to watch…</p>
-          </div>
-        ) : (
-          <section className="discovery-feature discovery-feature-welcome">
-            <span className="discovery-welcome-symbol">
-              <MonitorPlay size={38} aria-hidden="true" />
-            </span>
-            <div className="discovery-feature-copy">
-              <span className="discovery-eyebrow">
-                Your library. Your evening.
-              </span>
-              <h2>Your watching starts here</h2>
-              <p>
-                Find a movie, start a series, or tune in live. As you watch,
-                this space becomes yours.
-              </p>
-              <Button
-                size="lg"
-                disabled={!configured}
-                onClick={() => onBrowse("movie")}
+            {feature ? (
+              <section
+                className={`discovery-feature${feature.backdrop ? " has-backdrop" : ""}`}
+                aria-label={`Featured ${feature.name}`}
               >
-                Browse Movies <ArrowRight size={17} aria-hidden="true" />
-              </Button>
-            </div>
-          </section>
-        )}
-
-        <aside
-          className="discovery-side"
-          aria-label={upNext.length ? "Up next" : "On right now"}
-        >
-          {upNext.length > 0 ? (
-            <>
-              <div className="discovery-side-heading">
-                <span className="discovery-eyebrow">
-                  <RotateCcw size={14} aria-hidden="true" /> Your next episode
+                <div className="discovery-feature-copy">
+                  <span className="discovery-eyebrow">
+                    Featured in your library
+                  </span>
+                  <h2>{feature.name}</h2>
+                  <div className="discovery-feature-meta">
+                    <span>
+                      {feature.item.kind === "series" ? "Show" : "Movie"}
+                    </span>
+                    {!!feature.year && <span>{feature.year}</span>}
+                    {!!feature.rating && (
+                      <span>{feature.rating.toFixed(1)} / 10</span>
+                    )}
+                    {!!feature.genres?.length && (
+                      <span>{feature.genres.slice(0, 2).join(" · ")}</span>
+                    )}
+                  </div>
+                  {(feature.overview || feature.item.description) && (
+                    <p>{feature.overview || feature.item.description}</p>
+                  )}
+                  <div className="discovery-feature-actions">
+                    <Button
+                      size="lg"
+                      aria-label={
+                        feature.item.kind === "series"
+                          ? `View episodes of ${feature.name}`
+                          : `Play ${feature.name}`
+                      }
+                      disabled={!configured || opening === feature.item.id}
+                      onClick={() =>
+                        void run(feature.item.id, () =>
+                          feature.item.kind === "series"
+                            ? onOpenTitle(feature.item)
+                            : onPlay(feature.item),
+                        )
+                      }
+                    >
+                      {feature.item.kind === "series" ? (
+                        <Clapperboard size={17} aria-hidden="true" />
+                      ) : (
+                        <Play
+                          size={17}
+                          fill="currentColor"
+                          aria-hidden="true"
+                        />
+                      )}
+                      {opening === feature.item.id
+                        ? "Opening…"
+                        : feature.item.kind === "series"
+                          ? "View episodes"
+                          : "Play movie"}
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      size="lg"
+                      aria-label={`Open ${feature.name}`}
+                      onClick={() =>
+                        void run(feature.item.id, () =>
+                          onOpenTitle(feature.item),
+                        )
+                      }
+                      disabled={!configured || opening === feature.item.id}
+                    >
+                      <Info size={17} aria-hidden="true" /> Details
+                    </Button>
+                  </div>
+                </div>
+              </section>
+            ) : discoveryLoading ? (
+              <div
+                className="discovery-feature discovery-feature-loading"
+                role="status"
+                aria-label="Loading discovery"
+              >
+                <span className="artwork-skeleton" />
+                <p>Loading…</p>
+              </div>
+            ) : (
+              <section className="discovery-feature discovery-feature-welcome">
+                <span className="discovery-welcome-symbol">
+                  <MonitorPlay size={38} aria-hidden="true" />
                 </span>
+                <div className="discovery-feature-copy">
+                  <h2>Your next watch starts here.</h2>
+                  <p>
+                    Explore movies, shows, and live channels from your library.
+                  </p>
+                  <Button
+                    size="lg"
+                    disabled={!configured}
+                    onClick={() => onBrowse("movie")}
+                  >
+                    Browse Movies <ArrowRight size={17} aria-hidden="true" />
+                  </Button>
+                </div>
+              </section>
+            )}
+          </div>
+
+          {upNext.length > 0 && (
+            <section className="discovery-section" aria-label="Up next">
+              <div className="discovery-section-heading">
                 <h2>Up next</h2>
               </div>
-              {upNext.slice(0, 2).map(({ entry, episode }) => (
-                <button
-                  key={episode.id}
-                  type="button"
-                  className="discovery-next-card"
-                  aria-label={`Play ${entry.title.name} ${episodeLabel(episode)}: ${episode.name}`}
-                  disabled={opening === episode.id}
-                  onClick={() =>
-                    void run(episode.id, () =>
-                      onPlayEpisode(entry.title, episode),
-                    )
-                  }
-                >
-                  <div className="discovery-next-art">
-                    <Artwork
-                      item={{
-                        ...entry.title,
-                        image: episode.image || entry.title.image,
-                      }}
-                    />
-                    <span className="discovery-next-play">
-                      <Play size={17} fill="currentColor" aria-hidden="true" />
-                    </span>
-                  </div>
-                  <div>
-                    <span>{episodeLabel(episode)}</span>
-                    <h3>{entry.title.name}</h3>
-                    <p>{episode.name}</p>
-                  </div>
-                </button>
-              ))}
-            </>
-          ) : (
-            <>
-              <div className="discovery-side-heading">
-                <span className="discovery-eyebrow">
-                  <Radio size={14} aria-hidden="true" /> Tune in
-                </span>
-                <h2>On right now</h2>
+              <ContentRail label="Up next" className="discovery-next-grid">
+                {upNext.map(({ entry, episode }) => (
+                  <button
+                    key={episode.id}
+                    type="button"
+                    className="discovery-next-card"
+                    aria-label={`Play ${entry.title.name} ${episodeLabel(episode)}: ${episode.name}`}
+                    disabled={opening === episode.id}
+                    onClick={() =>
+                      void run(episode.id, () =>
+                        onPlayEpisode(entry.title, episode),
+                      )
+                    }
+                  >
+                    <div className="discovery-next-art">
+                      <Artwork
+                        item={{
+                          ...entry.title,
+                          image: episode.image || entry.title.image,
+                        }}
+                      />
+                      <span className="discovery-next-play">
+                        <Play
+                          size={17}
+                          fill="currentColor"
+                          aria-hidden="true"
+                        />
+                      </span>
+                    </div>
+                    <div>
+                      <span>{episodeLabel(episode)}</span>
+                      <h3>{entry.title.name}</h3>
+                      <p>{episode.name}</p>
+                    </div>
+                  </button>
+                ))}
+              </ContentRail>
+            </section>
+          )}
+
+          {continueWatching.length > 0 && (
+            <section
+              className="discovery-section"
+              aria-label="Continue watching"
+            >
+              <div className="discovery-section-heading">
+                <div>
+                  <h2>Continue watching</h2>
+                </div>
               </div>
-              {liveNow.slice(0, 2).map((item) => channelCard(item, true))}
-              {!liveNow.length && (
-                <p className="discovery-side-empty">
-                  Movies, shows and live channels, all in one place.
+              <ContentRail
+                label="Continue watching"
+                className="discovery-continue-grid"
+              >
+                {continueWatching.map((entry) => {
+                  const metadata = featureCandidates.find(
+                    (title) => title.item.id === entry.title.id,
+                  );
+                  const remaining =
+                    entry.duration && entry.position
+                      ? Math.ceil((entry.duration - entry.position) / 60)
+                      : 0;
+                  return (
+                    <button
+                      key={entry.title.id}
+                      className="discovery-continue-card"
+                      type="button"
+                      aria-label={`Resume ${entry.title.name}`}
+                      disabled={!configured || opening === entry.title.id}
+                      onClick={() =>
+                        void run(entry.title.id, () => onResume(entry))
+                      }
+                    >
+                      <div className="discovery-landscape-art">
+                        <Artwork
+                          item={{
+                            ...entry.title,
+                            image: metadata?.backdrop || entry.title.image,
+                          }}
+                        />
+                        <span className="discovery-resume-symbol">
+                          <Play
+                            size={22}
+                            fill="currentColor"
+                            aria-hidden="true"
+                          />
+                        </span>
+                        <span className="discovery-remaining">
+                          {remaining > 0
+                            ? `${remaining} min left`
+                            : "Resume watching"}
+                        </span>
+                        <div className="discovery-watch-progress">
+                          <span style={{ width: `${progress(entry)}%` }} />
+                        </div>
+                      </div>
+                      <div className="discovery-continue-copy">
+                        <h3>{entry.title.name}</h3>
+                        <p>
+                          {entry.title.kind === "series"
+                            ? `${episodeLabel(entry.item)} · ${entry.item.name}`
+                            : "Movie"}
+                        </p>
+                      </div>
+                    </button>
+                  );
+                })}
+              </ContentRail>
+            </section>
+          )}
+        </>
+      )}
+
+      {(playbackActive ||
+        titles.length > 0 ||
+        discoveryLoading ||
+        discovery?.refreshing) && (
+        <section
+          className="discovery-section discovery-picks"
+          aria-label={
+            playbackActive
+              ? "Explore"
+              : hasTrending
+                ? "Trending now"
+                : "Explore"
+          }
+        >
+          <div className="discovery-section-heading">
+            <div>
+              <h2>
+                {playbackActive
+                  ? "Explore"
+                  : hasTrending
+                    ? "Trending now"
+                    : "Explore"}
+              </h2>
+            </div>
+            <SectionTabs
+              label="Discovery type"
+              value={displayedKind}
+              className="discovery-type-tabs"
+              onValueChange={(value) => {
+                if (value === "movie" || value === "series")
+                  setDiscoveryKind(value);
+              }}
+              items={[
+                {
+                  value: "movie",
+                  label: "Movies",
+                  icon: Film,
+                  disabled: !movies.length,
+                },
+                {
+                  value: "series",
+                  label: "Shows",
+                  icon: Clapperboard,
+                  disabled: !series.length,
+                },
+              ]}
+            />
+          </div>
+          {playbackActive && (
+            <>
+              {!configured && (
+                <div className="notice" role="status">
+                  Provider not configured
+                </div>
+              )}
+              {error && (
+                <div className="notice" role="alert">
+                  {error}
+                </div>
+              )}
+              {discoveryFailed && (
+                <p className="discovery-fetch-note" role="status">
+                  Discovery unavailable
                 </p>
               )}
             </>
           )}
-          <div
-            className="discovery-destinations"
-            aria-label="Browse your library"
-          >
-            {sections.map(({ kind, label, icon: Icon }) => (
-              <button
-                key={kind}
-                type="button"
-                disabled={!configured}
-                aria-label={`Browse ${label}`}
-                onClick={() => onBrowse(kind)}
-              >
-                <Icon size={16} aria-hidden="true" />
-                <span>{label}</span>
-                <ArrowRight size={14} aria-hidden="true" />
-              </button>
-            ))}
-          </div>
-        </aside>
-      </div>
-
-      {continueWatching.length > 0 && (
-        <section className="discovery-section" aria-label="Continue watching">
-          <div className="discovery-section-heading">
-            <div>
-              <span className="discovery-eyebrow">Right where you left it</span>
-              <h2>Continue watching</h2>
-            </div>
-            <Clock3 size={20} aria-hidden="true" />
-          </div>
-          <div className="discovery-continue-grid">
-            {continueWatching.map((entry) => {
-              const metadata = featureCandidates.find(
-                (title) => title.item.id === entry.title.id,
-              );
-              const remaining =
-                entry.duration && entry.position
-                  ? Math.ceil((entry.duration - entry.position) / 60)
-                  : 0;
-              return (
-                <button
-                  key={entry.title.id}
-                  className="discovery-continue-card"
-                  type="button"
-                  aria-label={`Resume ${entry.title.name}`}
-                  disabled={!configured || opening === entry.title.id}
-                  onClick={() =>
-                    void run(entry.title.id, () => onResume(entry))
-                  }
-                >
-                  <div className="discovery-landscape-art">
-                    <Artwork
-                      item={{
-                        ...entry.title,
-                        image: metadata?.backdrop || entry.title.image,
-                      }}
-                    />
-                    <span className="discovery-resume-symbol">
-                      <Play size={22} fill="currentColor" aria-hidden="true" />
-                    </span>
-                    <span className="discovery-remaining">
-                      {remaining > 0
-                        ? `${remaining} min left`
-                        : "Resume watching"}
-                    </span>
-                    <div className="discovery-watch-progress">
-                      <span style={{ width: `${progress(entry)}%` }} />
-                    </div>
-                  </div>
-                  <div className="discovery-continue-copy">
-                    <h3>{entry.title.name}</h3>
-                    <p>
-                      {entry.title.kind === "series"
-                        ? `${episodeLabel(entry.item)} · ${entry.item.name}`
-                        : "Movie"}
-                    </p>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-      )}
-
-      {(titles.length > 0 || discoveryLoading || discovery?.refreshing) && (
-        <section
-          className="discovery-section discovery-picks"
-          aria-label={hasTrending ? "Trending now" : "Explore your library"}
-        >
-          <div className="discovery-section-heading">
-            <div>
-              <span className="discovery-eyebrow">
-                {hasTrending ? (
-                  <>
-                    <Flame size={13} aria-hidden="true" /> Popular this week ·
-                    Available here
-                  </>
-                ) : (
-                  "Find your next watch"
-                )}
-              </span>
-              <h2>{hasTrending ? "Trending now" : "Explore your library"}</h2>
-            </div>
-            <div className="discovery-segmented" aria-label="Discovery type">
-              <button
-                type="button"
-                aria-pressed={displayedKind === "movie"}
-                onClick={() => setDiscoveryKind("movie")}
-                disabled={!movies.length}
-              >
-                Movies
-              </button>
-              <button
-                type="button"
-                aria-pressed={displayedKind === "series"}
-                onClick={() => setDiscoveryKind("series")}
-                disabled={!series.length}
-              >
-                Shows
-              </button>
-            </div>
-          </div>
           {titles.length > 0 ? (
-            <div className="discovery-poster-grid">
+            <ContentRail label="Titles" className="discovery-poster-grid">
               {titles.map((title, index) => (
                 <button
                   key={title.item.id}
                   type="button"
                   className="discovery-poster-card"
                   aria-label={`Open ${title.name}`}
-                  disabled={opening === title.item.id}
+                  disabled={!configured || opening === title.item.id}
                   onClick={() =>
                     void run(title.item.id, () => onOpenTitle(title.item))
                   }
@@ -723,7 +807,9 @@ export function Dashboard({
                     <Artwork
                       item={{
                         ...title.item,
-                        image: title.poster || title.item.image,
+                        image: playbackActive
+                          ? title.backdrop || title.poster || title.item.image
+                          : title.poster || title.item.image,
                       }}
                     />
                     {hasTrending && (
@@ -736,18 +822,21 @@ export function Dashboard({
                     </span>
                   </div>
                   <h3>{title.name}</h3>
-                  <p>
-                    {[
-                      title.year,
-                      title.item.kind === "series" ? "Series" : "Movie",
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </p>
+                  {(!playbackActive || title.year) && (
+                    <p>
+                      {[
+                        title.year,
+                        !playbackActive &&
+                          (title.item.kind === "series" ? "Show" : "Movie"),
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </p>
+                  )}
                 </button>
               ))}
-            </div>
-          ) : (
+            </ContentRail>
+          ) : discoveryLoading || discovery?.refreshing ? (
             <div
               className="discovery-poster-grid discovery-skeleton-grid"
               role="status"
@@ -759,6 +848,10 @@ export function Dashboard({
                 </div>
               ))}
             </div>
+          ) : (
+            <p className="discovery-explore-empty">
+              {configured ? "No titles" : "Provider not configured"}
+            </p>
           )}
           <button
             type="button"
@@ -766,144 +859,165 @@ export function Dashboard({
             onClick={() => onBrowse(displayedKind)}
             disabled={!configured}
           >
-            Explore all {displayedKind === "movie" ? "movies" : "series"}{" "}
+            All {displayedKind === "movie" ? "movies" : "shows"}{" "}
             <ArrowRight size={15} aria-hidden="true" />
           </button>
         </section>
       )}
 
-      <div
-        className={`discovery-bottom${entries.length === 0 || liveNow.length === 0 ? " discovery-bottom-single" : ""}`}
-      >
-        {liveNow.length > 0 && (
-          <section
-            className="discovery-section discovery-live-section"
-            aria-label="Live now"
-          >
-            <div className="discovery-section-heading">
-              <div>
-                <span className="discovery-eyebrow">
-                  <span className="discovery-live-dot" /> In the moment
-                </span>
-                <h2>Live now</h2>
-              </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                aria-label="View all channels"
-                onClick={() => onBrowse("live")}
-              >
-                All channels <ArrowRight size={15} aria-hidden="true" />
-              </Button>
-            </div>
-            <div className="discovery-channel-grid">
-              {liveNow.map((item) => channelCard(item))}
-            </div>
-          </section>
-        )}
-        {entries.length > 0 && (
-          <section
-            className="discovery-section discovery-recent-section"
-            aria-label="Recently played"
-          >
-            <div className="discovery-section-heading">
-              <div>
-                <span className="discovery-eyebrow">Your viewing trail</span>
-                <h2>Recently played</h2>
-              </div>
-            </div>
-            <div
-              className="discovery-segmented discovery-recent-filters"
-              aria-label="History type"
+      {!playbackActive && (
+        <div
+          className={`discovery-bottom${entries.length === 0 || liveNow.length === 0 ? " discovery-bottom-single" : ""}`}
+        >
+          {liveNow.length > 0 && (
+            <section
+              className="discovery-section discovery-live-section"
+              aria-label="Live now"
             >
-              <button
-                type="button"
-                aria-pressed={recentKind === "all"}
-                onClick={() => setRecentKind("all")}
-              >
-                All
-              </button>
-              {sections.map(({ kind, label }) => (
-                <button
-                  key={kind}
-                  type="button"
-                  aria-pressed={recentKind === kind}
-                  onClick={() => setRecentKind(kind)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <div className="discovery-recent-grid">
-              {recent.map((entry) => (
-                <div
-                  key={entry.title.id}
-                  className={`discovery-recent-card${entry.title.kind === "live" ? " is-live" : ""}`}
-                >
-                  <button
-                    type="button"
-                    className="discovery-recent-open"
-                    aria-label={`Open ${entry.title.name}`}
-                    disabled={!configured || opening === entry.title.id}
-                    onClick={() => void open(entry)}
-                  >
-                    <div className="discovery-recent-art">
-                      <Artwork item={entry.title} />
-                    </div>
-                    <div className="discovery-recent-copy">
-                      <span>
-                        {entry.title.kind === "live"
-                          ? "Live TV"
-                          : entry.title.kind === "series"
-                            ? episodeLabel(entry.item)
-                            : "Movie"}
-                      </span>
-                      <h3>{entry.title.name}</h3>
-                      {entry.title.kind === "series" && (
-                        <p>{entry.item.name}</p>
-                      )}
-                      <time dateTime={new Date(entry.watchedAt).toISOString()}>
-                        {new Date(entry.watchedAt).toLocaleDateString(
-                          undefined,
-                          { month: "short", day: "numeric" },
-                        )}
-                      </time>
-                      {opening === entry.title.id && (
-                        <span className="discovery-opening" role="status">
-                          Opening…
-                        </span>
-                      )}
-                    </div>
-                  </button>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    className="discovery-remove"
-                    aria-label={`Remove ${entry.title.name} from history`}
-                    onClick={() => {
-                      if (opening === entry.title.id) {
-                        pending.current?.abort();
-                        operation.current++;
-                        setOpening("");
-                      }
-                      setError("");
-                      onRemove(entry);
-                    }}
-                  >
-                    <X size={13} aria-hidden="true" />
-                  </Button>
+              <div className="discovery-section-heading">
+                <div>
+                  <h2>Live now</h2>
                 </div>
-              ))}
-            </div>
-            {recent.length === 0 && (
-              <p className="discovery-side-empty">
-                Nothing watched in this section yet. Find something new in your
-                library.
-              </p>
-            )}
-          </section>
-        )}
-      </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="View all channels"
+                  onClick={() => onBrowse("live")}
+                >
+                  All channels <ArrowRight size={15} aria-hidden="true" />
+                </Button>
+              </div>
+              <ContentRail
+                label="Live channels"
+                className="discovery-channel-grid"
+              >
+                {liveNow.map((item) => channelCard(item))}
+              </ContentRail>
+            </section>
+          )}
+          {entries.length > 0 && (
+            <section
+              className="discovery-section discovery-recent-section"
+              aria-label="Recently played"
+            >
+              <div className="discovery-section-heading">
+                <div>
+                  <h2>Recently played</h2>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    pending.current?.abort();
+                    operation.current++;
+                    setOpening("");
+                    setError("");
+                    onClear();
+                  }}
+                >
+                  Clear history
+                </Button>
+              </div>
+              {!persistent && (
+                <p className="discovery-history-note" role="status">
+                  History isn’t saved.
+                </p>
+              )}
+              <SectionTabs
+                label="History type"
+                value={recentKind}
+                className="discovery-recent-filters"
+                onValueChange={(value) => {
+                  if (
+                    value === "all" ||
+                    value === "live" ||
+                    value === "movie" ||
+                    value === "series"
+                  )
+                    setRecentKind(value);
+                }}
+                items={[
+                  { value: "all", label: "All" },
+                  ...sections.map(({ kind, label, icon }) => ({
+                    value: kind,
+                    label,
+                    icon,
+                  })),
+                ]}
+              />
+              <ContentRail
+                label="Recently played"
+                className="discovery-recent-grid"
+              >
+                {recent.map((entry) => (
+                  <div
+                    key={entry.title.id}
+                    className={`discovery-recent-card${entry.title.kind === "live" ? " is-live" : ""}`}
+                  >
+                    <button
+                      type="button"
+                      className="discovery-recent-open"
+                      aria-label={`Open ${entry.title.name}`}
+                      disabled={!configured || opening === entry.title.id}
+                      onClick={() => void open(entry)}
+                    >
+                      <div className="discovery-recent-art">
+                        <Artwork item={entry.title} />
+                      </div>
+                      <div className="discovery-recent-copy">
+                        <span>
+                          {entry.title.kind === "live"
+                            ? "Live TV"
+                            : entry.title.kind === "series"
+                              ? episodeLabel(entry.item)
+                              : "Movie"}
+                        </span>
+                        <h3>{entry.title.name}</h3>
+                        {entry.title.kind === "series" && (
+                          <p>{entry.item.name}</p>
+                        )}
+                        <time
+                          dateTime={new Date(entry.watchedAt).toISOString()}
+                        >
+                          {new Date(entry.watchedAt).toLocaleDateString(
+                            undefined,
+                            { month: "short", day: "numeric" },
+                          )}
+                        </time>
+                        {opening === entry.title.id && (
+                          <span className="discovery-opening" role="status">
+                            Opening…
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      className="discovery-remove"
+                      aria-label={`Remove ${entry.title.name} from history`}
+                      onClick={() => {
+                        if (opening === entry.title.id) {
+                          pending.current?.abort();
+                          operation.current++;
+                          setOpening("");
+                        }
+                        setError("");
+                        onRemove(entry);
+                      }}
+                    >
+                      <X size={13} aria-hidden="true" />
+                    </Button>
+                  </div>
+                ))}
+              </ContentRail>
+              {recent.length === 0 && (
+                <p className="discovery-side-empty">No history</p>
+              )}
+            </section>
+          )}
+        </div>
+      )}
       {hasTMDB && (
         <footer className="discovery-attribution">
           <a

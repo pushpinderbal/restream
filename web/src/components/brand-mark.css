@@ -1,0 +1,68 @@
+.brand-mark {
+  display: block;
+  flex-shrink: 0;
+  width: var(--brand-mark-size, 38px);
+  height: var(--brand-mark-size, 38px);
+  overflow: visible;
+  color: #f5f5f7;
+}
+.brand-fragment {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: brand-assemble 1s cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: var(--fragment-delay, 0ms);
+}
+.brand-fragment-top {
+  --fragment-x: -4px;
+  --fragment-y: -6px;
+  --fragment-rotation: -12deg;
+}
+.brand-fragment-tip {
+  --fragment-delay: 60ms;
+  --fragment-x: 7px;
+  --fragment-y: 0px;
+  --fragment-rotation: 12deg;
+}
+.brand-fragment-center {
+  --fragment-delay: 120ms;
+  --fragment-x: -2px;
+  --fragment-y: 0px;
+  --fragment-rotation: -8deg;
+}
+.brand-fragment-bottom {
+  --fragment-delay: 180ms;
+  --fragment-x: -4px;
+  --fragment-y: 6px;
+  --fragment-rotation: 12deg;
+}
+.brand-resolved {
+  animation: brand-resolve 1.2s ease both;
+}
+@keyframes brand-resolve {
+  0%,
+  80% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+@keyframes brand-assemble {
+  0% {
+    transform: translate(var(--fragment-x), var(--fragment-y))
+      rotate(var(--fragment-rotation));
+    fill: #f08a83;
+    opacity: 0.2;
+  }
+  100% {
+    transform: translate(0, 0) rotate(0deg);
+    fill: #f5f5f7;
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-fragment,
+  .brand-resolved {
+    animation: none;
+  }
+}

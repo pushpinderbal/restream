@@ -1,0 +1,119 @@
+.settings-page.settings-readonly {
+  max-width: 1100px;
+  padding-bottom: 28px;
+}
+.settings-readonly .settings-heading {
+  position: static;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 6px 0 0;
+  background: transparent;
+}
+.settings-readonly .settings-heading > button {
+  flex: none;
+  font-size: 13px;
+}
+.settings-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 64px;
+  margin-top: 28px;
+}
+.settings-summary > dl {
+  min-width: 0;
+}
+.settings-summary dl > div {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 20px;
+  padding: 17px 0;
+  border-bottom: 1px solid #ffffff12;
+}
+.settings-summary dt {
+  color: #a1a1ad;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.settings-summary dd {
+  min-width: 0;
+  margin: 0;
+  color: #e6e6ec;
+  font-size: 14px;
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.settings-summary .settings-category-rules > div {
+  grid-template-columns: 90px minmax(0, 1fr);
+}
+.settings-rule-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.settings-rule-values li {
+  min-width: 0;
+  max-width: 100%;
+  color: #d2d2dc;
+  overflow-wrap: anywhere;
+}
+.settings-rule-values li + li::before {
+  content: "·";
+  padding-right: 8px;
+  color: #727280;
+}
+.settings-current-state {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 20px;
+  color: #aaaab5;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.settings-config-error {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 20px;
+  color: #ff9eab;
+  font-size: 13px;
+}
+@media (max-width: 820px) {
+  .settings-summary {
+    gap: 36px;
+  }
+  .settings-summary dl > div {
+    grid-template-columns: 115px minmax(0, 1fr);
+    gap: 14px;
+  }
+}
+@media (max-width: 560px) {
+  .settings-readonly .settings-heading {
+    gap: 14px;
+    padding-top: 0;
+  }
+  .settings-readonly .settings-heading > button {
+    padding-inline: 12px;
+    font-size: 12px;
+  }
+  .settings-summary {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+    margin-top: 20px;
+  }
+  .settings-summary dl > div,
+  .settings-summary .settings-category-rules > div {
+    grid-template-columns: 120px minmax(0, 1fr);
+    gap: 14px;
+    padding-block: 14px;
+  }
+}

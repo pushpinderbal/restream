@@ -4,6 +4,21 @@ export type Category = {
   name: string;
   kind: "live" | "movie" | "series";
 };
+export type CategoryVisibility = "show" | "block";
+export type CategoryPreference = {
+  kind: Category["kind"];
+  id: string;
+  visibility: CategoryVisibility;
+  dashboard: boolean;
+};
+export type Preferences = {
+  refreshIntervalSeconds: number;
+  categories: CategoryPreference[];
+  configuration?: {
+    dashboardCategories: string[];
+    blockedCategories: string[];
+  };
+};
 export type BrowsePage = {
   items: Item[];
   page: number;
@@ -52,6 +67,7 @@ export type Program = {
   end: string;
 };
 export type Status = {
+  preferencesUpdatedAt?: string;
   libraryUpdatedAt?: string;
   configured: boolean;
   refreshing: boolean;
@@ -128,6 +144,9 @@ export const jsonRequest = <T>(path: string, method: string, data: unknown) =>
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
+
+export const getPreferences = (signal?: AbortSignal) =>
+  request<Preferences>("/api/preferences", { signal });
 
 export function releaseSession(id: string, keepalive = false) {
   return fetch(`/api/sessions/${encodeURIComponent(id)}`, {

@@ -418,21 +418,23 @@ func TestPlaybackHTTPAdmissionAndStop(t *testing.T) {
 }
 
 func TestBrowsePageKeysAndExpiry(t *testing.T) {
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11", CatalogRefresh: 40 * time.Millisecond, EPGRefresh: time.Hour}
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11", CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
 	p := &fixtureProvider{}
-	s, err := New(cfg, p, nil)
+	s, err := New(cfg, nil, nil)
 	if err != nil {
+		t.Fatal(err)
+	}
+	s.provider = p
+	categories, err := p.Categories(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.cache.setCategories(categories); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 	defer s.Close()
-	waitFor(t, func() bool {
-		s.cache.mu.RLock()
-		ready := !s.cache.categoriesAt.IsZero()
-		s.cache.mu.RUnlock()
-		return ready
-	})
 	paths := []string{
 		"/api/browse?kind=movie&category=8&page=1",
 		"/api/browse?kind=movie&category=8&page=2",
@@ -458,7 +460,11 @@ func TestBrowsePageKeysAndExpiry(t *testing.T) {
 	if calls != len(paths) {
 		t.Fatal("fresh page refetched")
 	}
-	time.Sleep(55 * time.Millisecond)
+	// Age just this persisted page instead of depending on a 40ms wall clock
+	// window that can expire while the earlier HTTP assertions are running.
+	if _, err := s.cache.db.Exec(`UPDATE pages SET fetched_at=? WHERE kind='movie' AND category='8' AND search='' AND page=1`, time.Now().Add(-2*time.Hour).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
 	request(t, ts.URL, "GET", paths[0], "")
 	p.mu.Lock()
 	calls = p.browseCalls

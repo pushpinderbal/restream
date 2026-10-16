@@ -15,7 +15,7 @@ import (
 // loadEpisodeList shares provider work and keeps navigation and each season in
 // separate persistent cache entries. A disconnected browser can stop waiting.
 func (s *Server) loadEpisodeList(r *http.Request, series model.Item, key string, revision time.Time, load func(context.Context) ([]model.Item, error)) ([]model.Item, error) {
-	if items, ok := s.cache.getEpisodes(key, s.cfg.EpisodeCacheTTL); ok {
+	if items, ok := s.cache.getEpisodes(key, s.episodeTTL()); ok {
 		return items, nil
 	}
 	result := s.episodeFlights.DoChan(key+"\x00"+revision.Format(time.RFC3339Nano), func() (any, error) {
@@ -27,7 +27,7 @@ func (s *Server) loadEpisodeList(r *http.Request, series model.Item, key string,
 		s.browseWG.Add(1)
 		s.browseMu.Unlock()
 		defer s.browseWG.Done()
-		if items, ok := s.cache.getEpisodes(key, s.cfg.EpisodeCacheTTL); ok {
+		if items, ok := s.cache.getEpisodes(key, s.episodeTTL()); ok {
 			return items, nil
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
@@ -65,7 +65,7 @@ func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series m
 	}
 	revision := s.cache.libraryRevision()
 	// Reuse a fresh complete list from an older browser or provider when possible.
-	rows, complete := s.cache.getEpisodes(series.ID, s.cfg.EpisodeCacheTTL)
+	rows, complete := s.cache.getEpisodes(series.ID, s.episodeTTL())
 	provider, supportsSeasons := s.provider.(model.SeasonProvider)
 	if !complete {
 		key := series.ID
@@ -129,6 +129,10 @@ func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series m
 		}
 		return items[i].Episode < items[j].Episode
 	})
+	if s.blockedItem(series) {
+		blocked(w)
+		return
+	}
 	respond(w, 200, map[string]any{"items": publicItems(items), "seasons": seasons, "season": number})
 }
 

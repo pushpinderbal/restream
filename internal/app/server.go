@@ -58,6 +58,9 @@ type Server struct {
 	imageFlights           singleflight.Group
 	imageFailureTTL        time.Duration
 	discoveryService       *discoveryService
+	preferencesService     *preferencesService
+	sessionItemsMu         sync.Mutex
+	sessionItems           map[string]model.Item
 }
 
 type refreshState struct {
@@ -101,6 +104,12 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{cfg: cfg, provider: provider, streams: streams, cache: cache, ctx: ctx, cancel: cancel, imageClient: &http.Client{Timeout: 12 * time.Second}, imageCache: imageCache, imageFailureTTL: defaultImageFailureTTL}
+	if err := s.initPreferences(); err != nil {
+		cancel()
+		imageCache.Close()
+		_ = cache.close()
+		return nil, err
+	}
 	if err := s.initDiscovery(); err != nil {
 		cancel()
 		imageCache.Close()
@@ -108,6 +117,7 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 		return nil, err
 	}
 	s.refreshWake = [2]chan struct{}{make(chan struct{}, 1), make(chan struct{}, 1)}
+	s.sessionItems = make(map[string]model.Item)
 	cache.mu.RLock()
 	slog.Info("Cache restored", "liveChannels", len(cache.items), "categories", len(cache.categories), "programs", len(cache.programs))
 	if until := cache.portalCooldownUntil; until.After(time.Now()) {
@@ -130,6 +140,7 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok\n")) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok\n")) })
 	mux.HandleFunc("GET /api/status", s.status)
+	mux.HandleFunc("/api/preferences", s.getPreferences)
 	mux.HandleFunc("POST /api/refresh", s.refresh)
 	mux.HandleFunc("GET /api/catalog", s.catalog)
 	mux.HandleFunc("GET /api/categories", s.categories)
@@ -146,7 +157,7 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	mux.HandleFunc("POST /api/sessions/{id}/seek", s.seek)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.stop)
 	if streams != nil {
-		mux.Handle("/api/streams/", streams.MediaHandler())
+		mux.Handle("/api/streams/", s.policyMedia(streams.MediaHandler()))
 	}
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) { fail(w, 404, "not_found", "Not found.") })
 	mux.Handle("/", s.static())
@@ -212,6 +223,7 @@ func (s *Server) static() http.Handler {
 	})
 }
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
+	policy := s.preferencesSnapshot()
 	s.cache.mu.RLock()
 	cat, fullCat, epg, libraryUpdated := s.cache.catalogPublishedAt, s.cache.catalogAt, s.cache.epgAt, s.cache.libraryRefreshedAt
 	metadataAt := fullCat
@@ -220,8 +232,25 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	cooldown := s.cache.portalCooldownUntil
 	library := map[string]any{"liveChannels": len(s.cache.items), "categories": len(s.cache.categories), "programmes": len(s.cache.programs)}
+	if policy.restricted() {
+		live, categories := 0, 0
+		for _, item := range s.cache.items {
+			if s.itemPreferenceLocked(item, policy).Visibility == "show" {
+				live++
+			}
+		}
+		for _, category := range s.cache.categories {
+			if policy.category(category.Kind, category.ID, category.Name).Visibility == "show" {
+				categories++
+			}
+		}
+		library["liveChannels"], library["categories"] = live, categories
+	}
 	movies, series := 0, 0
 	for _, item := range s.cache.byID {
+		if policy.restricted() && s.itemPreferenceLocked(item, policy).Visibility != "show" {
+			continue
+		}
 		if item.Kind == "movie" {
 			movies++
 		}
@@ -231,7 +260,15 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	library["cachedMovies"], library["cachedSeries"] = movies, series
 	var guideStart, guideEnd time.Time
+	visiblePrograms := 0
 	for _, program := range s.cache.programs {
+		if policy.restricted() {
+			channel, known := s.cache.byID[program.ChannelID]
+			if !known || s.itemPreferenceLocked(channel, policy).Visibility != "show" {
+				continue
+			}
+		}
+		visiblePrograms++
 		if guideStart.IsZero() || program.Start.Before(guideStart) {
 			guideStart = program.Start
 		}
@@ -239,6 +276,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 			guideEnd = program.End
 		}
 	}
+	library["programmes"] = visiblePrograms
 	if !guideStart.IsZero() {
 		library["guideStartsAt"] = guideStart
 	}
@@ -271,6 +309,9 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		active = s.streams.Active()
 	}
 	out := map[string]any{"configured": s.provider != nil, "refreshing": busy, "activeStreams": active, "maxStreams": s.cfg.MaxStreams}
+	if updated := s.preferencesSnapshot().updatedAt; !updated.IsZero() {
+		out["preferencesUpdatedAt"] = updated
+	}
 	out["sync"] = map[string]any{"catalog": catSync, "epg": epgSync}
 	out["library"] = library
 	out["timezone"], out["guideHours"] = s.cfg.Timezone, s.cfg.EPGHours
@@ -361,18 +402,51 @@ func (s *Server) item(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "not_found", "Title not found in the library.")
 		return
 	}
+	if s.blockedItem(i) {
+		blocked(w)
+		return
+	}
 	respond(w, 200, map[string]any{"item": publicItems([]model.Item{i})[0]})
 }
 func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
 	s.cache.mu.RLock()
 	data, tag := s.cache.catalogJSON, s.cache.catalogETag
+	items := append([]model.Item(nil), s.cache.items...)
 	s.cache.mu.RUnlock()
+	if s.preferencesSnapshot().restricted() {
+		var err error
+		data, tag, err = catalogSnapshot(s.visibleItems(items, r.URL.Query().Get("dashboard") == "1"))
+		if err != nil {
+			fail(w, 500, "cache", "Could not read the library.")
+			return
+		}
+	}
 	writeSnapshot(w, r, data, tag)
 }
 func (s *Server) epg(w http.ResponseWriter, r *http.Request) {
 	s.cache.mu.RLock()
 	data, tag := s.cache.epgJSON, s.cache.epgETag
+	programs := append([]model.Program(nil), s.cache.programs...)
+	items := append([]model.Item(nil), s.cache.items...)
 	s.cache.mu.RUnlock()
+	if s.preferencesSnapshot().restricted() {
+		channels := map[string]bool{}
+		for _, item := range s.visibleItems(items, false) {
+			channels[item.ID] = true
+		}
+		visible := make([]model.Program, 0, len(programs))
+		for _, program := range programs {
+			if channels[program.ChannelID] {
+				visible = append(visible, program)
+			}
+		}
+		var err error
+		data, tag, err = epgSnapshot(visible)
+		if err != nil {
+			fail(w, 500, "cache", "Could not read the programme guide.")
+			return
+		}
+	}
 	writeSnapshot(w, r, data, tag)
 }
 func writeSnapshot(w http.ResponseWriter, r *http.Request, data []byte, tag string) {
@@ -391,16 +465,20 @@ func (s *Server) episodes(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "not_found", "Series not found.")
 		return
 	}
+	if s.blockedItem(item) {
+		blocked(w)
+		return
+	}
 	if r.URL.Query().Has("season") {
 		s.seasonEpisodes(w, r, item)
 		return
 	}
 	revision := s.cache.libraryRevision()
-	items, cached := s.cache.getEpisodes(id, s.cfg.EpisodeCacheTTL)
+	items, cached := s.cache.getEpisodes(id, s.episodeTTL())
 	if !cached {
 		key := id + "\x00" + revision.Format(time.RFC3339Nano)
 		value, err, _ := s.episodeFlights.Do(key, func() (any, error) {
-			cachedItems, exists := s.cache.getEpisodes(id, s.cfg.EpisodeCacheTTL)
+			cachedItems, exists := s.cache.getEpisodes(id, s.episodeTTL())
 			if exists {
 				return cachedItems, nil
 			}
@@ -431,6 +509,10 @@ func (s *Server) episodes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		items = value.([]model.Item)
+	}
+	if s.blockedItem(item) {
+		blocked(w)
+		return
 	}
 	respond(w, 200, map[string]any{"items": publicItems(items)})
 }
@@ -472,15 +554,20 @@ func episodeFailureReason(err error) string {
 	}
 }
 func (s *Server) refreshInterval(catalog bool) time.Duration {
+	p := s.preferencesSnapshot()
+	if p.unified {
+		cadence := time.Duration(p.value.RefreshIntervalSeconds) * time.Second
+		if catalog {
+			return cadence
+		}
+		return max(time.Minute, min(cadence/4, 6*time.Hour))
+	}
 	interval := s.cfg.EPGRefresh
 	if catalog {
 		interval = s.cfg.CatalogRefresh
 	}
 	if interval <= 0 {
 		interval = 6 * time.Hour
-		if catalog {
-			interval = 24 * time.Hour
-		}
 	}
 	return interval
 }
@@ -501,10 +588,7 @@ func (s *Server) scheduler(catalog bool) {
 	}
 	cooldown := s.cache.portalCooldownUntil
 	s.cache.mu.RUnlock()
-	next := last.Add(interval)
-	if last.IsZero() {
-		next = time.Now()
-	}
+	next := s.nextScheduledRefresh(catalog, last, interval)
 	if cooldown.After(next) {
 		next = cooldown
 	}
@@ -571,7 +655,8 @@ func (s *Server) scheduler(catalog bool) {
 			slog.Info("Refresh retry scheduled", "kind", kind, "nextAt", next, "failures", failures)
 		} else {
 			failures = 0
-			next = time.Now().Add(interval)
+			last = finished
+			next = s.nextScheduledRefresh(catalog, last, s.refreshInterval(catalog))
 		}
 	}
 }
@@ -652,6 +737,16 @@ func (s *Server) categories(w http.ResponseWriter, r *http.Request) {
 	if categories == nil {
 		categories = []model.Category{}
 	}
+	if r.URL.Query().Get("manage") != "1" {
+		p := s.preferencesSnapshot()
+		visible := make([]model.Category, 0, len(categories))
+		for _, category := range categories {
+			if p.category(category.Kind, category.ID, category.Name).Visibility == "show" {
+				visible = append(visible, category)
+			}
+		}
+		categories = visible
+	}
 	respond(w, 200, map[string]any{"categories": categories})
 }
 func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
@@ -680,6 +775,10 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 		}
 		q.Page = n
 	}
+	if !s.browseCategoryAllowed(q.Kind, q.Category) {
+		respond(w, 200, model.BrowsePage{Items: []model.Item{}, Page: q.Page})
+		return
+	}
 
 	s.cache.mu.RLock()
 	if q.Kind == "series" {
@@ -691,13 +790,13 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.cache.mu.RUnlock()
-	page, found, err := s.cache.browse(q, s.cfg.CatalogRefresh)
+	page, found, err := s.cache.browse(q, s.refreshInterval(true))
 	if err != nil {
 		fail(w, 500, "cache", "Could not read the saved page.")
 		return
 	}
 	if found {
-		page.Items = publicItems(page.Items)
+		page.Items = publicItems(s.visibleItems(page.Items, false))
 		respond(w, 200, page)
 		return
 	}
@@ -714,13 +813,16 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 	s.browseWG.Add(1)
 	result := s.browseFlights.DoChan(key, func() (any, error) {
 
-		if saved, ok, err := s.cache.browse(q, s.cfg.CatalogRefresh); err != nil {
+		if saved, ok, err := s.cache.browse(q, s.refreshInterval(true)); err != nil {
 			return nil, err
 		} else if ok {
 			return saved, nil
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
 		defer cancel()
+		if !s.browseCategoryAllowed(q.Kind, q.Category) {
+			return model.BrowsePage{Items: []model.Item{}, Page: q.Page}, nil
+		}
 		loaded, err := provider.Browse(ctx, q)
 		if err != nil {
 			return nil, err
@@ -742,7 +844,7 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 				item.Category = name
 			}
 		}
-		if err = s.cache.setBrowseAtRevision(q, loaded, s.cfg.CatalogRefresh, revision); err != nil {
+		if err = s.cache.setBrowseAtRevision(q, loaded, s.refreshInterval(true), revision); err != nil {
 			return nil, err
 		}
 		return loaded, nil
@@ -759,7 +861,7 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		page = res.Val.(model.BrowsePage)
-		page.Items = publicItems(page.Items)
+		page.Items = publicItems(s.visibleItems(page.Items, false))
 		respond(w, 200, page)
 	}
 }
@@ -780,6 +882,10 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "not_found", "This item is no longer available. Choose another title.")
 		return
 	}
+	if s.blockedItem(item) {
+		blocked(w)
+		return
+	}
 	if item.Kind == "series" {
 		fail(w, 400, "invalid", "Choose an episode to play.")
 		return
@@ -793,9 +899,16 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		streamError(w, err)
 		return
 	}
+	if !s.rememberSession(session.ID, item) {
+		blocked(w)
+		return
+	}
 	respond(w, 201, session)
 }
 func (s *Server) session(w http.ResponseWriter, r *http.Request) {
+	if !s.sessionAllowed(w, r.PathValue("id")) {
+		return
+	}
 	if s.streams == nil {
 		streamError(w, stream.ErrNotFound)
 		return
@@ -808,6 +921,9 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, session)
 }
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
+	if !s.sessionAllowed(w, r.PathValue("id")) {
+		return
+	}
 	if s.streams == nil {
 		streamError(w, stream.ErrNotFound)
 		return
@@ -819,6 +935,9 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 func (s *Server) seek(w http.ResponseWriter, r *http.Request) {
+	if !s.sessionAllowed(w, r.PathValue("id")) {
+		return
+	}
 	if s.streams == nil {
 		streamError(w, stream.ErrNotFound)
 		return
@@ -848,6 +967,9 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.sessionItemsMu.Lock()
+	delete(s.sessionItems, r.PathValue("id"))
+	s.sessionItemsMu.Unlock()
 	w.WriteHeader(204)
 }
 func validPosition(n float64) bool { return !math.IsNaN(n) && !math.IsInf(n, 0) && n >= 0 }
@@ -893,6 +1015,10 @@ func (s *Server) image(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if s.blockedItem(item) {
+		blocked(w)
+		return
+	}
 	if item.Logo == "" {
 		writeImage(w, fallbackArtwork, s.imageFailureTTL)
 		return
@@ -921,6 +1047,10 @@ func (s *Server) image(w http.ResponseWriter, r *http.Request) {
 		s.imageCache.Wait()
 		return image, nil
 	})
+	if s.blockedItem(item) {
+		blocked(w)
+		return
+	}
 	if err != nil {
 		writeImage(w, fallbackArtwork, s.imageFailureTTL)
 		return
