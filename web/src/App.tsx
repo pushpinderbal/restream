@@ -7,43 +7,33 @@ import {
   useMemo,
   useRef,
   useState,
-  type MouseEvent,
   type RefObject,
 } from "react";
-import { createPortal } from "react-dom";
 import type Hls from "hls.js";
 import hlsWorkerUrl from "hls.js/dist/hls.worker.js?url";
 import {
   AnimatePresence,
-  LayoutGroup,
   MotionConfig,
   motion,
   useIsPresent,
   useReducedMotion,
 } from "motion/react";
-import {
-  Radio,
-  Clapperboard,
-  ChevronLeft,
-  ChevronRight,
-  Film,
-  ListFilter,
-  LayoutDashboard,
-  MonitorPlay,
-  Pause,
-  Play,
-  Settings,
-  Square,
-} from "lucide-react";
+import { Radio, ChevronRight, Pause, Play, X } from "lucide-react";
 import type { RefreshTarget } from "./components/settings-page";
 import { PlayerControls } from "./components/player-controls";
-import { GalaxyBackdrop } from "./components/galaxy-backdrop";
+import { AppNavigation } from "./components/app-navigation";
+import { LibraryBrowser } from "./components/library-browser";
+import { SearchPage } from "./components/search-page";
 import { Button } from "./components/ui/button";
 import { Skeleton } from "./components/ui/skeleton";
-import { BeamSearch } from "./components/spectrumui/beam-search";
 import { Artwork } from "./components/artwork";
 import { Dashboard } from "./components/dashboard";
+import {
+  MovieSuggestions,
+  LiveChannelSuggestions,
+} from "./components/watch-suggestions";
 import { useWatchHistory, type WatchHistoryEntry } from "./watch-history";
+import { createContentPolicy } from "./content-preferences";
 import { Spinner } from "./components/spectrumui/spinner-dependencies";
 import {
   Select,
@@ -63,6 +53,7 @@ import {
   type Program,
   type Session,
   type Status,
+  type Preferences,
 } from "./api";
 
 const SettingsPage = lazy(() =>
@@ -81,23 +72,51 @@ function hasMediaSource() {
 
 type Tab = "live" | "movie" | "series";
 type PlaybackSelection = { item: Item; title: Item; start?: number };
+type PlayerOrigin = { url: string; scroll: number; initialURL?: string };
+function playerOriginFromHistory(): PlayerOrigin | null {
+  const origin = window.history.state?.restreamPlayerOrigin;
+  if (!origin || typeof origin.url !== "string") return null;
+  try {
+    if (
+      new URL(origin.url, window.location.href).origin !==
+      window.location.origin
+    )
+      return null;
+    return {
+      url: origin.url,
+      initialURL:
+        typeof origin.initialURL === "string" ? origin.initialURL : origin.url,
+      scroll: Number.isFinite(origin.scroll) ? Math.max(0, origin.scroll) : 0,
+    };
+  } catch {
+    return null;
+  }
+}
 type EpisodeDestination = {
   titleId: string;
   season: number;
   episodeId: string;
 };
 type PlaybackDestination = "library" | "category" | "title" | "season";
-function locationSelection() {
-  const params = new URLSearchParams(window.location.search);
+function locationSelection(href = window.location.href) {
+  const params = new URL(href, window.location.href).searchParams;
   const kind = params.get("section");
   const season = Number(params.get("season"));
   return {
     tab: (kind === "movie" || kind === "series" ? kind : "live") as Tab,
-    category: params.get("category") || "*",
+    category:
+      params.get("view") === "search" ? "*" : params.get("category") || "*",
     search: params.get("search") || "",
     item: params.get("item") || "",
     settings: params.get("view") === "settings",
-    dashboard: params.get("view") === "dashboard",
+    searchView: params.get("view") === "search",
+    dashboard:
+      params.get("view") === "dashboard" ||
+      (!params.has("view") &&
+        !["section", "category", "search", "item"].some((key) =>
+          params.has(key),
+        )),
+    player: params.get("view") === "player",
     episodeDestination:
       params.get("item") && Number.isInteger(season) && season > 0
         ? {
@@ -108,6 +127,11 @@ function locationSelection() {
         : null,
   };
 }
+function browseSelectionForLocation() {
+  const current = locationSelection();
+  const origin = current.player ? playerOriginFromHistory() : null;
+  return origin ? locationSelection(origin.url) : current;
+}
 function writeLocation(
   tab: Tab,
   category: string,
@@ -117,6 +141,8 @@ function writeLocation(
   settings = false,
   episodeDestination: EpisodeDestination | null = null,
   dashboard = false,
+  player = false,
+  searchView = false,
 ) {
   window.history[replace ? "replaceState" : "pushState"](
     {},
@@ -129,6 +155,8 @@ function writeLocation(
       settings,
       episodeDestination,
       dashboard,
+      player,
+      searchView,
     ),
   );
 }
@@ -140,14 +168,18 @@ function selectionURL(
   settings = false,
   episodeDestination: EpisodeDestination | null = null,
   dashboard = false,
+  player = false,
+  searchView = false,
 ) {
   const url = new URL(window.location.href);
-  if (settings) url.searchParams.set("view", "settings");
+  if (player) url.searchParams.set("view", "player");
+  else if (settings) url.searchParams.set("view", "settings");
   else if (dashboard) url.searchParams.set("view", "dashboard");
+  else if (searchView) url.searchParams.set("view", "search");
   else url.searchParams.delete("view");
-  if (tab === "live") url.searchParams.delete("section");
+  if (searchView && !item) url.searchParams.delete("section");
   else url.searchParams.set("section", tab);
-  if (category === "*") url.searchParams.delete("category");
+  if (searchView || category === "*") url.searchParams.delete("category");
   else url.searchParams.set("category", category);
   if (search) url.searchParams.set("search", search);
   else url.searchParams.delete("search");
@@ -162,25 +194,30 @@ function selectionURL(
   }
   return url;
 }
-const sections = [
-  { id: "dashboard" as const, label: "Dashboard", icon: LayoutDashboard },
-  { id: "live" as Tab, label: "Live TV", icon: MonitorPlay },
-  { id: "movie" as Tab, label: "Movies", icon: Film },
-  { id: "series" as Tab, label: "Series", icon: Clapperboard },
-  { id: "settings" as const, label: "Settings", icon: Settings },
-];
-const noRoom =
-  "No room available. All streaming slots are in use. Try again when someone stops watching.";
+const noRoom = "All streaming slots are in use.";
 function formatTime(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime())
     ? ""
     : date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
+function displayTitle(item: Item) {
+  const suffix = item.name.lastIndexOf(" - ");
+  return suffix > 0 &&
+    normalizeSearch(item.name.slice(suffix + 3)) ===
+      normalizeSearch(item.category)
+    ? item.name.slice(0, suffix)
+    : item.name;
+}
+function durationLabel(seconds?: number) {
+  if (!seconds || seconds <= 0) return "";
+  const minutes = Math.round(seconds / 60);
+  return minutes >= 60
+    ? `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+    : `${minutes}m`;
+}
 function message(error: unknown) {
-  return error instanceof Error
-    ? error.message
-    : "Something went wrong. Please try again.";
+  return error instanceof Error ? error.message : "Request failed.";
 }
 function normalizeSearch(text: string) {
   return text
@@ -190,18 +227,10 @@ function normalizeSearch(text: string) {
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim();
 }
-function BrandMark() {
-  return (
-    <span className="brand-mark" aria-hidden="true">
-      <img src="/favicon.svg?v=orbit" width={36} height={36} alt="" />
-    </span>
-  );
-}
 
 function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [statusError, setStatusError] = useState("");
-  const [statusCheckedAt, setStatusCheckedAt] = useState<number | null>(null);
   const statusLoaded = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(
     () => locationSelection().settings,
@@ -209,17 +238,40 @@ function App() {
   const [dashboardOpen, setDashboardOpen] = useState(
     () => locationSelection().dashboard,
   );
+  const [playerOpen, setPlayerOpen] = useState(
+    () => locationSelection().player,
+  );
+  const [searchOpen, setSearchOpen] = useState(
+    () => locationSelection().searchView,
+  );
+  const [playerError, setPlayerError] = useState("");
+  const [playerRetry, setPlayerRetry] = useState(0);
+  const playerOrigin = useRef<PlayerOrigin | null>(playerOriginFromHistory());
+  const playerOpenRef = useRef(playerOpen);
+  playerOpenRef.current = playerOpen;
+  const pendingPlayback = useRef<AbortController | null>(null);
+  const navigationRevision = useRef(0);
+  const cancelPlaybackIntent = useCallback(() => {
+    navigationRevision.current++;
+    pendingPlayback.current?.abort();
+    pendingPlayback.current = null;
+  }, []);
   const watchHistory = useWatchHistory();
+  const historyEntries = useRef(watchHistory.entries);
+  historyEntries.current = watchHistory.entries;
   const [liveItems, setLiveItems] = useState<Item[]>([]);
   const [programs, setPrograms] = useState<Program[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [preferences, setPreferences] = useState<Preferences | null>(null);
+  const [managedCategories, setManagedCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [tab, setTab] = useState<Tab>(() => locationSelection().tab);
-  const [category, setCategory] = useState(() => locationSelection().category);
-  const [search, setSearch] = useState(() => locationSelection().search);
-  const [debouncedSearch, setDebouncedSearch] = useState(
-    () => locationSelection().search,
+  const [tab, setTab] = useState<Tab>(() => browseSelectionForLocation().tab);
+  const [category, setCategory] = useState(
+    () => browseSelectionForLocation().category,
+  );
+  const [search, setSearch] = useState(
+    () => browseSelectionForLocation().search,
   );
   const [browseItems, setBrowseItems] = useState<Item[]>([]);
   const [browsePage, setBrowsePage] = useState(0);
@@ -230,8 +282,10 @@ function App() {
   const [selectedId, setSelectedId] = useState(() => locationSelection().item);
   const [detailError, setDetailError] = useState("");
   const [playbackDetailsId, setPlaybackDetailsId] = useState("");
-  const [livePlaybackRequested, setLivePlaybackRequested] = useState(false);
   const [playback, setPlayback] = useState<PlaybackSelection | null>(null);
+  const playingTitleRef = useRef(playback?.title.id);
+  playingTitleRef.current = playback?.title.id;
+  const [playbackDuration, setPlaybackDuration] = useState(0);
   const [episodeDestination, setEpisodeDestination] =
     useState<EpisodeDestination | null>(
       () => locationSelection().episodeDestination,
@@ -243,53 +297,125 @@ function App() {
   const selectionRef = useRef(selectedId);
   selectionRef.current = selectedId;
   const [catalogGrid, setCatalogGrid] = useState<HTMLDivElement | null>(null);
-  const [playerDock, setPlayerDock] = useState<HTMLDivElement | null>(null);
   const [gridColumns, setGridColumns] = useState(1);
   const libraryScroll = useRef(0);
-  const categoryRail = useRef<HTMLDivElement | null>(null);
   const [loadSentinel, setLoadSentinel] = useState<HTMLDivElement | null>(null);
   const browseAbort = useRef<AbortController | null>(null);
   const browseGeneration = useRef(0);
-  const searchPending = useRef(false);
-  const [searchRevision, setSearchRevision] = useState(0);
   const [now, setNow] = useState(Date.now());
   const [visibleCount, setVisibleCount] = useState(72);
-  const [categoryRailOpen, setCategoryRailOpen] = useState(false);
-  const [categorySearch, setCategorySearch] = useState("");
+  const lastVodTab = useRef<"movie" | "series">(
+    tab === "series" ? "series" : "movie",
+  );
+  useEffect(() => {
+    if (tab !== "live") lastVodTab.current = tab;
+  }, [tab]);
+  const playerSource = (() => {
+    const origin = playerOrigin.current;
+    return origin ? locationSelection(origin.url) : locationSelection();
+  })();
+  const playerContext =
+    playerSource.dashboard || playerSource.settings
+      ? "dashboard"
+      : playerSource.tab;
+  const searchContext = searchOpen || (playerOpen && playerSource.searchView);
+  const discoveryContext =
+    dashboardOpen || (playerOpen && playerContext === "dashboard");
+  const contentPolicy = useMemo(
+    () => createContentPolicy(preferences, managedCategories),
+    [preferences, managedCategories],
+  );
+  const visibleItem = contentPolicy.isVisible;
+  const dashboardItem = contentPolicy.isDashboardAllowed;
+  const visibleHistory = useMemo(
+    () =>
+      preferences
+        ? watchHistory.entries.filter((entry) => dashboardItem(entry.title))
+        : [],
+    [watchHistory.entries, preferences, dashboardItem],
+  );
 
-  useLayoutEffect(() => {
-    if (!playerDock) return;
-    const measure = () => {
-      document.documentElement.style.setProperty(
-        "--player-dock-height",
-        `${playerDock.getBoundingClientRect().height}px`,
-      );
-    };
-    const observer = new ResizeObserver(measure);
-    observer.observe(playerDock);
-    measure();
-    return () => {
-      observer.disconnect();
-      document.documentElement.style.removeProperty("--player-dock-height");
-    };
-  }, [playerDock]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void Promise.all([
+      request<Preferences>("/api/preferences", { signal: controller.signal }),
+      request<{ categories: Category[] }>("/api/categories?manage=1", {
+        signal: controller.signal,
+      }),
+    ])
+      .then(([next, all]) => {
+        if (controller.signal.aborted) return;
+        setPreferences(next);
+        setManagedCategories(all.categories || []);
+      })
+      .catch(() => {
+        // Do not expose local history before the server's category choices load.
+      });
+    return () => controller.abort();
+  }, [status?.preferencesUpdatedAt, status?.catalogUpdatedAt]);
+  useEffect(() => {
+    if (
+      !playback ||
+      contentPolicy.categoryPreference(playback.title)?.visibility !== "block"
+    )
+      return;
+    cancelPlaybackIntent();
+    playerOpenRef.current = false;
+    playerOrigin.current = null;
+    setPlayback(null);
+    setPlayerOpen(false);
+    setSearchOpen(playerSource.searchView);
+    setSelected(null);
+    setSelectedId("");
+    setEpisodeDestination(null);
+    writeLocation(
+      tab,
+      category,
+      search,
+      true,
+      "",
+      false,
+      null,
+      false,
+      false,
+      playerSource.searchView,
+    );
+  }, [
+    preferences,
+    managedCategories,
+    playback,
+    tab,
+    category,
+    search,
+    playerSource.searchView,
+    cancelPlaybackIntent,
+  ]);
 
   useEffect(() => {
     let alive = true;
-    void request<Status>("/api/status")
-      .then((value) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    let checking = false;
+    const check = async () => {
+      if (checking || !alive) return;
+      clearTimeout(timer);
+      checking = true;
+      let nextDelay = 10000;
+      try {
+        const value = await request<Status>("/api/status", {
+          signal: controller.signal,
+        });
         if (alive) {
           setStatus(value);
           statusLoaded.current = true;
           setStatusError("");
-          setStatusCheckedAt(Date.now());
+          nextDelay = value.refreshing ? 2000 : settingsOpen ? 5000 : 10000;
           if (!value.configured) {
             setLoading(false);
             setError("");
           }
         }
-      })
-      .catch((cause) => {
+      } catch (cause) {
         if (alive) {
           setStatusError(message(cause));
           if (!statusLoaded.current) {
@@ -297,52 +423,69 @@ function App() {
             setLoading(false);
           }
         }
-      });
-    const interval = window.setInterval(
-      () => {
-        void request<Status>("/api/status")
-          .then((value) => {
-            if (alive) {
-              setStatus(value);
-              statusLoaded.current = true;
-              setStatusError("");
-              setStatusCheckedAt(Date.now());
-            }
-          })
-          .catch((cause) => {
-            if (alive) setStatusError(message(cause));
-          });
-      },
-      settingsOpen || status?.refreshing ? 2000 : 10000,
-    );
+      } finally {
+        checking = false;
+        if (alive)
+          timer = setTimeout(
+            () => void check(),
+            document.hidden ? 60000 : nextDelay,
+          );
+      }
+    };
+    const onVisibility = () => {
+      if (!document.hidden) void check();
+    };
+    void check();
+    document.addEventListener("visibilitychange", onVisibility);
     const clock = window.setInterval(() => setNow(Date.now()), 30000);
     return () => {
       alive = false;
-      clearInterval(interval);
+      controller.abort();
+      clearTimeout(timer);
       clearInterval(clock);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [settingsOpen, status?.refreshing]);
+  }, [settingsOpen]);
   useEffect(() => {
     const restore = () => {
+      cancelPlaybackIntent();
       const next = locationSelection();
-      searchPending.current = false;
-      setTab(next.tab);
+      const browse = browseSelectionForLocation();
+      const previousOrigin = playerOrigin.current;
+      const returningToOrigin =
+        previousOrigin &&
+        new URL(previousOrigin.url, window.location.href).href ===
+          window.location.href;
+      playerOpenRef.current = next.player;
+      playerOrigin.current = next.player ? playerOriginFromHistory() : null;
+
+      setTab(browse.tab);
       setSettingsOpen(next.settings);
       setDashboardOpen(next.dashboard);
-      setCategory(next.category);
-      setSearch(next.search);
-      setDebouncedSearch(next.search);
+      setSearchOpen(next.searchView);
+      setPlayerOpen(next.player);
+      setPlayback(null);
+      setPlayerError("");
+      setCategory(browse.category);
+      setSearch(browse.search);
+
       setSelectedId(next.item);
       setPlaybackDetailsId("");
       setEpisodeDestination(next.episodeDestination);
       setSelected((old) => (old?.id === next.item ? old : null));
       window.requestAnimationFrame(() =>
-        window.scrollTo({ top: libraryScroll.current }),
+        window.scrollTo({
+          top: next.player
+            ? 0
+            : returningToOrigin && previousOrigin
+              ? previousOrigin.scroll
+              : libraryScroll.current,
+        }),
       );
     };
     window.addEventListener("popstate", restore);
     return () => window.removeEventListener("popstate", restore);
-  }, []);
+  }, [cancelPlaybackIntent]);
   useEffect(() => {
     if (!selectedId || selected?.id === selectedId || !status?.configured)
       return;
@@ -358,7 +501,7 @@ function App() {
     return () => {
       alive = false;
     };
-  }, [selectedId, selected?.id, status?.configured]);
+  }, [selectedId, selected?.id, status?.configured, playerRetry]);
   useEffect(() => {
     if (!status?.configured) return;
     let alive = true;
@@ -386,47 +529,16 @@ function App() {
     return () => {
       alive = false;
     };
-  }, [status?.configured, status?.catalogUpdatedAt, status?.epgUpdatedAt]);
-  useEffect(() => {
-    if (!searchPending.current) return;
-    if (tab !== "live") {
-      browseGeneration.current++;
-      browseAbort.current?.abort();
-      setBrowseLoading(false);
-      setBrowseItems([]);
-      setBrowsePage(0);
-      setHasMore(false);
-      setBrowseError("");
-    }
-    const timer = window.setTimeout(() => {
-      searchPending.current = false;
-      setDebouncedSearch(search.trim());
-      setSearchRevision((value) => value + 1);
-      writeLocation(
-        tab,
-        category,
-        search.trim(),
-        true,
-        selectedId,
-        settingsOpen,
-        episodeDestination,
-        dashboardOpen,
-      );
-    }, 400);
-    return () => clearTimeout(timer);
   }, [
-    search,
-    tab,
-    category,
-    selectedId,
-    settingsOpen,
-    episodeDestination,
-    dashboardOpen,
+    status?.configured,
+    status?.catalogUpdatedAt,
+    status?.epgUpdatedAt,
+    status?.preferencesUpdatedAt,
   ]);
-
   const fetchPage = useCallback(
     (page: number, generation: number, pagesToLoad = 3) => {
-      if (tab === "live" || dashboardOpen) return;
+      if (tab === "live" || discoveryContext || searchContext || settingsOpen)
+        return;
       browseAbort.current?.abort();
       const controller = new AbortController();
       browseAbort.current = controller;
@@ -444,7 +556,7 @@ function App() {
             const params = new URLSearchParams({
               kind: tab,
               category,
-              search: debouncedSearch,
+              search: search,
               page: String(nextPage),
             });
             const result = await request<BrowsePage>(`/api/browse?${params}`, {
@@ -480,7 +592,7 @@ function App() {
         }
       })();
     },
-    [tab, category, debouncedSearch, dashboardOpen],
+    [tab, category, search, discoveryContext, searchContext, settingsOpen],
   );
   useEffect(() => {
     browseGeneration.current++;
@@ -496,11 +608,11 @@ function App() {
   }, [
     tab,
     category,
-    debouncedSearch,
-    searchRevision,
+    search,
     status?.configured,
     status?.libraryUpdatedAt,
     fetchPage,
+    status?.preferencesUpdatedAt,
   ]);
 
   useEffect(() => {
@@ -545,16 +657,28 @@ function App() {
         .map(({ item }) => item),
     [liveSearchIndex, selectedLiveCategoryName, category, liveTerms],
   );
-  const items = tab === "live" ? filteredLive : browseItems;
+  const items = (tab === "live" ? filteredLive : browseItems).filter(
+    visibleItem,
+  );
   const shownItems = tab === "live" ? items.slice(0, visibleCount) : items;
+  const catalogLoading =
+    tab !== "live" && browseLoading && browseItems.length === 0;
   // Keep the selected tile available as its close control when search filters it out.
   const displayedItems =
-    selected && !shownItems.some((item) => item.id === selected.id)
+    selected &&
+    visibleItem(selected) &&
+    !playerOpen &&
+    !shownItems.some((item) => item.id === selected.id)
       ? [selected, ...shownItems]
       : shownItems;
   const epgByChannel = useMemo(() => {
     const grouped = new Map<string, Program[]>();
     for (const program of programs) {
+      if (
+        !program.title.trim() ||
+        normalizeSearch(program.title) === "no information available"
+      )
+        continue;
       const list = grouped.get(program.channelId) || [];
       list.push(program);
       grouped.set(program.channelId, list);
@@ -574,31 +698,127 @@ function App() {
     }
     return current;
   }, [epgByChannel, now]);
-  const onLivePlaybackChange = useCallback((active: boolean) => {
-    setLivePlaybackRequested(active);
-  }, []);
-  const selectCategory = (nextTab: Tab, nextCategory = "*") => {
+  const selectCategory = (
+    nextTab: Tab,
+    nextCategory = "*",
+    {
+      replace = false,
+      retainPlayback = false,
+      searchView: nextSearchView = false,
+      query: nextSearch = "",
+    }: {
+      replace?: boolean;
+      retainPlayback?: boolean;
+      searchView?: boolean;
+      query?: string;
+    } = {},
+  ) => {
+    if (
+      retainPlayback &&
+      playerOpen &&
+      playback &&
+      playerContext !== "dashboard"
+    ) {
+      cancelPlaybackIntent();
+
+      setTab(nextTab);
+      setCategory(nextCategory);
+      setSearch(nextSearch);
+
+      setVisibleCount(72);
+      setSelected(playback.title);
+      setSelectedId(playback.title.id);
+      const origin = playerOrigin.current;
+      if (origin)
+        origin.url = selectionURL(
+          nextTab,
+          nextCategory,
+          nextSearch.trim(),
+          "",
+          false,
+          null,
+          false,
+          false,
+          nextSearchView,
+        ).href;
+      window.history.replaceState(
+        { restreamPlayerOrigin: origin },
+        "",
+        selectionURL(
+          nextTab,
+          nextCategory,
+          nextSearch.trim(),
+          playback.title.id,
+          false,
+          episodeDestination,
+          false,
+          true,
+        ),
+      );
+      return;
+    }
+    cancelPlaybackIntent();
+    playerOpenRef.current = false;
+    setPlayback(null);
+    setPlayerOpen(false);
+    setPlayerError("");
+    playerOrigin.current = null;
     setSettingsOpen(false);
     setDashboardOpen(false);
-    searchPending.current = false;
-    writeLocation(nextTab, nextCategory, "");
+    setSearchOpen(nextSearchView);
+
+    writeLocation(
+      nextTab,
+      nextCategory,
+      nextSearch.trim(),
+      replace,
+      "",
+      false,
+      null,
+      false,
+      false,
+      nextSearchView,
+    );
     setTab(nextTab);
     setCategory(nextCategory);
-    setSearch("");
-    setDebouncedSearch("");
+    setSearch(nextSearch);
+
     setVisibleCount(72);
     setSelected(null);
     setSelectedId("");
     setPlaybackDetailsId("");
     setEpisodeDestination(null);
   };
-  const navigateSection = (next: Tab | "dashboard" | "settings") => {
-    if (next === "dashboard") {
+  const navigateSection = (next: Tab | "dashboard" | "settings" | "search") => {
+    if (next === "search" && searchOpen && !playerOpen) {
+      document
+        .querySelector<HTMLInputElement>('input[aria-label="Search library"]')
+        ?.focus();
+      return;
+    }
+    cancelPlaybackIntent();
+    if (playerOpen) {
+      playerOpenRef.current = false;
+      setPlayback(null);
+      setPlayerOpen(false);
+      setPlayerError("");
+    }
+    if (next === "search") {
+      const nextTab = dashboardOpen || settingsOpen ? lastVodTab.current : tab;
+      selectCategory(nextTab, "*", { searchView: true });
+      window.requestAnimationFrame(() =>
+        document
+          .querySelector<HTMLInputElement>('input[aria-label="Search library"]')
+          ?.focus(),
+      );
+      window.scrollTo({ top: 0 });
+    } else if (next === "dashboard") {
       if (dashboardOpen) return;
-      searchPending.current = false;
+
       writeLocation(tab, category, search, false, "", false, null, true);
       setDashboardOpen(true);
       setSettingsOpen(false);
+      setSearchOpen(false);
       setSelected(null);
       setSelectedId("");
       setPlaybackDetailsId("");
@@ -611,18 +831,17 @@ function App() {
       writeLocation(tab, category, search, false, selectedId, true);
       setSettingsOpen(true);
       setDashboardOpen(false);
+      setSearchOpen(false);
       window.scrollTo({ top: 0 });
-    } else if (settingsOpen && next === tab) {
-      writeLocation(tab, category, search, false, selectedId);
-      setSettingsOpen(false);
-      window.requestAnimationFrame(() =>
-        window.scrollTo({ top: libraryScroll.current }),
-      );
     } else selectCategory(next);
   };
-  const openDetails = (title: Item, episodeItem: Item | null = null) => {
+  const openDetails = (
+    title: Item,
+    episodeItem: Item | null = null,
+    replace = false,
+  ) => {
     const nextTab = title.kind as Tab;
-    selectCategory(nextTab);
+    selectCategory(nextTab, "*", { replace });
     const episodeTarget =
       title.kind === "series" && episodeItem
         ? {
@@ -646,7 +865,6 @@ function App() {
       const next = await request<Status>("/api/status");
       setStatus(next);
       setStatusError("");
-      setStatusCheckedAt(Date.now());
     } catch (cause) {
       setStatusError(message(cause));
       throw cause;
@@ -666,6 +884,7 @@ function App() {
   }, []);
   const requestPlayback = useCallback(
     (item: Item, title: Item, start = 0) => {
+      cancelPlaybackIntent();
       const knownTitle = [...liveItems, ...browseItems].find(
         (value) => value.id === title.id,
       );
@@ -676,55 +895,175 @@ function App() {
       const titleCategory = categories.find(
         (value) => value.kind === title.kind && value.id === categoryID,
       );
+      const playbackTitle = {
+        ...title,
+        categoryId: categoryID || undefined,
+        category:
+          titleCategory?.name || title.category || knownTitle?.category || "",
+      };
+      const episodeTarget =
+        title.kind === "series"
+          ? { titleId: title.id, season: item.season || 1, episodeId: item.id }
+          : null;
+      const alreadyOnPlayer = playerOpenRef.current;
+      playerOpenRef.current = true;
+      if (!alreadyOnPlayer) {
+        const current = locationSelection();
+        let url = window.location.href;
+        if (
+          !current.dashboard &&
+          !current.settings &&
+          current.item === title.id &&
+          episodeTarget
+        ) {
+          url = selectionURL(
+            current.tab,
+            current.category,
+            current.search,
+            title.id,
+            false,
+            episodeTarget,
+            false,
+            false,
+            current.searchView,
+          ).href;
+          window.history.replaceState(window.history.state, "", url);
+        }
+        playerOrigin.current = { url, initialURL: url, scroll: window.scrollY };
+      }
+      const originSelection = playerOrigin.current
+        ? locationSelection(playerOrigin.current.url)
+        : locationSelection();
+      const libraryOrigin =
+        !originSelection.dashboard && !originSelection.settings;
+      const browseTab = libraryOrigin
+        ? originSelection.tab
+        : (title.kind as Tab);
+      const browseCategory = libraryOrigin
+        ? originSelection.category
+        : categoryID || "*";
+      const browseSearch = libraryOrigin ? originSelection.search : "";
+      window.history[alreadyOnPlayer ? "replaceState" : "pushState"](
+        { restreamPlayerOrigin: playerOrigin.current },
+        "",
+        selectionURL(
+          browseTab,
+          browseCategory,
+          browseSearch,
+          title.id,
+          false,
+          episodeTarget,
+          false,
+          true,
+        ),
+      );
+
+      setPlayerError("");
+      setPlayerOpen(true);
+      setDashboardOpen(false);
+      setSettingsOpen(false);
+      setSearchOpen(false);
+      setTab(browseTab);
+      setCategory(browseCategory);
+      setSearch(browseSearch);
+
+      setSelected(playbackTitle);
+      setSelectedId(title.id);
+      setEpisodeDestination(episodeTarget);
       setPlayback({
         item,
         start: item.kind === "live" ? 0 : Math.max(0, start),
-        title: {
-          ...title,
-          categoryId: categoryID || undefined,
-          category:
-            titleCategory?.name || title.category || knownTitle?.category || "",
-        },
+        title: playbackTitle,
       });
-      setLivePlaybackRequested(item.kind === "live");
+      setPlaybackDuration(0);
+      window.scrollTo({ top: 0 });
     },
-    [liveItems, browseItems, categories, tab, category],
+    [liveItems, browseItems, categories, tab, category, cancelPlaybackIntent],
   );
   const closePlayer = useCallback(() => {
+    cancelPlaybackIntent();
+    if (playerOpen && playback) {
+      setSelected(playback.title);
+      setSelectedId(playback.title.id);
+      setDetailError("");
+      opener.current?.focus({ preventScroll: true });
+      return;
+    }
     if (playback?.title.id === selectedId) {
       setPlayback(null);
-      setLivePlaybackRequested(false);
     }
     setSelected(null);
     setSelectedId("");
     setDetailError("");
     scrolledExpansion.current = "";
-    writeLocation(tab, category, search, true);
+    writeLocation(
+      tab,
+      category,
+      search,
+      true,
+      "",
+      false,
+      null,
+      false,
+      false,
+      searchContext,
+    );
     window.requestAnimationFrame(() => {
       const target = opener.current?.isConnected
         ? opener.current
-        : document.querySelector<HTMLInputElement>(".header-search input");
+        : document.querySelector<HTMLInputElement>(
+            'input[aria-label="Search library"]',
+          ) ||
+          document.querySelector<HTMLButtonElement>(".category-select-trigger");
       if (opener.current?.isConnected)
         opener.current.scrollIntoView({ block: "nearest", behavior: "smooth" });
       target?.focus({ preventScroll: true });
     });
-  }, [tab, category, search, playback?.title.id, selectedId]);
+  }, [
+    tab,
+    category,
+    search,
+    playback?.title.id,
+    selectedId,
+    cancelPlaybackIntent,
+    playerOpen,
+    playback,
+    searchContext,
+  ]);
   const stopPlayback = () => {
+    cancelPlaybackIntent();
+    playerOpenRef.current = false;
+    const title = playback?.title || selected;
+    const episode = playback?.item.kind === "episode" ? playback.item : null;
+    const origin = playerOrigin.current;
     setPlayback(null);
-    setLivePlaybackRequested(false);
-    if (playback?.title.id === selectedId) closePlayer();
+    setPlayerOpen(false);
+    setPlayerError("");
+    if (origin && origin.initialURL && origin.url !== origin.initialURL) {
+      window.history.replaceState({}, "", origin.url);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    } else if (origin && playerOriginFromHistory() && window.history.length > 1)
+      window.history.back();
+    else if (title) openDetails(title, episode, true);
+    else selectCategory(tab, "*", { replace: true });
   };
-  const verifyDashboardTitle = async (title: Item) => {
+  const verifyDashboardTitle = async (title: Item, signal?: AbortSignal) => {
     const { item } = await request<{ item: Item }>(
       `/api/items/${encodeURIComponent(title.id)}`,
+      { signal },
     );
     if (item.kind !== title.kind || item.kind === "episode")
       throw new Error("This title is no longer available.");
     return item;
   };
-  const dashboardEpisode = async (title: Item, wanted?: Item) => {
+  const dashboardEpisode = async (
+    title: Item,
+    wanted?: Pick<Item, "id" | "season" | "episode">,
+    signal?: AbortSignal,
+  ) => {
     const result = await request<{ items: Item[] }>(
       `/api/series/${encodeURIComponent(title.id)}/episodes?season=${wanted?.season || (wanted ? 1 : "first")}`,
+      { signal },
     );
     const episodes = (result.items || [])
       .filter((item) => item.kind === "episode")
@@ -745,28 +1084,114 @@ function App() {
     if (!episode) throw new Error("This episode is no longer available.");
     return episode;
   };
-  const playDashboardTitle = async (title: Item) => {
-    const verified = await verifyDashboardTitle(title);
-    const target =
-      verified.kind === "series" ? await dashboardEpisode(verified) : verified;
-    requestPlayback(target, verified);
-    window.scrollTo({ top: 0 });
+  const startDashboardPlayback = async (
+    title: Item,
+    wanted?: Item,
+    start = 0,
+  ) => {
+    cancelPlaybackIntent();
+    const revision = navigationRevision.current;
+    const controller = new AbortController();
+    pendingPlayback.current = controller;
+    try {
+      const verified = await verifyDashboardTitle(title, controller.signal);
+      const target =
+        verified.kind === "series"
+          ? await dashboardEpisode(verified, wanted, controller.signal)
+          : verified;
+      if (controller.signal.aborted || revision !== navigationRevision.current)
+        return;
+      requestPlayback(target, verified, start);
+    } catch (cause) {
+      if (!controller.signal.aborted) throw cause;
+    } finally {
+      if (pendingPlayback.current === controller)
+        pendingPlayback.current = null;
+    }
   };
-  const resumeDashboardTitle = async (entry: WatchHistoryEntry) => {
-    const title = await verifyDashboardTitle(entry.title);
-    const target =
-      title.kind === "series"
-        ? await dashboardEpisode(title, entry.item)
-        : title;
-    requestPlayback(target, title, entry.completed ? 0 : entry.position);
-    window.scrollTo({ top: 0 });
+  const playDashboardTitle = (title: Item) => startDashboardPlayback(title);
+  const openDashboardDetails = async (title: Item) => {
+    cancelPlaybackIntent();
+    const revision = navigationRevision.current;
+    const controller = new AbortController();
+    pendingPlayback.current = controller;
+    try {
+      const verified = await verifyDashboardTitle(title, controller.signal);
+      if (!controller.signal.aborted && revision === navigationRevision.current)
+        openDetails(verified);
+    } catch (cause) {
+      if (!controller.signal.aborted) throw cause;
+    } finally {
+      if (pendingPlayback.current === controller)
+        pendingPlayback.current = null;
+    }
   };
-  const playDashboardEpisode = async (title: Item, episode: Item) => {
-    const verified = await verifyDashboardTitle(title);
-    const target = await dashboardEpisode(verified, episode);
-    requestPlayback(target, verified);
-    window.scrollTo({ top: 0 });
-  };
+  const resumeDashboardTitle = (entry: WatchHistoryEntry) =>
+    startDashboardPlayback(
+      entry.title,
+      entry.item,
+      entry.completed ? 0 : entry.position,
+    );
+  const playDashboardEpisode = (title: Item, episode: Item) =>
+    startDashboardPlayback(title, episode);
+  useEffect(() => {
+    if (!playerOpen || playback || !selected || !status?.configured) return;
+    const controller = new AbortController();
+    setPlayerError("");
+    void (async () => {
+      try {
+        if (
+          selected.kind !== "live" &&
+          selected.kind !== "movie" &&
+          selected.kind !== "series"
+        )
+          throw new Error("Choose a channel, movie or show to watch.");
+        const target =
+          selected.kind === "series"
+            ? await dashboardEpisode(
+                selected,
+                episodeDestination?.episodeId
+                  ? {
+                      id: episodeDestination.episodeId,
+                      season: episodeDestination.season,
+                    }
+                  : undefined,
+                controller.signal,
+              )
+            : selected;
+        if (controller.signal.aborted) return;
+        const saved = historyEntries.current.find(
+          (entry) =>
+            entry.title.id === selected.id && entry.item.id === target.id,
+        );
+        requestPlayback(
+          target,
+          selected,
+          saved && !saved.completed ? saved.position : 0,
+        );
+      } catch (cause) {
+        if (!controller.signal.aborted) setPlayerError(message(cause));
+      }
+    })();
+    return () => controller.abort();
+  }, [
+    playerOpen,
+    playback?.item.id,
+    selected?.id,
+    episodeDestination?.episodeId,
+    episodeDestination?.season,
+    status?.configured,
+    playerRetry,
+  ]);
+  useEffect(() => {
+    if (!playerOpen || !playback) return;
+    const frame = window.requestAnimationFrame(() =>
+      document
+        .querySelector<HTMLElement>(".watch-sidebar .dock-title")
+        ?.focus({ preventScroll: true }),
+    );
+    return () => window.cancelAnimationFrame(frame);
+  }, [playerOpen, playback?.item.id]);
   const playbackCategory =
     playback &&
     categories.find(
@@ -815,33 +1240,17 @@ function App() {
     () => categories.filter((value) => value.kind === tab),
     [categories, tab],
   );
-  const visibleCategories = useMemo(() => {
-    const terms = normalizeSearch(categorySearch).split(/\s+/).filter(Boolean);
-    if (!terms.length) return sectionCategories;
-    return sectionCategories.filter((value) => {
-      const name = normalizeSearch(value.name);
-      return terms.every((term) => name.includes(term));
-    });
-  }, [categorySearch, sectionCategories]);
-  useEffect(() => {
-    setCategorySearch("");
-    setCategoryRailOpen(false);
-  }, [tab]);
-  useEffect(() => {
-    const frame = window.requestAnimationFrame(() => {
-      categoryRail.current
-        ?.querySelector<HTMLElement>('[aria-current="page"]')
-        ?.scrollIntoView({
-          behavior: "smooth",
-          block: "nearest",
-          inline: "center",
-        });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [tab, category]);
   useEffect(() => {
     const target = loadSentinel;
-    if (!target || dashboardOpen || browseLoading || browseError) return;
+    if (
+      !target ||
+      discoveryContext ||
+      searchContext ||
+      settingsOpen ||
+      browseLoading ||
+      browseError
+    )
+      return;
     const hasNext = tab === "live" ? items.length > visibleCount : hasMore;
     if (!hasNext) return;
     let active = true;
@@ -864,7 +1273,9 @@ function App() {
     browseError,
     browseLoading,
     browsePage,
-    dashboardOpen,
+    discoveryContext,
+    searchContext,
+    settingsOpen,
     fetchPage,
     hasMore,
     items.length,
@@ -873,6 +1284,13 @@ function App() {
     visibleCount,
   ]);
   const openTitle = (item: Item, element?: HTMLButtonElement) => {
+    cancelPlaybackIntent();
+    if (playerOpen && item.id === playback?.title.id) {
+      document
+        .querySelector(".player-page")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
     if (selectedId === item.id) {
       if (element) closePlayer();
       else
@@ -883,17 +1301,28 @@ function App() {
       return;
     }
     if (element) opener.current = element;
+    if (searchContext) setTab(item.kind as Tab);
     libraryScroll.current = window.scrollY;
     scrolledExpansion.current = "";
-    searchPending.current = false;
+
     setDetailError("");
     setSelected(item);
     setPlaybackDetailsId("");
     setEpisodeDestination(null);
     setSelectedId(item.id);
-    if (item.kind === "live" && livePlaybackRequested)
-      requestPlayback(item, item);
-    writeLocation(tab, category, search, false, item.id);
+    if (!playerOpen)
+      writeLocation(
+        searchContext ? (item.kind as Tab) : tab,
+        searchContext ? "*" : category,
+        search,
+        false,
+        item.id,
+        false,
+        null,
+        false,
+        false,
+        searchContext,
+      );
   };
   const selectedIndex = displayedItems.findIndex(
     (item) => item.id === selectedId,
@@ -905,164 +1334,242 @@ function App() {
           displayedItems.length - 1,
           Math.ceil((selectedIndex + 1) / gridColumns) * gridColumns - 1,
         );
+  // Search mounts details with their result group, so its first mount must
+  // animate for the reveal handler to bring the title controls into view.
   const inlineDetails = (
-    <AnimatePresence mode="wait" initial={false}>
-      {selectedId && (
-        <motion.section
-          key={selectedId}
-          ref={expandedArea}
-          id="inline-title-details"
-          className="inline-expansion"
-          aria-label="Expanded title"
-          style={{ order: rowEnd * 2 + 1 }}
-          initial={{ height: 0, opacity: 0 }}
-          animate={{ height: "auto", opacity: 1 }}
-          exit={{ height: 0, opacity: 0 }}
-          transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
-          onAnimationComplete={() => {
-            if (
-              selectionRef.current !== selectedId ||
-              scrolledExpansion.current === selectedId
-            )
-              return;
-            scrolledExpansion.current = selectedId;
-            expandedArea.current?.scrollIntoView({
-              block: "nearest",
-              behavior: "smooth",
-            });
-            const focusTarget =
-              expandedArea.current?.querySelector<HTMLElement>(
-                ".playback-area",
-              ) || expandedArea.current?.querySelector<HTMLElement>("h1");
-            focusTarget?.focus({ preventScroll: true });
-          }}
-        >
-          {selected ? (
-            <PlayerPage
-              key={`${selected.kind}:${selected.id}`}
-              item={selected}
-              programs={epgByChannel.get(selected.id) || []}
-              now={now}
-              playback={playback}
-              refreshRevision={status?.libraryUpdatedAt}
-              showDetails={playbackDetailsId === selected.id}
-              episodeDestination={
-                episodeDestination?.titleId === selected.id
-                  ? episodeDestination
-                  : null
-              }
-              onPlay={requestPlayback}
-            />
-          ) : detailError ? (
-            <div className="inline-detail-state" role="alert">
-              <h2>Couldn’t open this title</h2>
-              <p>{detailError}</p>
-            </div>
-          ) : (
-            <div className="inline-detail-state inline-loading" role="status">
-              <Spinner size="medium" className="app-spinner" />
-              Opening title…
-            </div>
-          )}
-        </motion.section>
-      )}
+    <AnimatePresence mode="wait" initial={searchContext}>
+      {selectedId &&
+        (!selected || visibleItem(selected)) &&
+        (!playerOpen || (!!playback && selectedId !== playback.title.id)) && (
+          <motion.section
+            key={selectedId}
+            ref={expandedArea}
+            id="inline-title-details"
+            className="inline-expansion"
+            aria-label="Expanded title"
+            style={{ order: rowEnd * 2 + 1 }}
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+            onAnimationComplete={() => {
+              if (
+                (playerOpenRef.current &&
+                  playingTitleRef.current === selectedId) ||
+                selectionRef.current !== selectedId ||
+                scrolledExpansion.current === selectedId
+              )
+                return;
+              scrolledExpansion.current = selectedId;
+              expandedArea.current?.scrollIntoView({
+                block: "start",
+                behavior: "smooth",
+              });
+              const focusTarget =
+                expandedArea.current?.querySelector<HTMLElement>(
+                  ".playback-area",
+                ) || expandedArea.current?.querySelector<HTMLElement>("h1");
+              focusTarget?.focus({ preventScroll: true });
+            }}
+          >
+            <Button
+              variant="ghost"
+              size="icon"
+              className="inline-close"
+              aria-label="Close title details"
+              onClick={closePlayer}
+            >
+              <X size={18} aria-hidden="true" />
+            </Button>
+            {selected ? (
+              <PlayerPage
+                key={`${selected.kind}:${selected.id}`}
+                item={selected}
+                programs={epgByChannel.get(selected.id) || []}
+                now={now}
+                playback={playback}
+                refreshRevision={status?.libraryUpdatedAt}
+                showDetails={playbackDetailsId === selected.id}
+                episodeDestination={
+                  episodeDestination?.titleId === selected.id
+                    ? episodeDestination
+                    : null
+                }
+                onPlay={requestPlayback}
+              />
+            ) : detailError ? (
+              <div className="inline-detail-state" role="alert">
+                <h2>Couldn’t open this title</h2>
+                <p>{detailError}</p>
+              </div>
+            ) : (
+              <div className="inline-detail-state inline-loading" role="status">
+                <Spinner size="medium" className="app-spinner" />
+                Opening title…
+              </div>
+            )}
+          </motion.section>
+        )}
     </AnimatePresence>
   );
+  const navigationContext = playerOpen
+    ? playerContext
+    : dashboardOpen
+      ? "dashboard"
+      : tab;
+  const activeNavigation = settingsOpen
+    ? "settings"
+    : searchContext
+      ? "search"
+      : navigationContext === "dashboard"
+        ? "home"
+        : navigationContext === "live"
+          ? "live"
+          : "vod";
   return (
     <MotionConfig reducedMotion="user">
-      <div className={`app-shell${dashboardOpen ? " dashboard-active" : ""}`}>
-        <GalaxyBackdrop active={!playback} />
+      <div
+        className={`app-shell${dashboardOpen ? " dashboard-active" : ""}${playerOpen ? " player-active" : ""}`}
+      >
         <a className="skip-link" href="#main-content">
           Skip to content
         </a>
-        <header
-          className={`site-header${settingsOpen ? " settings-header" : ""}`}
-        >
-          <div className="header-inner">
-            <div className="brand">
-              <BrandMark />
-              <span className="brand-name">RESTREAM</span>
-            </div>
-            <LayoutGroup id="library-sections">
-              <nav className="top-navigation" aria-label="Library">
-                {sections.map((section) => {
-                  const Icon = section.icon;
-                  const active =
-                    section.id === "settings"
-                      ? settingsOpen
-                      : section.id === "dashboard"
-                        ? dashboardOpen
-                        : !settingsOpen && !dashboardOpen && tab === section.id;
-                  return (
-                    <button
-                      key={section.id}
-                      type="button"
-                      className={active ? "active" : ""}
-                      aria-current={active ? "page" : undefined}
-                      onClick={() => navigateSection(section.id)}
-                    >
-                      {active && (
-                        <motion.span
-                          className="top-navigation-indicator"
-                          layoutId="active-library-section"
-                          transition={{
-                            type: "spring",
-                            stiffness: 430,
-                            damping: 34,
-                          }}
-                        />
-                      )}
-                      <Icon size={15} aria-hidden="true" />
-                      <span>{section.label}</span>
-                    </button>
-                  );
-                })}
-              </nav>
-            </LayoutGroup>
-            {!settingsOpen && !dashboardOpen && (
-              <BeamSearch
-                className="header-search"
-                theme="dark"
-                colorVariant="mono"
-                value={search}
-                ariaLabel={`Search ${tab === "live" ? "channels" : "titles"}`}
-                placeholder={`Search ${tab === "live" ? "channels" : tab === "movie" ? "movies" : "series"}`}
-                onChange={(value) => {
-                  searchPending.current = true;
-                  setSearch(value);
-                  setVisibleCount(72);
-                }}
-              />
-            )}
-          </div>
-        </header>
-        <div className="player-dock" ref={setPlayerDock} />
-        <AnimatePresence mode="wait" initial={false}>
-          {playback && (
-            <PlaybackPlayer
-              key={`${playback.item.kind}:${playback.item.id}:${playback.start || 0}`}
-              selection={playback}
-              category={playbackCategory || null}
-              onNavigate={navigatePlayback}
-              onLivePlaybackChange={onLivePlaybackChange}
-              onSessionChange={updateStatus}
-              onPlaybackStarted={watchHistory.record}
-              onPlaybackProgress={watchHistory.updateProgress}
-              onFlushProgress={watchHistory.flushProgress}
-              transitionRef={playbackTransition}
-              playerDock={playerDock}
-              onClose={stopPlayback}
-            />
-          )}
-        </AnimatePresence>
+        <AppNavigation
+          active={activeNavigation}
+          onNavigate={(destination) => {
+            const next =
+              destination === "home"
+                ? "dashboard"
+                : destination === "vod"
+                  ? lastVodTab.current
+                  : destination;
+            navigateSection(next);
+            window.scrollTo({ top: 0 });
+          }}
+        />
         <div className="library-layout">
           <main id="main-content" className="main-content">
-            {dashboardOpen && (
+            <section
+              className="player-page"
+              aria-label="Watch workspace"
+              hidden={!playerOpen}
+            >
+              <div className="watch-workspace-grid">
+                <AnimatePresence mode="wait" initial={false}>
+                  {playerOpen && playback && (
+                    <PlaybackPlayer
+                      key={`${playback.item.kind}:${playback.item.id}:${playback.start || 0}`}
+                      selection={playback}
+                      onSessionChange={updateStatus}
+                      onPlaybackStarted={watchHistory.record}
+                      onPlaybackProgress={watchHistory.updateProgress}
+                      onFlushProgress={watchHistory.flushProgress}
+                      transitionRef={playbackTransition}
+                      onDurationResolved={setPlaybackDuration}
+                    />
+                  )}
+                </AnimatePresence>
+                {playerOpen && playback && (
+                  <aside className="watch-sidebar" aria-label="Watch context">
+                    <PlayerPage
+                      key={`${playback.title.kind}:${playback.title.id}`}
+                      compact
+                      item={playback.title}
+                      programs={epgByChannel.get(playback.title.id) || []}
+                      now={now}
+                      playback={playback}
+                      refreshRevision={status?.libraryUpdatedAt}
+                      showDetails={false}
+                      episodeDestination={episodeDestination}
+                      onPlay={requestPlayback}
+                      onClose={stopPlayback}
+                      onDetails={() => navigatePlayback("title")}
+                      duration={playbackDuration}
+                    />
+                    {playback.title.kind === "movie" && (
+                      <MovieSuggestions
+                        item={playback.title}
+                        refreshRevision={status?.libraryUpdatedAt}
+                        onPlay={playDashboardTitle}
+                        items={
+                          playerContext === "dashboard" || searchContext
+                            ? undefined
+                            : items
+                        }
+                      />
+                    )}
+                    {playback.title.kind === "live" && (
+                      <LiveChannelSuggestions
+                        items={
+                          playerContext === "dashboard" || searchContext
+                            ? liveItems.filter(visibleItem)
+                            : items
+                        }
+                        activeItem={playback.title}
+                        currentPrograms={currentPrograms}
+                        onPlay={(item) => requestPlayback(item, item)}
+                      />
+                    )}
+                  </aside>
+                )}
+              </div>
+              {playerOpen && !playback && (
+                <div
+                  className="player-page-state"
+                  role={playerError || detailError ? "alert" : "status"}
+                >
+                  {playerError || detailError ? (
+                    <>
+                      <h2>Couldn’t open the player</h2>
+                      <p>{playerError || detailError}</p>
+                      <Button
+                        onClick={() => {
+                          setPlayerError("");
+                          setDetailError("");
+                          setPlayerRetry((value) => value + 1);
+                        }}
+                      >
+                        Try again
+                      </Button>
+                    </>
+                  ) : status?.configured === false || !selectedId ? (
+                    <>
+                      <h2>
+                        {status?.configured === false
+                          ? "Provider not configured"
+                          : "No title selected"}
+                      </h2>
+                      <Button
+                        onClick={() =>
+                          navigateSection(
+                            status?.configured === false
+                              ? "settings"
+                              : "dashboard",
+                          )
+                        }
+                      >
+                        Open{" "}
+                        {status?.configured === false ? "Settings" : "Home"}
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <Spinner size="medium" className="app-spinner" />
+                      <p>Opening player…</p>
+                    </>
+                  )}
+                </div>
+              )}
+            </section>
+            {discoveryContext && (
               <Dashboard
-                entries={watchHistory.entries}
+                key={status?.preferencesUpdatedAt || "default"}
+                playbackActive={playerOpen}
+                entries={visibleHistory}
                 persistent={watchHistory.persistent}
                 configured={status?.configured !== false}
-                liveItems={liveItems}
+                liveItems={liveItems.filter(dashboardItem)}
+                isDashboardAllowed={dashboardItem}
                 programs={programs}
                 now={now}
                 onBrowse={(kind) => {
@@ -1073,9 +1580,7 @@ function App() {
                 onResume={resumeDashboardTitle}
                 onPlay={playDashboardTitle}
                 onPlayEpisode={playDashboardEpisode}
-                onOpenTitle={async (item) => {
-                  openDetails(await verifyDashboardTitle(item));
-                }}
+                onOpenTitle={openDashboardDetails}
                 onRemove={watchHistory.remove}
                 onClear={watchHistory.clear}
               />
@@ -1085,353 +1590,306 @@ function App() {
                 <SettingsPage
                   status={status}
                   statusError={statusError}
-                  checkedAt={statusCheckedAt}
                   onRefresh={forceRefresh}
                 />
               </Suspense>
             )}
-            <div
-              hidden={settingsOpen || dashboardOpen}
-              className="library-content"
-            >
-              {loading ? (
-                <div
-                  className="loading-library"
-                  role="status"
-                  aria-label="Loading your library"
+            {searchContext && (
+              <div hidden={playerOpen} className="search-page-container">
+                <SearchPage
+                  value={search}
+                  onQueryChange={(value) => {
+                    cancelPlaybackIntent();
+                    setSearch(value);
+                    setCategory("*");
+                    setSelected(null);
+                    setSelectedId("");
+                    setPlaybackDetailsId("");
+                    setEpisodeDestination(null);
+                    setDetailError("");
+                    scrolledExpansion.current = "";
+                    opener.current = null;
+                    writeLocation(
+                      tab,
+                      "*",
+                      value.trim(),
+                      true,
+                      "",
+                      false,
+                      null,
+                      false,
+                      false,
+                      true,
+                    );
+                  }}
+                  enabled={status?.configured === true && preferences !== null}
+                  liveItems={liveItems}
+                  currentPrograms={currentPrograms}
+                  refreshRevision={`${status?.libraryUpdatedAt || ""}:${status?.preferencesUpdatedAt || ""}`}
+                  isVisible={visibleItem}
+                  onOpen={openTitle}
+                  selectedItem={selected}
+                  selectedId={selectedId}
+                  details={inlineDetails}
+                  setCatalogGrid={setCatalogGrid}
+                  gridColumns={gridColumns}
+                />
+              </div>
+            )}
+            {!searchContext && (
+              <div
+                hidden={settingsOpen || discoveryContext}
+                className={`library-content${playerOpen ? " library-during-playback" : ""}${!searchContext && tab !== "live" && !playerOpen ? " library-vod" : ""}`}
+              >
+                <LibraryBrowser
+                  mode={tab === "live" ? "live" : "vod"}
+                  tab={tab}
+                  categories={sectionCategories}
+                  category={category}
+                  playerActive={playerOpen}
+                  onTabChange={(nextTab) => selectCategory(nextTab)}
+                  onCategoryChange={(value) =>
+                    selectCategory(tab, value, { retainPlayback: true })
+                  }
                 >
-                  <Skeleton className="h-9 w-56" />
-                  <Skeleton className="h-20 w-full" />
-                  <Skeleton className="h-20 w-full" />
-                </div>
-              ) : !status?.configured && !error ? (
-                <div className="state-card state-block" role="status">
-                  <h2>Restream is awaiting setup</h2>
-                  <p>
-                    Ask your administrator to finish setting up the library.
-                  </p>
-                </div>
-              ) : error ? (
-                <div className="state-card state-block" role="alert">
-                  <h2>Couldn’t load the library</h2>
-                  <p>{error}</p>
-                  <Button
-                    className="button-primary"
-                    onClick={() => window.location.reload()}
-                  >
-                    Try again
-                  </Button>
-                </div>
-              ) : (
-                <AnimatePresence mode="wait" initial={false}>
-                  <motion.div
-                    key={tab}
-                    className="section-view"
-                    role="region"
-                    aria-label={`${sections.find((section) => section.id === tab)?.label} library`}
-                    initial={{ opacity: 0, y: 8, filter: "blur(3px)" }}
-                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                    exit={{ opacity: 0, y: -5, filter: "blur(2px)" }}
-                    transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
-                  >
-                    {status?.error && (
-                      <div className="notice" role="alert">
-                        {status.error}
-                      </div>
-                    )}
+                  {loading ? (
                     <div
-                      className={`category-browser ${categoryRailOpen ? "open" : ""}`}
+                      className="loading-library"
+                      role="status"
+                      aria-label="Loading your library"
                     >
-                      <div className="category-browser-toolbar">
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-sm"
-                          className="category-filter-toggle"
-                          aria-expanded={categoryRailOpen}
-                          aria-controls="category-filter-panel"
-                          aria-label={
-                            categoryRailOpen
-                              ? "Close category filters"
-                              : "Open category filters"
-                          }
-                          onClick={() => setCategoryRailOpen((open) => !open)}
-                        >
-                          <ListFilter aria-hidden="true" />
-                        </Button>
+                      <Skeleton className="h-9 w-56" />
+                      <Skeleton className="h-20 w-full" />
+                      <Skeleton className="h-20 w-full" />
+                    </div>
+                  ) : !status?.configured && !error ? (
+                    <div className="state-card state-block" role="status">
+                      <h2>Provider not configured</h2>
+                    </div>
+                  ) : error ? (
+                    <div className="state-card state-block" role="alert">
+                      <h2>Couldn’t load the library</h2>
+                      <p>{error}</p>
+                      <Button
+                        className="button-primary"
+                        onClick={() => window.location.reload()}
+                      >
+                        Try again
+                      </Button>
+                    </div>
+                  ) : (
+                    <>
+                      {status?.error && (
+                        <div className="notice" role="alert">
+                          {status.error}
+                        </div>
+                      )}
+                      <div className="listing-summary">
+                        <h2 className="current-listing-heading">
+                          {search.trim()
+                            ? `Results for “${search.trim()}”`
+                            : sectionCategories.find(
+                                (value) => value.id === category,
+                              )?.name ||
+                              `All ${tab === "movie" ? "movies" : tab === "series" ? "shows" : "channels"}`}
+                        </h2>
+                        <span>
+                          {catalogLoading ? (
+                            ""
+                          ) : (
+                            <>
+                              {items.length}
+                              {hasMore ? "+" : ""}{" "}
+                              {tab === "live" ? "channel" : "title"}
+                              {items.length === 1 && !hasMore ? "" : "s"}
+                            </>
+                          )}
+                        </span>
                       </div>
-                      <AnimatePresence initial={false}>
-                        {categoryRailOpen && (
-                          <motion.div
-                            id="category-filter-panel"
-                            className="category-filter-panel"
-                            initial={{ height: 0, opacity: 0, y: -6 }}
-                            animate={{ height: "auto", opacity: 1, y: 0 }}
-                            exit={{ height: 0, opacity: 0, y: -6 }}
-                            transition={{
-                              duration: 0.28,
-                              ease: [0.22, 1, 0.36, 1],
-                            }}
+                      {catalogLoading ? (
+                        <div
+                          className="catalog-grid catalog-skeleton"
+                          role="status"
+                          aria-label="Loading titles"
+                        >
+                          {Array.from({ length: 8 }, (_, index) => (
+                            <div
+                              className="catalog-skeleton-card"
+                              key={index}
+                              aria-hidden="true"
+                            >
+                              <Skeleton className="catalog-skeleton-poster" />
+                              <Skeleton className="h-4 w-3/4 mt-3" />
+                              <Skeleton className="h-3 w-1/2 mt-2" />
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        (items.length > 0 || selectedId) && (
+                          <div
+                            ref={setCatalogGrid}
+                            className={
+                              tab === "live"
+                                ? "catalog-grid live-grid"
+                                : "catalog-grid"
+                            }
                           >
-                            <BeamSearch
-                              autoFocus
-                              className="category-beam-search"
-                              theme="dark"
-                              colorVariant="colorful"
-                              value={categorySearch}
-                              ariaLabel="Search categories"
-                              placeholder="Search categories"
-                              onChange={setCategorySearch}
-                            />
-                            <div className="category-rail-shell">
-                              <Button
+                            {displayedItems.map((item, index) => (
+                              <button
                                 type="button"
-                                variant="ghost"
-                                size="icon-sm"
-                                className="category-scroll-button"
-                                aria-label="Previous categories"
-                                onClick={() =>
-                                  categoryRail.current?.scrollBy({
-                                    left: -320,
-                                    behavior: "smooth",
-                                  })
+                                key={item.id}
+                                className={`media-card ${selectedId === item.id ? "expanded" : ""}`}
+                                style={{ order: index * 2 }}
+                                aria-expanded={
+                                  selectedId === item.id &&
+                                  (!playerOpen ||
+                                    item.id !== playback?.title.id)
                                 }
+                                aria-current={
+                                  playerOpen && item.id === playback?.title.id
+                                    ? "true"
+                                    : undefined
+                                }
+                                aria-controls={
+                                  selectedId === item.id &&
+                                  (!playerOpen ||
+                                    item.id !== playback?.title.id)
+                                    ? "inline-title-details"
+                                    : undefined
+                                }
+                                onClick={(event) => {
+                                  openTitle(item, event.currentTarget);
+                                }}
+                                title={
+                                  selectedId === item.id
+                                    ? `Close ${item.name}`
+                                    : undefined
+                                }
+                                aria-label={`Open ${item.name}`}
                               >
-                                <ChevronLeft />
-                              </Button>
-                              <LayoutGroup id={`category-selector-${tab}`}>
-                                <nav
-                                  key={tab}
-                                  ref={categoryRail}
-                                  className="category-rail"
-                                  aria-label={`${sections.find((value) => value.id === tab)?.label} categories`}
-                                >
-                                  <button
-                                    type="button"
-                                    className={category === "*" ? "active" : ""}
-                                    aria-current={
-                                      category === "*" ? "page" : undefined
-                                    }
-                                    onClick={() => selectCategory(tab)}
-                                  >
-                                    {category === "*" && (
-                                      <motion.span
-                                        className="category-selection-indicator"
-                                        layoutId="active-category-selection"
-                                        transition={{
-                                          type: "spring",
-                                          stiffness: 430,
-                                          damping: 34,
-                                        }}
-                                      />
-                                    )}
-                                    <span>All</span>
-                                  </button>
-                                  {visibleCategories.map((value) => (
-                                    <button
-                                      key={value.id}
-                                      type="button"
-                                      className={
-                                        category === value.id ? "active" : ""
-                                      }
-                                      aria-current={
-                                        category === value.id
-                                          ? "page"
-                                          : undefined
-                                      }
-                                      onClick={() =>
-                                        selectCategory(tab, value.id)
-                                      }
+                                <div className="card-art">
+                                  <Artwork item={item} />
+                                  {tab === "live" && (
+                                    <span
+                                      className="card-live-icon"
+                                      title="Live channel"
                                     >
-                                      {category === value.id && (
-                                        <motion.span
-                                          className="category-selection-indicator"
-                                          layoutId="active-category-selection"
-                                          transition={{
-                                            type: "spring",
-                                            stiffness: 430,
-                                            damping: 34,
-                                          }}
-                                        />
-                                      )}
-                                      <span>{value.name}</span>
-                                    </button>
-                                  ))}
-                                  {visibleCategories.length === 0 && (
-                                    <span className="category-search-empty">
-                                      No matching categories
+                                      <Radio size={15} aria-hidden="true" />
+                                      <span className="sr-only">
+                                        Live channel
+                                      </span>
                                     </span>
                                   )}
-                                </nav>
-                              </LayoutGroup>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-sm"
-                                className="category-scroll-button"
-                                aria-label="More categories"
-                                onClick={() =>
-                                  categoryRail.current?.scrollBy({
-                                    left: 320,
-                                    behavior: "smooth",
-                                  })
-                                }
-                              >
-                                <ChevronRight />
-                              </Button>
-                            </div>
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
-                    </div>
-                    {(items.length > 0 || selectedId) && (
-                      <div
-                        ref={setCatalogGrid}
-                        className={
-                          tab === "live"
-                            ? "catalog-grid live-grid"
-                            : "catalog-grid"
-                        }
-                      >
-                        {displayedItems.map((item, index) => (
-                          <button
-                            type="button"
-                            key={item.id}
-                            className={`media-card ${selectedId === item.id ? "expanded" : ""}`}
-                            style={{ order: index * 2 }}
-                            aria-expanded={selectedId === item.id}
-                            aria-controls={
-                              selectedId === item.id
-                                ? "inline-title-details"
-                                : undefined
-                            }
-                            onClick={(event) => {
-                              openTitle(item, event.currentTarget);
-                            }}
-                            title={
-                              selectedId === item.id
-                                ? `Close ${item.name}`
-                                : undefined
-                            }
-                            aria-label={`Open ${item.name}`}
-                          >
-                            <div className="card-art">
-                              <Artwork item={item} />
-                              {tab === "live" && (
-                                <span
-                                  className="card-live-icon"
-                                  title="Live channel"
-                                >
-                                  <Radio size={15} aria-hidden="true" />
-                                  <span className="sr-only">Live channel</span>
-                                </span>
-                              )}
-                              <span className="card-play" aria-hidden="true">
-                                <Play size={13} fill="currentColor" />
-                              </span>
-                            </div>
-                            <div className="card-content">
-                              <div className="card-title-row">
-                                <h3>{item.name}</h3>
-                              </div>
-                              {item.kind === "live" &&
-                                currentPrograms.has(item.id) && (
-                                  <p
-                                    className="card-programme"
-                                    aria-label={`On now: ${currentPrograms.get(item.id)?.title}`}
-                                    title={currentPrograms.get(item.id)?.title}
+                                  <span
+                                    className="card-play"
+                                    aria-hidden="true"
                                   >
-                                    <span
-                                      className="on-air-dot"
-                                      aria-hidden="true"
-                                    />
-                                    <span>
-                                      {currentPrograms.get(item.id)?.title}
-                                    </span>
-                                  </p>
-                                )}
-                            </div>
-                          </button>
-                        ))}
-                        {inlineDetails}
-                      </div>
-                    )}
-                    {!browseLoading && !browseError && items.length === 0 && (
-                      <div className="empty-state" role="status">
-                        <h3>
-                          {tab !== "live" && hasMore
-                            ? `No ${tab === "movie" ? "movies" : "series"} in the pages checked yet`
-                            : search
-                              ? "No matches found"
-                              : tab === "live"
-                                ? "No channels yet"
-                                : "No titles in this category"}
-                        </h3>
-                        <p>
-                          {hasMore
-                            ? "Continue loading to check the next pages."
-                            : "Try another category or search."}
-                        </p>
-                      </div>
-                    )}
-                    {browseLoading && items.length === 0 && (
-                      <div className="page-status" role="status">
-                        <Spinner size="small" className="app-spinner" /> Loading{" "}
-                        {tab === "movie" ? "movies" : "series"}…
-                      </div>
-                    )}
-                    {browseError && (
-                      <div className="page-error" role="alert">
-                        <span>{browseError}</span>
-                        <Button
-                          onClick={() =>
-                            fetchPage(browsePage + 1, browseGeneration.current)
-                          }
-                        >
-                          Retry page
-                        </Button>
-                      </div>
-                    )}
-                    {((tab === "live" && items.length > visibleCount) ||
-                      (tab !== "live" && hasMore && !browseError)) && (
-                      <div ref={setLoadSentinel} className="auto-loader">
-                        {browseLoading && (
-                          <span role="status">
-                            <Spinner size="small" className="app-spinner" />{" "}
-                            Loading more…
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </motion.div>
-                </AnimatePresence>
-              )}
-            </div>
+                                    <Play size={13} fill="currentColor" />
+                                  </span>
+                                </div>
+                                <div className="card-content">
+                                  <div className="card-title-row">
+                                    <h3>{item.name}</h3>
+                                  </div>
+                                  {item.kind !== "live" && (
+                                    <p className="card-metadata">
+                                      <span>
+                                        {item.category ||
+                                          (item.kind === "series"
+                                            ? "Show"
+                                            : "Movie")}
+                                      </span>
+                                      {!!item.duration && (
+                                        <span>
+                                          {durationLabel(item.duration)}
+                                        </span>
+                                      )}
+                                    </p>
+                                  )}
+                                  {item.kind === "live" &&
+                                    currentPrograms.has(item.id) && (
+                                      <p
+                                        className="card-programme"
+                                        aria-label={`On now: ${currentPrograms.get(item.id)?.title}`}
+                                        title={
+                                          currentPrograms.get(item.id)?.title
+                                        }
+                                      >
+                                        <span
+                                          className="on-air-dot"
+                                          aria-hidden="true"
+                                        />
+                                        <span>
+                                          {currentPrograms.get(item.id)?.title}
+                                        </span>
+                                      </p>
+                                    )}
+                                </div>
+                              </button>
+                            ))}
+                            {inlineDetails}
+                          </div>
+                        )
+                      )}
+                      {!browseLoading && !browseError && items.length === 0 && (
+                        <div className="empty-state" role="status">
+                          <h3>
+                            {tab !== "live" && hasMore
+                              ? `No ${tab === "movie" ? "movies" : "shows"} loaded`
+                              : search
+                                ? "No matches found"
+                                : tab === "live"
+                                  ? "No channels yet"
+                                  : "No titles in this category"}
+                          </h3>
+                          {(search.trim() || category !== "*") && (
+                            <Button
+                              variant="secondary"
+                              onClick={() =>
+                                selectCategory(tab, "*", {
+                                  retainPlayback: true,
+                                  searchView: searchContext,
+                                })
+                              }
+                            >
+                              Clear filters
+                            </Button>
+                          )}
+                        </div>
+                      )}
+                      {browseError && (
+                        <div className="page-error" role="alert">
+                          <span>{browseError}</span>
+                          <Button
+                            onClick={() =>
+                              fetchPage(
+                                browsePage + 1,
+                                browseGeneration.current,
+                              )
+                            }
+                          >
+                            Retry page
+                          </Button>
+                        </div>
+                      )}
+                      {(browseLoading ||
+                        (tab === "live" && items.length > visibleCount) ||
+                        (tab !== "live" && hasMore && !browseError)) && (
+                        <div ref={setLoadSentinel} className="auto-loader">
+                          {browseLoading && (
+                            <span role="status" aria-label="Loading">
+                              <Spinner size="small" className="app-spinner" />
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </LibraryBrowser>
+              </div>
+            )}
           </main>
         </div>
-        <nav className="mobile-bottom-nav" aria-label="Primary navigation">
-          {sections.map((section) => {
-            const Icon = section.icon;
-            const active =
-              section.id === "settings"
-                ? settingsOpen
-                : section.id === "dashboard"
-                  ? dashboardOpen
-                  : !settingsOpen && !dashboardOpen && tab === section.id;
-            return (
-              <button
-                key={section.id}
-                type="button"
-                className={active ? "active" : ""}
-                aria-current={active ? "page" : undefined}
-                onClick={() => navigateSection(section.id)}
-              >
-                <Icon size={20} />
-                <span>{section.label}</span>
-              </button>
-            );
-          })}
-        </nav>
       </div>
     </MotionConfig>
   );
@@ -1446,6 +1904,10 @@ function PlayerPage({
   showDetails,
   episodeDestination,
   onPlay,
+  compact = false,
+  onClose,
+  onDetails,
+  duration,
 }: {
   item: Item;
   programs: Program[];
@@ -1455,6 +1917,10 @@ function PlayerPage({
   showDetails: boolean;
   episodeDestination: EpisodeDestination | null;
   onPlay: (item: Item, title: Item) => void;
+  compact?: boolean;
+  onClose?: () => void;
+  onDetails?: () => void;
+  duration?: number;
 }) {
   const [episode, setEpisode] = useState<Item | null>(null);
   const [episodes, setEpisodes] = useState<Item[]>([]);
@@ -1570,46 +2036,89 @@ function PlayerPage({
   );
   return (
     <article
-      className={`title-page kind-${item.kind} ${playRequested ? "watching" : ""} ${showDetails ? "show-details" : ""}`}
+      className={`title-page kind-${item.kind} ${compact ? "watch-companion" : ""} ${playRequested ? "watching" : ""} ${showDetails ? "show-details" : ""}`}
     >
       <div className="title-hero">
-        <div className="title-art">
-          <Artwork item={item} />
-        </div>
+        {(!compact || item.kind === "live") && (
+          <div className="title-art">
+            <Artwork item={item} />
+          </div>
+        )}
         <div className="title-information">
-          <span className="eyebrow">
-            {item.kind === "series"
-              ? "SERIES"
-              : item.kind === "live"
-                ? "LIVE TV"
-                : "MOVIE"}
-          </span>
-          <h1 tabIndex={-1}>{item.name}</h1>
-          <p className="title-category">
-            {item.category ||
-              (item.kind === "live" ? "Live channel" : "Entertainment")}
-            {item.number && ` · Channel ${item.number}`}
-          </p>
+          {!compact && (
+            <span className="eyebrow">
+              {item.kind === "series"
+                ? "SHOW"
+                : item.kind === "live"
+                  ? "LIVE TV"
+                  : "MOVIE"}
+            </span>
+          )}
+          {compact ? (
+            <div className="watch-companion-heading">
+              <h2 className="dock-title" tabIndex={-1}>
+                {displayTitle(item)}
+              </h2>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="dock-stop"
+                onClick={onClose}
+                aria-label="Stop playback"
+                title="Close player"
+              >
+                <X size={20} strokeWidth={1.5} aria-hidden="true" />
+              </Button>
+            </div>
+          ) : (
+            <h1 tabIndex={-1}>{item.name}</h1>
+          )}
+          {!compact && (item.category || item.number) && (
+            <p className="title-category">
+              {[item.category, item.number && `Channel ${item.number}`]
+                .filter(Boolean)
+                .join(" · ")}
+            </p>
+          )}
+          {compact && item.kind !== "live" && (
+            <p className="watch-media-meta">
+              {item.kind === "series"
+                ? `Season ${playingEpisode?.season ?? 1} · Episode ${playingEpisode?.episode ?? "—"}`
+                : ["Movie", durationLabel(duration)]
+                    .filter(Boolean)
+                    .join(" · ")}
+              <Button
+                variant="ghost"
+                className="watch-details-link"
+                onClick={onDetails}
+              >
+                Title details <ChevronRight size={14} aria-hidden="true" />
+              </Button>
+            </p>
+          )}
           {item.description && (
             <p className="title-description">{item.description}</p>
           )}
-          {item.kind === "series" && episode && (
+          {!compact && item.kind === "series" && episode && (
             <p className="selected-episode">
               Selected · S{episode.season ?? 1} E{episode.episode ?? "—"} ·{" "}
               {episode.name}
             </p>
           )}
-          <Button
-            className="hero-play"
-            disabled={item.kind === "series" && !episode}
-            onClick={() => {
-              const target = item.kind === "series" ? episode : item;
-              if (target) onPlay(target, item);
-            }}
-          >
-            <Play size={17} fill="currentColor" />{" "}
-            {item.kind === "series" ? "Play episode" : "Play"}
-          </Button>
+          {!compact && (
+            <Button
+              className="hero-play"
+              disabled={item.kind === "series" && !episode}
+              onClick={() => {
+                const target = item.kind === "series" ? episode : item;
+                if (target) onPlay(target, item);
+              }}
+            >
+              <Play size={17} fill="currentColor" />{" "}
+              {item.kind === "series" ? "Play episode" : "Play"}
+            </Button>
+          )}
         </div>
         {item.kind === "live" && (
           <section className="title-guide" aria-label="On this channel">
@@ -1623,6 +2132,7 @@ function PlayerPage({
                 <ol>
                   {programs
                     .filter((program) => Date.parse(program.end) > now)
+                    .slice(0, compact ? 2 : undefined)
                     .map((program) => {
                       const onAir = Date.parse(program.start) <= now;
                       return (
@@ -1647,15 +2157,24 @@ function PlayerPage({
                           </div>
                           <strong>{program.title}</strong>
                           {program.description && <p>{program.description}</p>}
+                          {compact && onAir && (
+                            <div
+                              className="schedule-progress"
+                              aria-hidden="true"
+                            >
+                              <span
+                                style={{
+                                  width: `${Math.max(0, Math.min(100, ((now - Date.parse(program.start)) / (Date.parse(program.end) - Date.parse(program.start))) * 100))}%`,
+                                }}
+                              />
+                            </div>
+                          )}
                         </li>
                       );
                     })}
                 </ol>
               ) : (
-                <p className="epg-unavailable">
-                  The provider hasn’t supplied an upcoming schedule for this
-                  channel.
-                </p>
+                <p className="epg-unavailable">No programme guide</p>
               )}
             </div>
           </section>
@@ -1715,24 +2234,42 @@ function PlayerPage({
                       ? "episode-row selected"
                       : "episode-row"
                   }
+                  aria-label={`Play ${value.name}`}
+                  aria-current={
+                    compact && playingEpisode?.id === value.id
+                      ? true
+                      : undefined
+                  }
+                  disabled={compact && playingEpisode?.id === value.id}
                   onClick={() => {
                     setEpisode(value);
                     onPlay(value, item);
                   }}
                 >
-                  <span className="episode-number">
-                    {value.episode ?? "▶"}
-                  </span>
-                  <span>
+                  {compact && (value.image || item.image) ? (
+                    <span className="watch-episode-art">
+                      <Artwork
+                        item={{ ...value, image: value.image || item.image }}
+                      />
+                      <span className="watch-episode-index">
+                        {value.episode}
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="episode-number">
+                      {value.episode ?? "—"}
+                    </span>
+                  )}
+                  <span className="episode-copy">
                     <strong>{value.name}</strong>
-                    <small>{value.description || "Play episode"}</small>
+                    {value.description && <small>{value.description}</small>}
                   </span>
                   <Play size={17} aria-hidden="true" />
                 </button>
               ))}
             </div>
           ) : (
-            <p className="episode-empty">No episodes are available.</p>
+            <p className="episode-empty">No episodes</p>
           )}
         </div>
       )}
@@ -1742,21 +2279,14 @@ function PlayerPage({
 
 function PlaybackPlayer({
   selection,
-  category,
-  onNavigate,
-  onLivePlaybackChange,
   onSessionChange,
   onPlaybackStarted,
   onPlaybackProgress,
   onFlushProgress,
   transitionRef,
-  playerDock,
-  onClose,
+  onDurationResolved,
 }: {
   selection: PlaybackSelection;
-  category: Category | null;
-  onNavigate: (destination: PlaybackDestination) => void;
-  onLivePlaybackChange: (active: boolean) => void;
   onSessionChange: () => void;
   onPlaybackStarted: (selection: PlaybackSelection) => void;
   onPlaybackProgress: (
@@ -1767,12 +2297,10 @@ function PlaybackPlayer({
   ) => void;
   onFlushProgress: () => void;
   transitionRef: RefObject<Promise<void>>;
-  playerDock: HTMLDivElement | null;
-  onClose: () => void;
+  onDurationResolved: (duration: number) => void;
 }) {
   const isPresent = useIsPresent();
   const reducedMotion = useReducedMotion();
-  const item = selection.title;
   const activeItem = selection.item;
   const historyRecorded = useRef(false);
   const historyFinished = useRef(false);
@@ -1792,6 +2320,15 @@ function PlaybackPlayer({
   const [playAttempt, setPlayAttempt] = useState(0);
   const playbackStart = useRef(selection.start || 0);
   const [session, setSession] = useState<Session | null>(null);
+  useEffect(() => {
+    if (
+      activeItem.kind !== "live" &&
+      (session?.state === "ready" || session?.state === "ended") &&
+      Number.isFinite(session.duration) &&
+      session.duration > 0
+    )
+      onDurationResolved(session.duration);
+  }, [activeItem.kind, session?.state, session?.duration, onDurationResolved]);
   const latestSession = useRef<Session | null>(null);
   latestSession.current = session;
   const saveProgress = useCallback(
@@ -1870,6 +2407,16 @@ function PlaybackPlayer({
     };
     const stop = (keepalive = false) => {
       if (stopped) return;
+      if (
+        keepalive &&
+        activeItem.kind !== "live" &&
+        video.current &&
+        latestSession.current &&
+        attachedUrlRef.current === latestSession.current.url
+      )
+        playbackStart.current = historyFinished.current
+          ? 0
+          : latestSession.current.offset + video.current.currentTime;
       saveProgressRef.current();
       onFlushProgress();
       stopped = true;
@@ -2004,9 +2551,14 @@ function PlaybackPlayer({
         });
     });
     const onPageHide = () => stop(true);
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) setPlayAttempt((value) => value + 1);
+    };
     window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
     return () => {
       window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
       stop();
     };
   }, [
@@ -2293,308 +2845,198 @@ function PlaybackPlayer({
     }
     clearMediaRef.current?.();
     pendingPlayUrlRef.current = null;
-    if (item.kind === "live") onLivePlaybackChange(false);
     setViewerFinished(true);
     setPlaying(false);
   };
   const vod = activeItem?.kind === "movie" || activeItem?.kind === "episode";
   const streamPreparing = session?.state === "starting";
   const absolutePosition = Math.min(session?.duration || 0, position);
-  const breadcrumbLink = (destination: PlaybackDestination) => {
-    const showTitle = destination === "title" || destination === "season";
-    return {
-      href: selectionURL(
-        item.kind as Tab,
-        destination === "library" ? "*" : category?.id || "*",
-        "",
-        showTitle ? item.id : "",
-        false,
-        showTitle && item.kind === "series"
-          ? {
-              titleId: item.id,
-              season: activeItem.season ?? 1,
-              episodeId: activeItem.id,
-            }
-          : null,
-      ).toString(),
-      onClick: (event: MouseEvent<HTMLAnchorElement>) => {
-        if (
-          event.button !== 0 ||
-          event.metaKey ||
-          event.ctrlKey ||
-          event.shiftKey ||
-          event.altKey
-        )
-          return;
-        event.preventDefault();
-        onNavigate(destination);
-      },
-    };
-  };
 
-  return playerDock
-    ? createPortal(
-        <motion.section
-          className="watch-section"
-          aria-label="Player"
-          inert={!isPresent}
-          data-closing={!isPresent || undefined}
-          initial={false}
-          animate={{ height: "auto", opacity: 1 }}
-          exit={{ height: 0, opacity: 0 }}
-          transition={{
-            duration: reducedMotion ? 0 : 0.3,
-            ease: [0.22, 1, 0.36, 1],
-          }}
-        >
-          <div className="dock-caption">
-            <div className="dock-heading">
-              <nav
-                className="dock-breadcrumbs"
-                aria-label="Playback breadcrumbs"
-              >
-                <ol>
-                  <li>
-                    <Button asChild variant="ghost" className="dock-crumb">
-                      <a {...breadcrumbLink("library")}>
-                        {item.kind === "live"
-                          ? "Live TV"
-                          : item.kind === "series"
-                            ? "Series"
-                            : "Movies"}
-                      </a>
-                    </Button>
-                  </li>
-                  {(category || item.category) && (
-                    <li>
-                      <ChevronRight aria-hidden="true" />
-                      {category ? (
-                        <Button asChild variant="ghost" className="dock-crumb">
-                          <a {...breadcrumbLink("category")}>{category.name}</a>
-                        </Button>
-                      ) : (
-                        <span className="dock-crumb-label">
-                          {item.category}
-                        </span>
-                      )}
-                    </li>
-                  )}
-                  {item.kind === "series" && (
-                    <>
-                      <li>
-                        <ChevronRight aria-hidden="true" />
-                        <Button
-                          asChild
-                          variant="ghost"
-                          className="dock-crumb dock-series-crumb"
-                          title={item.name}
-                        >
-                          <a {...breadcrumbLink("title")}>{item.name}</a>
-                        </Button>
-                      </li>
-                      <li>
-                        <ChevronRight aria-hidden="true" />
-                        <Button asChild variant="ghost" className="dock-crumb">
-                          <a {...breadcrumbLink("season")}>
-                            Season {activeItem.season ?? 1}
-                          </a>
-                        </Button>
-                      </li>
-                    </>
-                  )}
-                </ol>
-              </nav>
-              <h2 className="dock-title" title={activeItem.name}>
-                <a {...breadcrumbLink("title")} title="Open title details">
-                  {activeItem.name}
-                </a>
-              </h2>
-            </div>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="dock-stop"
-              onClick={onClose}
-              aria-label="Stop playback"
-              title="Close player"
+  return (
+    <motion.section
+      className="watch-section"
+      aria-label="Player"
+      inert={!isPresent}
+      data-closing={!isPresent || undefined}
+      initial={false}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{
+        duration: reducedMotion ? 0 : 0.3,
+        ease: [0.22, 1, 0.36, 1],
+      }}
+    >
+      <div
+        className="playback-area"
+        ref={playbackArea}
+        tabIndex={0}
+        aria-label="Video player"
+      >
+        <div className="video-wrap">
+          <video
+            ref={video}
+            playsInline
+            controls={false}
+            preload="auto"
+            onPointerDown={(event) => {
+              videoPointer.current = event.pointerType;
+            }}
+            onClick={() => {
+              if (
+                videoPointer.current === "mouse" &&
+                !streamPreparing &&
+                !seeking
+              )
+                void togglePlay();
+            }}
+            onDoubleClick={() => {
+              if (videoPointer.current === "mouse") void enterFullscreen();
+            }}
+            onWaiting={() => setBuffering(true)}
+            onPlaying={() => {
+              setBuffering(false);
+              if (isPresent && !historyRecorded.current) {
+                historyRecorded.current = true;
+                onPlaybackStarted(selection);
+              }
+            }}
+            onSeeked={() => {
+              setBuffering(false);
+              saveProgress();
+              onFlushProgress();
+            }}
+            onProgress={(event) => {
+              const ranges = event.currentTarget.buffered;
+              if (attachedUrlRef.current === session?.url) {
+                const offset = session?.offset || 0;
+                setBuffered(
+                  Array.from({ length: ranges.length }, (_, i) => ({
+                    start: offset + ranges.start(i),
+                    end: offset + ranges.end(i),
+                  })),
+                );
+              }
+            }}
+            onVolumeChange={(event) => setMuted(event.currentTarget.muted)}
+            onPlay={() => {
+              setPlaying(true);
+            }}
+            onPause={() => {
+              setPlaying(false);
+              saveProgress();
+              onFlushProgress();
+            }}
+            onCanPlay={() => {
+              setBuffering(false);
+              if (
+                isPresent &&
+                pendingPlayUrlRef.current &&
+                pendingPlayUrlRef.current === attachedUrlRef.current &&
+                video.current
+              ) {
+                pendingPlayUrlRef.current = null;
+                void video.current
+                  .play()
+                  .catch(() =>
+                    setError(
+                      "Playback could not start. Press play to try again.",
+                    ),
+                  );
+              }
+            }}
+            onEnded={finishPlayback}
+            onTimeUpdate={(event) => {
+              saveProgress();
+              if (attachedUrlRef.current === session?.url)
+                setPosition(
+                  (session?.offset || 0) + event.currentTarget.currentTime,
+                );
+            }}
+            aria-label={`${activeItem?.name} video`}
+          />
+          {isPresent && playbackFeedback && (
+            <motion.div
+              key={playbackFeedback.id}
+              className="playback-feedback"
+              data-action={playbackFeedback.action}
+              aria-hidden="true"
+              initial={{ opacity: 0, scale: reducedMotion ? 1 : 0.85 }}
+              animate={{
+                opacity: [0, 1, 1, 0],
+                scale: reducedMotion ? 1 : [0.85, 1, 1, 1.12],
+              }}
+              transition={{
+                duration: 0.55,
+                times: [0, 0.16, 0.45, 1],
+                ease: "easeOut",
+              }}
+              onAnimationComplete={() => {
+                setPlaybackFeedback((current) =>
+                  current?.id === playbackFeedback.id ? null : current,
+                );
+              }}
             >
-              <Square className="size-4" strokeWidth={1.5} aria-hidden="true" />
-            </Button>
-          </div>
-          <div
-            className="playback-area"
-            ref={playbackArea}
-            tabIndex={0}
-            aria-label="Video player"
-          >
-            <div className="video-wrap">
-              <video
-                ref={video}
-                playsInline
-                controls={false}
-                preload="auto"
-                onPointerDown={(event) => {
-                  videoPointer.current = event.pointerType;
-                }}
-                onClick={() => {
-                  if (
-                    videoPointer.current === "mouse" &&
-                    !streamPreparing &&
-                    !seeking
-                  )
-                    void togglePlay();
-                }}
-                onDoubleClick={() => {
-                  if (videoPointer.current === "mouse") void enterFullscreen();
-                }}
-                onWaiting={() => setBuffering(true)}
-                onPlaying={() => {
-                  setBuffering(false);
-                  if (isPresent && !historyRecorded.current) {
-                    historyRecorded.current = true;
-                    onPlaybackStarted(selection);
-                  }
-                }}
-                onSeeked={() => {
-                  setBuffering(false);
-                  saveProgress();
-                  onFlushProgress();
-                }}
-                onProgress={(event) => {
-                  const ranges = event.currentTarget.buffered;
-                  if (attachedUrlRef.current === session?.url) {
-                    const offset = session?.offset || 0;
-                    setBuffered(
-                      Array.from({ length: ranges.length }, (_, i) => ({
-                        start: offset + ranges.start(i),
-                        end: offset + ranges.end(i),
-                      })),
-                    );
-                  }
-                }}
-                onVolumeChange={(event) => setMuted(event.currentTarget.muted)}
-                onPlay={() => {
-                  setPlaying(true);
-                }}
-                onPause={() => {
-                  setPlaying(false);
-                  saveProgress();
-                  onFlushProgress();
-                }}
-                onCanPlay={() => {
-                  setBuffering(false);
-                  if (
-                    isPresent &&
-                    pendingPlayUrlRef.current &&
-                    pendingPlayUrlRef.current === attachedUrlRef.current &&
-                    video.current
-                  ) {
-                    pendingPlayUrlRef.current = null;
-                    void video.current
-                      .play()
-                      .catch(() =>
-                        setError(
-                          "Playback could not start. Press play to try again.",
-                        ),
-                      );
-                  }
-                }}
-                onEnded={finishPlayback}
-                onTimeUpdate={(event) => {
-                  saveProgress();
-                  if (attachedUrlRef.current === session?.url)
-                    setPosition(
-                      (session?.offset || 0) + event.currentTarget.currentTime,
-                    );
-                }}
-                aria-label={`${activeItem?.name} video`}
-              />
-              {isPresent && playbackFeedback && (
-                <motion.div
-                  key={playbackFeedback.id}
-                  className="playback-feedback"
-                  data-action={playbackFeedback.action}
-                  aria-hidden="true"
-                  initial={{ opacity: 0, scale: reducedMotion ? 1 : 0.85 }}
-                  animate={{
-                    opacity: [0, 1, 1, 0],
-                    scale: reducedMotion ? 1 : [0.85, 1, 1, 1.12],
-                  }}
-                  transition={{
-                    duration: 0.55,
-                    times: [0, 0.16, 0.45, 1],
-                    ease: "easeOut",
-                  }}
-                  onAnimationComplete={() => {
-                    setPlaybackFeedback((current) =>
-                      current?.id === playbackFeedback.id ? null : current,
-                    );
-                  }}
-                >
-                  {playbackFeedback.action === "play" ? (
-                    <Play strokeWidth={1.5} />
-                  ) : (
-                    <Pause strokeWidth={1.5} />
-                  )}
-                </motion.div>
+              {playbackFeedback.action === "play" ? (
+                <Play strokeWidth={1.5} />
+              ) : (
+                <Pause strokeWidth={1.5} />
               )}
-              {(streamPreparing || seeking || buffering) &&
-                !error &&
-                !viewerFinished && (
-                  <div className="playback-loading" role="status">
-                    <Spinner size="large" className="app-spinner" />
-                    <span className="sr-only">Loading playback</span>
-                  </div>
-                )}
-              {viewerFinished && (
-                <div className="video-overlay" role="status">
-                  <div className="playback-ended">
-                    <p>You’ve reached the end</p>
-                    <Button
-                      onClick={() => {
-                        playbackStart.current = 0;
-                        setPlayAttempt((value) => value + 1);
-                      }}
-                    >
-                      <Play size={17} fill="currentColor" /> Play again
-                    </Button>
-                  </div>
-                </div>
-              )}
-              <PlayerControls
-                area={playbackArea}
-                playing={playing}
-                muted={muted}
-                busy={streamPreparing || seeking || !playbackUrl}
-                finished={viewerFinished}
-                position={absolutePosition}
-                duration={session?.duration || 0}
-                buffered={buffered}
-                live={!vod}
-                liveDelay={liveDelay}
-                onGoLive={() => void goLive()}
-                onPlay={() => void togglePlay()}
-                onSeek={(target) => void seek(target)}
-                onMute={() => {
-                  if (video.current) video.current.muted = !video.current.muted;
-                }}
-                onFullscreen={() => void enterFullscreen()}
-              />
-            </div>
-            {error && (
-              <div className="player-error" role="alert">
-                <span>{error}</span>
-                <Button onClick={() => setPlayAttempt((value) => value + 1)}>
-                  Try again
-                </Button>
+            </motion.div>
+          )}
+          {(streamPreparing || seeking || buffering) &&
+            !error &&
+            !viewerFinished && (
+              <div className="playback-loading" role="status">
+                <Spinner size="large" className="app-spinner" />
+                <span className="sr-only">Loading playback</span>
               </div>
             )}
+          {viewerFinished && (
+            <div className="video-overlay" role="status">
+              <div className="playback-ended">
+                <p>Playback ended</p>
+                <Button
+                  onClick={() => {
+                    playbackStart.current = 0;
+                    setPlayAttempt((value) => value + 1);
+                  }}
+                >
+                  <Play size={17} fill="currentColor" /> Play again
+                </Button>
+              </div>
+            </div>
+          )}
+          <PlayerControls
+            area={playbackArea}
+            playing={playing}
+            muted={muted}
+            busy={streamPreparing || seeking || !playbackUrl}
+            finished={viewerFinished}
+            position={absolutePosition}
+            duration={session?.duration || 0}
+            buffered={buffered}
+            live={!vod}
+            liveDelay={liveDelay}
+            onGoLive={() => void goLive()}
+            onPlay={() => void togglePlay()}
+            onSeek={(target) => void seek(target)}
+            onMute={() => {
+              if (video.current) video.current.muted = !video.current.muted;
+            }}
+            onFullscreen={() => void enterFullscreen()}
+          />
+        </div>
+        {error && (
+          <div className="player-error" role="alert">
+            <span>{error}</span>
+            <Button onClick={() => setPlayAttempt((value) => value + 1)}>
+              Try again
+            </Button>
           </div>
-        </motion.section>,
-        playerDock,
-      )
-    : null;
+        )}
+      </div>
+    </motion.section>
+  );
 }
 
 export default App;

@@ -1,21 +1,14 @@
-import { useState } from "react";
-import {
-  AudioLines,
-  Database,
-  Radio,
-  RefreshCw,
-  CalendarClock,
-  Wifi,
-  TriangleAlert,
-} from "lucide-react";
+import { useEffect, useState } from "react";
+import { CalendarClock, RefreshCw, TriangleAlert } from "lucide-react";
+import { getPreferences, type Preferences, type Status } from "../api";
 import { Button } from "./ui/button";
 import { Spinner } from "./spectrumui/spinner-dependencies";
-import type { RefreshState, Status } from "../api";
+import "./settings-preferences.css";
 
 export type RefreshTarget = "all" | "catalog" | "epg";
 
 function timestamp(value?: string) {
-  if (!value) return "Not yet synced";
+  if (!value) return "Not yet refreshed";
   const date = new Date(value);
   return Number.isNaN(date.getTime())
     ? "Unavailable"
@@ -24,333 +17,251 @@ function timestamp(value?: string) {
         day: "numeric",
         hour: "numeric",
         minute: "2-digit",
-        second: "2-digit",
       });
 }
-function duration(seconds?: number) {
-  if (!seconds || seconds < 0) return "Unavailable";
-  const hours = seconds / 3600;
-  if (hours >= 1)
-    return `${Number(hours.toFixed(1))} ${hours === 1 ? "hour" : "hours"}`;
-  if (seconds >= 60) return `${Number((seconds / 60).toFixed(1))} minutes`;
-  return `${seconds} seconds`;
+
+function interval(seconds?: number) {
+  if (!seconds || seconds < 0) return "—";
+  const unit =
+    seconds % 86400 === 0
+      ? ([86400, "day"] as const)
+      : seconds % 3600 === 0
+        ? ([3600, "hour"] as const)
+        : seconds % 60 === 0
+          ? ([60, "minute"] as const)
+          : ([1, "second"] as const);
+  const count = seconds / unit[0];
+  return `${count} ${unit[1]}${count === 1 ? "" : "s"}`;
 }
-function syncLabel(
-  state: RefreshState | undefined,
-  configured: boolean,
-  coolingDown: boolean,
-) {
-  if (!configured) return "Awaiting setup";
-  if (state?.running) return "Syncing";
-  if (state?.queued) return "Queued";
-  if (coolingDown) return "Waiting for provider";
-  if (state?.error) return "Needs attention";
-  if (!state?.lastSuccessfulAt) return "Waiting for first sync";
-  return "Up to date";
+
+function RuleList({
+  values,
+  fallback,
+  loaded,
+}: {
+  values?: string[];
+  fallback: string;
+  loaded: boolean;
+}) {
+  if (!loaded) return <>—</>;
+  if (!values?.length) return <>{fallback}</>;
+  return (
+    <ul className="settings-rule-values">
+      {values.map((value, index) => (
+        <li key={`${index}:${value}`}>{value}</li>
+      ))}
+    </ul>
+  );
 }
 
 export function SettingsPage({
   status,
   statusError,
-  checkedAt,
   onRefresh,
 }: {
   status: Status | null;
   statusError: string;
-  checkedAt: number | null;
   onRefresh: (target: RefreshTarget) => Promise<void>;
 }) {
-  const [pending, setPending] = useState<RefreshTarget | null>(null);
-  const [actionError, setActionError] = useState("");
+  const [preferences, setPreferences] = useState<Preferences | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [retry, setRetry] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    setLoadError("");
+    void getPreferences(controller.signal)
+      .then((value) => {
+        if (!controller.signal.aborted) setPreferences(value);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted)
+          setLoadError("Configuration unavailable.");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [retry, status?.preferencesUpdatedAt]);
+
   const configured = status?.configured ?? false;
   const cooldown =
     !!status?.portalCooldownUntil &&
     Date.parse(status.portalCooldownUntil) > Date.now();
-  const unavailable =
-    !configured || cooldown || !!statusError || pending !== null;
-
-  const refresh = async (target: RefreshTarget) => {
-    if (pending) return;
-    setPending(target);
-    setActionError("");
+  const syncStates = [status?.sync?.catalog, status?.sync?.epg];
+  const busy =
+    refreshing ||
+    !!status?.refreshing ||
+    syncStates.some((state) => state?.running || state?.queued);
+  const syncErrors = [
+    ...new Set(
+      [status?.error, ...syncStates.map((state) => state?.error)].filter(
+        (value): value is string => !!value,
+      ),
+    ),
+  ];
+  const lastUpdated =
+    syncStates
+      .map((state) => state?.lastSuccessfulAt)
+      .filter((value): value is string => !!value)
+      .sort()
+      .at(-1) || status?.libraryUpdatedAt;
+  const configuration = preferences?.configuration;
+  const refresh = async () => {
+    if (busy || !configured || cooldown || statusError) return;
+    setRefreshing(true);
+    setRefreshError("");
     try {
-      await onRefresh(target);
+      await onRefresh("all");
     } catch (cause) {
-      setActionError(
-        cause instanceof Error
-          ? cause.message
-          : "Couldn’t request a refresh. Try again.",
+      setRefreshError(
+        cause instanceof Error ? cause.message : "Couldn’t refresh. Try again.",
       );
     } finally {
-      setPending(null);
+      setRefreshing(false);
     }
   };
 
   return (
-    <section className="settings-page" aria-labelledby="settings-title">
+    <section
+      className="settings-page settings-readonly"
+      aria-labelledby="settings-title"
+    >
       <div className="settings-heading">
-        <div>
-          <h1 id="settings-title">Settings</h1>
-          <p>Keep your library and guide up to date.</p>
-        </div>
+        <h1 id="settings-title">Settings</h1>
+        <Button
+          variant="outline"
+          disabled={!configured || cooldown || busy || !!statusError}
+          aria-busy={busy || undefined}
+          onClick={() => void refresh()}
+        >
+          <RefreshCw
+            size={16}
+            className={busy ? "animate-spin" : undefined}
+            aria-hidden="true"
+          />
+          Refresh now
+        </Button>
       </div>
-      {statusError && (
-        <div className="settings-notice" role="alert">
-          <TriangleAlert size={18} aria-hidden="true" />
-          <span>
-            Couldn’t check the server. {statusError} The values below are from
-            the last successful check.
-          </span>
-        </div>
-      )}
-      {actionError && (
-        <p className="settings-action-error" role="alert">
-          {actionError}
+      {busy && (
+        <p className="settings-current-state" role="status">
+          <Spinner size="small" className="app-spinner" />
+          Refreshing…
         </p>
       )}
-      {!status ? (
-        <div className="inline-loading" role="status">
-          <Spinner size="small" className="app-spinner" />
-          Checking server status…
-        </div>
-      ) : (
-        <>
-          <div className="settings-connection">
-            <Wifi size={19} aria-hidden="true" />
-            <span>
-              {configured ? "Provider configured" : "Provider setup required"}
-            </span>
-            <span className="settings-connection-detail">
-              {!configured
-                ? "Waiting for configuration"
-                : status.refreshing
-                  ? "Sync in progress"
-                  : "Automatic refresh enabled"}
-            </span>
-          </div>
-          {cooldown && (
-            <div className="settings-notice">
-              <CalendarClock size={18} aria-hidden="true" />
-              <span>
-                The provider requested a pause. Automatic refresh resumes after{" "}
-                {timestamp(status.portalCooldownUntil)}.
-              </span>
-            </div>
-          )}
-          <div className="settings-sync-list">
-            {[
-              {
-                target: "catalog" as const,
-                title: "Library metadata",
-                description:
-                  "Update live channels and categories, and check movie, series, and episode lists for changes.",
-                icon: Database,
-              },
-              {
-                target: "epg" as const,
-                title: "Programme guide",
-                description: "Schedules and what’s currently on each channel.",
-                icon: CalendarClock,
-              },
-            ].map(({ target, title, description, icon: Icon }) => {
-              const state = status.sync?.[target];
-              const busy =
-                !!state?.running ||
-                !!state?.queued ||
-                pending === target ||
-                pending === "all";
-              return (
-                <section
-                  className="settings-sync-section"
-                  key={target}
-                  aria-label={title}
-                >
-                  <div className="settings-sync-heading">
-                    <Icon size={22} aria-hidden="true" />
-                    <div>
-                      <h2>{title}</h2>
-                      <p>{description}</p>
-                    </div>
-                    <span
-                      className={`settings-sync-state ${busy ? "syncing" : state?.error ? "sync-error" : ""}`}
-                    >
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="settings-sync-refresh"
-                        aria-label={
-                          target === "catalog"
-                            ? "Refresh library"
-                            : "Refresh guide"
-                        }
-                        title={
-                          busy
-                            ? "Syncing"
-                            : target === "catalog"
-                              ? "Refresh library"
-                              : "Refresh guide"
-                        }
-                        aria-busy={busy || undefined}
-                        disabled={unavailable || busy}
-                        onClick={() => void refresh(target)}
-                      >
-                        <RefreshCw
-                          size={16}
-                          className={busy ? "animate-spin" : undefined}
-                          aria-hidden="true"
-                        />
-                      </Button>
-                      <span role="status">
-                        {busy
-                          ? "Syncing"
-                          : syncLabel(state, configured, cooldown)}
-                      </span>
-                    </span>
-                  </div>
-                  <div className="settings-sync-body">
-                    <dl>
-                      <div>
-                        <dt>Last successful sync</dt>
-                        <dd>
-                          <time dateTime={state?.lastSuccessfulAt}>
-                            {timestamp(state?.lastSuccessfulAt)}
-                          </time>
-                        </dd>
-                      </div>
-                      <div>
-                        <dt>{busy ? "Started" : "Next refresh"}</dt>
-                        <dd>
-                          {busy
-                            ? state?.queued
-                              ? "Queued to start"
-                              : state?.startedAt
-                                ? timestamp(state.startedAt)
-                                : "Starting…"
-                            : !configured
-                              ? "After setup"
-                              : state?.nextRefreshAt
-                                ? timestamp(state.nextRefreshAt)
-                                : "Due now"}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt>Refresh interval</dt>
-                        <dd>Every {duration(state?.intervalSeconds)}</dd>
-                      </div>
-                    </dl>
-                  </div>
-                  {state?.error && (
-                    <p className="settings-sync-error" role="alert">
-                      {state.error}
-                    </p>
-                  )}
-                </section>
-              );
-            })}
-          </div>
-          <div className="settings-details">
-            <section aria-labelledby="settings-library-title">
-              <h2 id="settings-library-title">
-                <Radio size={19} aria-hidden="true" />
-                Library &amp; guide
-              </h2>
-              <dl>
-                <div>
-                  <dt>Live channels</dt>
-                  <dd>
-                    {status.library?.liveChannels.toLocaleString() ?? "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Categories</dt>
-                  <dd>{status.library?.categories.toLocaleString() ?? "—"}</dd>
-                </div>
-                <div>
-                  <dt>Cached movies / series</dt>
-                  <dd>
-                    {status.library
-                      ? `${status.library.cachedMovies.toLocaleString()} / ${status.library.cachedSeries.toLocaleString()}`
-                      : "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Guide programmes</dt>
-                  <dd>{status.library?.programmes.toLocaleString() ?? "—"}</dd>
-                </div>
-                <div>
-                  <dt>Guide available through</dt>
-                  <dd>
-                    {status.library?.guideEndsAt
-                      ? timestamp(status.library.guideEndsAt)
-                      : "No guide data yet"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Guide request window</dt>
-                  <dd>
-                    {status.guideHours ? `${status.guideHours} hours` : "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Provider timezone</dt>
-                  <dd>{status.timezone || "—"}</dd>
-                </div>
-              </dl>
-              <p className="settings-footnote">
-                Cached title counts grow as you browse. Guide coverage depends
-                on the provider. Times are shown in your device’s timezone.
-              </p>
-            </section>
-            <section aria-labelledby="settings-playback-title">
-              <h2 id="settings-playback-title">
-                <AudioLines size={19} aria-hidden="true" />
-                Playback
-              </h2>
-              <dl>
-                <div>
-                  <dt>Streams in use</dt>
-                  <dd>
-                    {status.activeStreams} / {status.maxStreams}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Available slots</dt>
-                  <dd>
-                    {Math.max(0, status.maxStreams - status.activeStreams)}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Playback mode</dt>
-                  <dd>
-                    {status.playback?.transcodeMode === "auto"
-                      ? "Automatic"
-                      : status.playback?.transcodeMode === "copy"
-                        ? "Direct stream"
-                        : status.playback?.transcodeMode === "transcode"
-                          ? "Transcode"
-                          : "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Idle session timeout</dt>
-                  <dd>{duration(status.playback?.sessionTimeoutSeconds)}</dd>
-                </div>
-              </dl>
-              <p className="settings-footnote">
-                Refreshes run in the background while you watch. Refresh
-                intervals and playback limits are configured on the server.
-              </p>
-            </section>
-          </div>
-        </>
+      {!status && !statusError && (
+        <p className="settings-current-state" role="status">
+          Checking server…
+        </p>
       )}
-      <div className="settings-check">
-        <span>
-          {checkedAt
-            ? `Status checked ${timestamp(new Date(checkedAt).toISOString())}`
-            : "Waiting for server status"}{" "}
-          · Updates automatically
-        </span>
+      {status && !configured && (
+        <p className="settings-current-state" role="status">
+          Provider setup required.
+        </p>
+      )}
+      {statusError && (
+        <p className="settings-notice" role="alert">
+          <TriangleAlert size={17} aria-hidden="true" />
+          Server unavailable. {statusError}
+        </p>
+      )}
+      {cooldown && (
+        <p className="settings-notice" role="status">
+          <CalendarClock size={17} aria-hidden="true" />
+          Refresh resumes after {timestamp(status?.portalCooldownUntil)}.
+        </p>
+      )}
+      {refreshError && (
+        <p className="settings-action-error" role="alert">
+          {refreshError}
+        </p>
+      )}
+      {syncErrors.map((error) => (
+        <p key={error} className="settings-action-error" role="alert">
+          {error}
+        </p>
+      ))}
+      {loadError && (
+        <div className="settings-config-error" role="alert">
+          <span>{loadError}</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setRetry((value) => value + 1)}
+          >
+            Retry configuration
+          </Button>
+        </div>
+      )}
+      {loading && !preferences && (
+        <p className="settings-current-state" role="status">
+          Loading configuration…
+        </p>
+      )}
+      <div className="settings-summary">
+        <dl aria-label="Server status">
+          <div>
+            <dt>Provider</dt>
+            <dd>
+              {status ? (configured ? "Configured" : "Not configured") : "—"}
+            </dd>
+          </div>
+          <div>
+            <dt title="REFRESH_INTERVAL">Refresh interval</dt>
+            <dd>
+              {interval(
+                preferences?.refreshIntervalSeconds ??
+                  status?.sync?.catalog?.intervalSeconds,
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt>Last refreshed</dt>
+            <dd>
+              <time dateTime={lastUpdated}>{timestamp(lastUpdated)}</time>
+            </dd>
+          </div>
+          <div>
+            <dt>Live channels</dt>
+            <dd>{status?.library?.liveChannels.toLocaleString() ?? "—"}</dd>
+          </div>
+          <div>
+            <dt>Categories</dt>
+            <dd>{status?.library?.categories.toLocaleString() ?? "—"}</dd>
+          </div>
+          <div>
+            <dt>Streams</dt>
+            <dd>
+              {status ? `${status.activeStreams} / ${status.maxStreams}` : "—"}
+            </dd>
+          </div>
+        </dl>
+        <dl className="settings-category-rules" aria-label="Category rules">
+          <div>
+            <dt title="DASHBOARD_CATEGORIES">Dashboard</dt>
+            <dd>
+              <RuleList
+                values={configuration?.dashboardCategories}
+                fallback="All"
+                loaded={!!preferences}
+              />
+            </dd>
+          </div>
+          <div>
+            <dt title="BLOCKED_CATEGORIES">Blocked</dt>
+            <dd>
+              <RuleList
+                values={configuration?.blockedCategories}
+                fallback="None"
+                loaded={!!preferences}
+              />
+            </dd>
+          </div>
+        </dl>
       </div>
     </section>
   );

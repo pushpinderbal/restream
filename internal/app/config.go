@@ -20,6 +20,8 @@ type Config struct {
 	EpisodeCacheTTL                                                        time.Duration
 	TranscodeMode                                                          string
 	TMDBReadAccessToken, TMDBAPIKey                                        string
+	RefreshInterval                                                        time.Duration
+	categoryEnvironment                                                    categoryEnvironment
 }
 
 func LoadConfig() (Config, error) {
@@ -31,6 +33,18 @@ func LoadConfig() (Config, error) {
 		TMDBReadAccessToken: strings.TrimSpace(os.Getenv("TMDB_API_READ_ACCESS_TOKEN")), TMDBAPIKey: strings.TrimSpace(os.Getenv("TMDB_API_KEY")),
 	}
 	var err error
+	for _, setting := range []struct {
+		name   string
+		target *[]categorySelector
+	}{
+		{"DASHBOARD_CATEGORIES", &c.categoryEnvironment.dashboard},
+		{"BLOCKED_CATEGORIES", &c.categoryEnvironment.blocked},
+	} {
+		*setting.target, err = parseCategorySelectors(setting.name, os.Getenv(setting.name))
+		if err != nil {
+			return c, err
+		}
+	}
 	responseMB, err := strconv.ParseInt(env("STALKER_MAX_RESPONSE_MB", "64"), 10, 32)
 	if err != nil || responseMB < 1 || responseMB > 512 {
 		return c, fmt.Errorf("STALKER_MAX_RESPONSE_MB must be an integer between 1 and 512")
@@ -67,6 +81,10 @@ func LoadConfig() (Config, error) {
 		if err != nil || *setting.target < setting.minimum {
 			return c, fmt.Errorf("%s must be a duration of at least %s", setting.name, setting.minimum)
 		}
+	}
+	c.RefreshInterval, err = time.ParseDuration(env("REFRESH_INTERVAL", env("CATALOG_REFRESH_INTERVAL", "6h")))
+	if err != nil || c.RefreshInterval < time.Minute || c.RefreshInterval > 7*24*time.Hour {
+		return c, fmt.Errorf("REFRESH_INTERVAL must be a duration between 1m and 168h")
 	}
 	if (c.PortalURL == "") != (c.MAC == "") {
 		return c, fmt.Errorf("set both STALKER_PORTAL_URL and STALKER_MAC")

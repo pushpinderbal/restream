@@ -79,6 +79,61 @@ page.on("response", async (response) => {
   }
 });
 
+const navigateLibrary = async (kind) => {
+  const navigation = page.getByRole("navigation", {
+    name: page.viewportSize().width <= 820 ? "Primary navigation" : "Library",
+    exact: true,
+  });
+  const types = page.getByRole("tablist", { name: "VOD type", exact: true });
+  if (kind === "live" || !(await types.isVisible()))
+    await navigation
+      .getByRole("button", {
+        name: kind === "live" ? "Live TV" : "VOD",
+        exact: true,
+      })
+      .click();
+  if (kind !== "live")
+    await types
+      .getByRole("tab", {
+        name: kind === "movie" ? "Movies" : "Shows",
+        exact: true,
+      })
+      .click();
+};
+const checkReleasedPlayback = async () => {
+  await checkReleasedMedia();
+  await expect
+    .poll(
+      async () =>
+        (await (await page.request.get(`${baseURL}/api/status`)).json())
+          .activeStreams,
+      { timeout: 10000 },
+    )
+    .toBe(0);
+};
+const playTestMovie = async ({ fromSearch = false } = {}) => {
+  if (fromSearch) {
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await expect(
+      page.getByRole("searchbox", { name: "Search library", exact: true }),
+    ).toHaveValue("");
+    await page
+      .getByRole("searchbox", { name: "Search library", exact: true })
+      .fill("Test");
+  } else await navigateLibrary("movie");
+  const titles = fromSearch
+    ? page.getByRole("region", { name: "Movies results", exact: true })
+    : page;
+  await titles
+    .getByRole("button", { name: "Open Test movie", exact: true })
+    .click();
+  await page
+    .getByRole("region", { name: "Expanded title", exact: true })
+    .getByRole("button", { name: "Play", exact: true })
+    .click();
+  await page.waitForFunction(progressing, undefined, { timeout: 15000 });
+};
+
 const videoState = () => {
   const video = document.querySelector("video");
   return (
@@ -115,6 +170,18 @@ async function checkNativePlayback() {
   }
   // Emulate a native-only browser while retaining Chrome's real HLS decoder.
   await nativePage.addInitScript(() => {
+    document.addEventListener(
+      "error",
+      (event) => {
+        if (event.target instanceof HTMLVideoElement && event.target.error)
+          window.__restreamNativeMediaError = {
+            code: event.target.error.code,
+            message: event.target.error.message,
+            source: event.target.currentSrc || event.target.src,
+          };
+      },
+      true,
+    );
     for (const name of [
       "MediaSource",
       "ManagedMediaSource",
@@ -124,6 +191,10 @@ async function checkNativePlayback() {
   });
   let nativeSeeks = 0;
   const nativeErrors = [];
+  nativePage.on("console", (message) => {
+    if (message.type() === "error" || message.type() === "warning")
+      console.log(`Native browser ${message.type()}: ${message.text()}`);
+  });
   const workers = new Set();
   nativePage.on("worker", (worker) => {
     workers.add(worker);
@@ -147,9 +218,35 @@ async function checkNativePlayback() {
     await nativePage.goto(`${baseURL}/?section=movie`);
     await nativePage.getByRole("button", { name: "Open Test movie" }).click();
     await nativePage.getByRole("button", { name: "Play", exact: true }).click();
-    await nativePage.waitForFunction(progressing, undefined, {
-      timeout: 15000,
-    });
+    await nativePage
+      .waitForFunction(progressing, undefined, {
+        timeout: 15000,
+      })
+      .catch(async (error) => {
+        console.log(
+          "Native initial state:",
+          JSON.stringify(
+            await nativePage.locator("video").evaluate((video) => ({
+              currentTime: video.currentTime,
+              currentSrc: video.currentSrc,
+              paused: video.paused,
+              readyState: video.readyState,
+              networkState: video.networkState,
+              error: video.error && {
+                code: video.error.code,
+                message: video.error.message,
+              },
+              hasMediaSource: "MediaSource" in window,
+              capturedError: window.__restreamNativeMediaError,
+            })),
+          ),
+        );
+        console.log(
+          "Native player alerts:",
+          await nativePage.getByRole("alert").allTextContents(),
+        );
+        throw error;
+      });
     const source = (await nativePage.evaluate(videoState)).src;
     const nativeArea = nativePage.locator(".playback-area");
     await nativeArea.hover();
@@ -234,303 +331,329 @@ async function checkNativePlayback() {
 }
 
 try {
-  const codecsSupported = await page.evaluate(
-    () =>
-      typeof MediaSource !== "undefined" &&
-      MediaSource.isTypeSupported('video/mp4;codecs="avc1.42e01e"') &&
-      MediaSource.isTypeSupported('audio/mp4;codecs="mp4a.40.2"'),
-  );
-  if (!codecsSupported)
-    throw new Error(
-      "Real playback requires H.264/AAC support. Set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH to a compatible Chrome/Chromium executable.",
+  if (process.env.RESTREAM_NATIVE_ONLY === "1") {
+    await checkNativePlayback();
+  } else {
+    const codecsSupported = await page.evaluate(
+      () =>
+        typeof MediaSource !== "undefined" &&
+        MediaSource.isTypeSupported('video/mp4;codecs="avc1.42e01e"') &&
+        MediaSource.isTypeSupported('audio/mp4;codecs="mp4a.40.2"'),
     );
-  await page.goto(baseURL);
-  const initialHeap = await heapUsage();
-  if (activeWorkers.size) throw new Error("Decoder started before playback");
-  await page
-    .getByRole("navigation", { name: "Library" })
-    .getByRole("button", { name: "Movies", exact: true })
-    .click();
-  await page.getByRole("button", { name: "Open Test movie" }).click();
-  const play = page.getByRole("button", { name: "Play", exact: true });
-  await play.waitFor({ timeout: 30000 });
-  const started = Date.now();
-  await play.click();
-  await page.waitForFunction(
-    () => {
-      const video = document.querySelector("video");
-      return video && video.getVideoPlaybackQuality().totalVideoFrames > 0;
-    },
-    undefined,
-    { timeout: 15000 },
-  );
-  const firstFrameMs = Date.now() - started;
-  await page
-    .waitForFunction(progressing, undefined, { timeout: 15000 })
-    .catch(async (error) => {
-      console.log(
-        "Video state:",
-        JSON.stringify(await page.evaluate(videoState)),
+    if (!codecsSupported)
+      throw new Error(
+        "Real playback requires H.264/AAC support. Set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH to a compatible Chrome/Chromium executable.",
       );
-      console.log(
-        "Player alerts:",
-        await page.getByRole("alert").allTextContents(),
-      );
-      await page.screenshot({ path: "/tmp/restream-playback-debug.png" });
-      throw error;
-    });
-  const decoded = await page.evaluate(videoState);
-  if (!decoded.src.startsWith("blob:"))
-    throw new Error("HLS.js was not preferred over advertised native support");
-  if (
-    ![...activeWorkers].some((worker) =>
-      /\/assets\/hls\.worker-/.test(worker.url()),
-    )
-  )
-    throw new Error("HLS transmuxing did not start its local worker");
-  console.log(
-    `Buffered ${await checkBufferWindow()}s; decoding worker active: ${activeWorkers.size}`,
-  );
-  console.log(
-    `Decoded HLS ${decoded.width}x${decoded.height}; first decoded frame observed in ${firstFrameMs}ms`,
-  );
-
-  const persistentVideo = await page.locator("video").elementHandle();
-  for (const section of ["Series", "Live TV", "Movies"]) {
+    await page.goto(baseURL);
+    const initialHeap = await heapUsage();
+    if (activeWorkers.size) throw new Error("Decoder started before playback");
+    await navigateLibrary("movie");
+    await page.getByRole("button", { name: "Open Test movie" }).click();
+    const play = page.getByRole("button", { name: "Play", exact: true });
+    await play.waitFor({ timeout: 30000 });
+    const started = Date.now();
+    await play.click();
+    await page.waitForFunction(
+      () => {
+        const video = document.querySelector("video");
+        return video && video.getVideoPlaybackQuality().totalVideoFrames > 0;
+      },
+      undefined,
+      { timeout: 15000 },
+    );
+    const firstFrameMs = Date.now() - started;
     await page
-      .getByRole("navigation", { name: "Library" })
-      .getByRole("button", { name: section, exact: true })
-      .click();
-    const state = await page.evaluate(videoState);
+      .waitForFunction(progressing, undefined, { timeout: 15000 })
+      .catch(async (error) => {
+        console.log(
+          "Video state:",
+          JSON.stringify(await page.evaluate(videoState)),
+        );
+        console.log(
+          "Player alerts:",
+          await page.getByRole("alert").allTextContents(),
+        );
+        await page.screenshot({ path: "/tmp/restream-playback-debug.png" });
+        throw error;
+      });
+    const decoded = await page.evaluate(videoState);
+    if (!decoded.src.startsWith("blob:"))
+      throw new Error(
+        "HLS.js was not preferred over advertised native support",
+      );
     if (
-      !(await persistentVideo.evaluate(
-        (element) => element === document.querySelector("video"),
-      )) ||
-      state.src !== decoded.src ||
-      state.paused ||
-      !state.width ||
+      ![...activeWorkers].some((worker) =>
+        /\/assets\/hls\.worker-/.test(worker.url()),
+      )
+    )
+      throw new Error("HLS transmuxing did not start its local worker");
+    console.log(
+      `Buffered ${await checkBufferWindow()}s; decoding worker active: ${activeWorkers.size}`,
+    );
+    console.log(
+      `Decoded HLS ${decoded.width}x${decoded.height}; first decoded frame observed in ${firstFrameMs}ms`,
+    );
+
+    for (const section of ["series", "live", "movie"]) {
+      const previousVideo = await page.locator("video").elementHandle();
+      await navigateLibrary(section);
+      await checkReleasedPlayback();
+      if (await previousVideo.evaluate((element) => element.isConnected))
+        throw new Error(`Switching to ${section} retained the old player`);
+      await playTestMovie();
+    }
+    console.log(
+      "Sidebar navigation releases its decoder and stream slot; returning to VOD starts decoded playback again",
+    );
+
+    const area = page.locator(".playback-area");
+    const controls = page.locator(".video-controls");
+    await page.mouse.move(1, 1);
+    await area.hover();
+    await page.waitForTimeout(3100);
+    if ((await controls.getAttribute("data-visible")) !== "false")
+      throw new Error("Playing controls did not auto-hide");
+    await area.hover({ position: { x: 30, y: 30 } });
+    await page
+      .getByRole("button", { name: "Full screen", exact: true })
+      .click();
+    await page.mouse.move(100, 100);
+    await page.waitForTimeout(3100);
+    if ((await controls.getAttribute("data-visible")) !== "false")
+      throw new Error("Fullscreen controls did not auto-hide");
+    await page.mouse.move(200, 120);
+    await page.getByRole("button", { name: "Exit full screen" }).click();
+    await area.hover({ position: { x: 40, y: 40 } });
+    console.log(
+      "Controls fade after inactivity, including fullscreen, and return on pointer activity",
+    );
+
+    await page.getByRole("button", { name: "Pause", exact: true }).click();
+    await page.waitForFunction(
+      () => document.querySelector("video")?.paused,
+      undefined,
+      {
+        timeout: 5000,
+      },
+    );
+    await page.waitForTimeout(1200);
+    const sourceBeforeResume = (await page.evaluate(videoState)).src;
+    await page.keyboard.press("m");
+    if (!(await page.evaluate(() => document.querySelector("video")?.muted)))
+      throw new Error("Mute shortcut failed");
+    await page.keyboard.press("m");
+    await page.keyboard.press("k");
+    await page.waitForFunction(progressing, undefined, { timeout: 10000 });
+    if (
+      (await page.evaluate(videoState)).src !== sourceBeforeResume ||
       seekCount !== 0
     )
-      throw new Error(
-        `Switching to ${section} interrupted the decoding player`,
-      );
-  }
-  await page.getByRole("button", { name: "Open Test movie" }).click();
-  console.log("Library tabs preserve the same decoding player and HLS source");
+      throw new Error("Pause/resume unnecessarily restarted the stream");
+    console.log("Pause/resume keeps the same HLS generation");
 
-  const area = page.locator(".playback-area");
-  const controls = page.locator(".video-controls");
-  await page.mouse.move(1, 1);
-  await area.hover();
-  await page.waitForTimeout(3100);
-  if ((await controls.getAttribute("data-visible")) !== "false")
-    throw new Error("Playing controls did not auto-hide");
-  await area.hover({ position: { x: 30, y: 30 } });
-  await page.getByRole("button", { name: "Full screen", exact: true }).click();
-  await page.mouse.move(100, 100);
-  await page.waitForTimeout(3100);
-  if ((await controls.getAttribute("data-visible")) !== "false")
-    throw new Error("Fullscreen controls did not auto-hide");
-  await page.mouse.move(200, 120);
-  await page.getByRole("button", { name: "Exit full screen" }).click();
-  await area.hover({ position: { x: 40, y: 40 } });
-  console.log(
-    "Controls fade after inactivity, including fullscreen, and return on pointer activity",
-  );
+    await area.hover({ position: { x: 50, y: 40 } });
+    await page.getByRole("button", { name: "Back 10 seconds" }).click();
+    await page.waitForTimeout(500);
+    if (seekCount !== 0)
+      throw new Error("Buffered rewind restarted the stream");
+    console.log("Buffered rewind seeks locally");
 
-  await page.getByRole("button", { name: "Pause", exact: true }).click();
-  await page.waitForFunction(
-    () => document.querySelector("video")?.paused,
-    undefined,
-    {
-      timeout: 5000,
-    },
-  );
-  await page.waitForTimeout(1200);
-  const sourceBeforeResume = (await page.evaluate(videoState)).src;
-  await page.keyboard.press("m");
-  if (!(await page.evaluate(() => document.querySelector("video")?.muted)))
-    throw new Error("Mute shortcut failed");
-  await page.keyboard.press("m");
-  await page.keyboard.press("k");
-  await page.waitForFunction(progressing, undefined, { timeout: 10000 });
-  if (
-    (await page.evaluate(videoState)).src !== sourceBeforeResume ||
-    seekCount !== 0
-  )
-    throw new Error("Pause/resume unnecessarily restarted the stream");
-  console.log("Pause/resume keeps the same HLS generation");
-
-  await area.hover({ position: { x: 50, y: 40 } });
-  await page.getByRole("button", { name: "Back 10 seconds" }).click();
-  await page.waitForTimeout(500);
-  if (seekCount !== 0) throw new Error("Buffered rewind restarted the stream");
-  console.log("Buffered rewind seeks locally");
-
-  await area.hover({ position: { x: 60, y: 40 } });
-  await page.getByRole("button", { name: "Forward 10 seconds" }).click();
-  await page.waitForTimeout(500);
-  if (seekCount !== 0)
-    throw new Error("Available forward seek restarted the stream");
-  console.log("Available forward seek stays local");
-  await checkBufferWindow();
-  if (process.env.CAPTURE_SCREENSHOTS === "1")
-    await page.screenshot({ path: "/tmp/restream-real-player.png" });
-  const bounds = await page.locator(".timeline").boundingBox();
-  if (!bounds) throw new Error("Timeline not visible");
-  const seeksBefore = seekCount;
-  const sourceBeforeSeek = (await page.evaluate(videoState)).src;
-  const seekResponse = page.waitForResponse(
-    (response) =>
-      /\/api\/sessions\/[^/]+\/seek$/.test(response.url()) &&
-      response.request().method() === "POST",
-    { timeout: 5000 },
-  );
-  const seekStarted = Date.now();
-  await page.mouse.click(
-    bounds.x + bounds.width * 0.9,
-    bounds.y + bounds.height / 2,
-  );
-  await seekResponse;
-  if (seekCount <= seeksBefore)
-    throw new Error("Timeline did not request a seek");
-  await page.waitForFunction(
-    (previous) => document.querySelector("video")?.currentSrc !== previous,
-    sourceBeforeSeek,
-    { timeout: 30000 },
-  );
-  await page.waitForFunction(progressing, undefined, { timeout: 30000 });
-  const afterSeek = await page.evaluate(videoState);
-  if (afterSeek.paused || afterSeek.width === 0)
-    throw new Error("Playback did not resume after timeline seek");
-  console.log(
-    `Timeline seek resumed decoded playback in ${Date.now() - seekStarted}ms`,
-  );
-  await checkBufferWindow();
-  await page.setViewportSize({ width: 390, height: 844 });
-  await area.hover({ position: { x: 70, y: 40 } });
-  if (process.env.CAPTURE_SCREENSHOTS === "1")
-    await page.screenshot({ path: "/tmp/restream-real-player-mobile.png" });
-  if ((await page.evaluate(() => document.documentElement.scrollWidth)) > 390)
-    throw new Error("Player overflows mobile viewport");
-
-  const playingVideo = await page.locator("video").elementHandle();
-  const sourceBeforeSearch = (await page.evaluate(videoState)).src;
-  const itemBeforeSearch = new URL(page.url()).searchParams.get("item");
-  const timeBeforeSettings = (await page.evaluate(videoState)).time;
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByRole("heading", { name: "Settings", exact: true }).waitFor();
-  const beforeRefresh = await (
-    await page.request.get(`${baseURL}/api/status`)
-  ).json();
-  const libraryRefreshed = page.waitForResponse(async (response) => {
-    if (!response.url().endsWith("/api/status")) return false;
-    const status = await response.json();
-    return (
-      status.libraryUpdatedAt !== beforeRefresh.libraryUpdatedAt &&
-      !status.refreshing
+    await area.hover({ position: { x: 60, y: 40 } });
+    await page.getByRole("button", { name: "Forward 10 seconds" }).click();
+    await page.waitForTimeout(500);
+    if (seekCount !== 0)
+      throw new Error("Available forward seek restarted the stream");
+    console.log("Available forward seek stays local");
+    await checkBufferWindow();
+    if (process.env.CAPTURE_SCREENSHOTS === "1")
+      await page.screenshot({ path: "/tmp/restream-real-player.png" });
+    const bounds = await page.locator(".timeline").boundingBox();
+    if (!bounds) throw new Error("Timeline not visible");
+    const seeksBefore = seekCount;
+    const sourceBeforeSeek = (await page.evaluate(videoState)).src;
+    const seekResponse = page.waitForResponse(
+      (response) =>
+        /\/api\/sessions\/[^/]+\/seek$/.test(response.url()) &&
+        response.request().method() === "POST",
+      { timeout: 5000 },
     );
-  });
-  await page.getByRole("button", { name: "Refresh library" }).click();
-  await libraryRefreshed;
-  await page.getByRole("button", { name: "Refresh guide" }).click();
-  await page.waitForFunction(
-    (previous) => {
-      const video = document.querySelector("video");
-      return video && !video.paused && video.currentTime > previous + 0.3;
-    },
-    timeBeforeSettings,
-    { timeout: 5000 },
-  );
-  if (
-    !(await playingVideo.evaluate((element) => element.isConnected)) ||
-    (await page.evaluate(videoState)).src !== sourceBeforeSearch
-  )
-    throw new Error(
-      "Settings or background library/guide refresh restarted playback",
+    const seekStarted = Date.now();
+    await page.mouse.click(
+      bounds.x + bounds.width * 0.9,
+      bounds.y + bounds.height / 2,
     );
-  await page.getByRole("button", { name: "Movies", exact: true }).click();
-  await area.waitFor({ state: "visible" });
-  console.log(
-    "Settings, library refresh, and guide refresh preserve the same decoding player",
-  );
-  await page
-    .locator(".header-search")
-    .getByRole("searchbox")
-    .fill("No matching film");
-  await page.getByText("No matches found", { exact: true }).waitFor();
-  const filteredVideo = await page.evaluate(videoState);
-  if (
-    !(await playingVideo.evaluate((element) => element.isConnected)) ||
-    filteredVideo.src !== sourceBeforeSearch ||
-    filteredVideo.paused ||
-    !filteredVideo.width
-  )
-    throw new Error("Search interrupted the playing HLS stream");
-  if (new URL(page.url()).searchParams.get("item") !== itemBeforeSearch)
-    throw new Error("Search dropped the selected title from the URL");
-  if ((await page.locator('.media-card[aria-expanded="true"]').count()) !== 1)
-    throw new Error("Filtered playing tile is unavailable to close");
-  console.log(
-    "Search preserves decoded playback and keeps the selected tile available to close",
-  );
+    await seekResponse;
+    if (seekCount <= seeksBefore)
+      throw new Error("Timeline did not request a seek");
+    await page.waitForFunction(
+      (previous) => document.querySelector("video")?.currentSrc !== previous,
+      sourceBeforeSeek,
+      { timeout: 30000 },
+    );
+    await page.waitForFunction(progressing, undefined, { timeout: 30000 });
+    const afterSeek = await page.evaluate(videoState);
+    if (afterSeek.paused || afterSeek.width === 0)
+      throw new Error("Playback did not resume after timeline seek");
+    console.log(
+      `Timeline seek resumed decoded playback in ${Date.now() - seekStarted}ms`,
+    );
+    await checkBufferWindow();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await area.hover({ position: { x: 70, y: 40 } });
+    if (process.env.CAPTURE_SCREENSHOTS === "1")
+      await page.screenshot({ path: "/tmp/restream-real-player-mobile.png" });
+    if ((await page.evaluate(() => document.documentElement.scrollWidth)) > 390)
+      throw new Error("Player overflows mobile viewport");
 
-  await page.locator('.media-card[aria-expanded="true"]').click();
-  await page.waitForFunction(
-    async (url) =>
-      (await (await fetch(`${url}/api/status`)).json()).activeStreams === 0,
-    baseURL,
-    { timeout: 10000 },
-  );
-  await checkReleasedMedia();
-  await page
-    .getByRole("navigation", { name: "Primary navigation" })
-    .getByRole("button", { name: "Live TV", exact: true })
-    .click();
-  await page
-    .getByRole("button", { name: "Open Test live", exact: true })
-    .click();
-  await page.getByRole("button", { name: "Play", exact: true }).click();
-  await page.waitForFunction(progressing, undefined, { timeout: 15000 });
-  const firstLiveSource = (await page.evaluate(videoState)).src;
-  await page
-    .getByRole("button", { name: "Open Test live two", exact: true })
-    .click();
-  await page.waitForFunction(
-    (previous) => {
-      const video = document.querySelector("video");
+    const videoBeforeSettings = await page.locator("video").elementHandle();
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page
+      .getByRole("heading", { name: "Settings", exact: true })
+      .waitFor();
+    await checkReleasedPlayback();
+    if (await videoBeforeSettings.evaluate((element) => element.isConnected))
+      throw new Error("Settings retained the decoding player");
+    const beforeRefresh = await (
+      await page.request.get(`${baseURL}/api/status`)
+    ).json();
+    const libraryRefreshed = page.waitForResponse(async (response) => {
+      if (!response.url().endsWith("/api/status")) return false;
+      const status = await response.json();
       return (
-        video &&
-        video.currentSrc !== previous &&
-        !video.paused &&
-        video.videoWidth > 0 &&
-        video.currentTime > 0.5
+        status.libraryUpdatedAt !== beforeRefresh.libraryUpdatedAt &&
+        !status.refreshing
       );
-    },
-    firstLiveSource,
-    { timeout: 15000 },
-  );
-  const liveStatus = await (await fetch(`${baseURL}/api/status`)).json();
-  if (liveStatus.activeStreams !== 1)
-    throw new Error("Channel tune lost its single stream slot");
-  console.log(
-    "One-click live channel switch decodes the next channel with one stream slot",
-  );
-  await page.locator('.media-card[aria-expanded="true"]').click();
-  await page.waitForFunction(
-    async (url) =>
-      (await (await fetch(`${url}/api/status`)).json()).activeStreams === 0,
-    baseURL,
-    { timeout: 10000 },
-  );
-  await checkReleasedMedia();
-  const finalHeap = await heapUsage();
-  console.log(
-    `JS heap after GC: ${(initialHeap / 1024 / 1024).toFixed(1)}MiB before playback, ${(finalHeap / 1024 / 1024).toFixed(1)}MiB after playback (decoder modules remain cached)`,
-  );
-  if (browserErrors.length) throw new Error(browserErrors.join("\n"));
-  console.log("Leaving player released stream slot; no browser errors");
-  await checkNativePlayback();
+    });
+    const refreshResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/refresh" &&
+        response.request().method() === "POST",
+    );
+    await page
+      .getByRole("button", { name: "Refresh now", exact: true })
+      .click();
+    const refresh = await refreshResponse;
+    expect(refresh.ok()).toBe(true);
+    expect(refresh.request().postDataJSON()).toEqual({ target: "all" });
+    await libraryRefreshed;
+    await checkReleasedPlayback();
+    await playTestMovie();
+    await area.waitFor({ state: "visible" });
+    const playingVideo = await page.locator("video").elementHandle();
+    const sourceBeforeCategory = (await page.evaluate(videoState)).src;
+    const seeksBeforeCategory = seekCount;
+    await page.getByRole("combobox", { name: "Category", exact: true }).click();
+    await page.getByRole("option", { name: "Test films", exact: true }).click();
+    await expect(
+      page.getByRole("combobox", { name: "Category", exact: true }),
+    ).toContainText("Test films");
+    const filteredVideo = await page.evaluate(videoState);
+    if (
+      !(await playingVideo.evaluate((element) => element.isConnected)) ||
+      filteredVideo.src !== sourceBeforeCategory ||
+      filteredVideo.paused ||
+      !filteredVideo.width ||
+      seekCount !== seeksBeforeCategory
+    )
+      throw new Error(
+        "Changing library category interrupted the decoding player",
+      );
+    console.log(
+      "Library category changes preserve the same decoding video and HLS source",
+    );
+    await page
+      .getByRole("button", { name: "Stop playback", exact: true })
+      .click();
+    await checkReleasedPlayback();
+
+    await playTestMovie({ fromSearch: true });
+    const searchOrigin = await page.evaluate(
+      () => window.history.state.restreamPlayerOrigin.url,
+    );
+    await expect(page.getByRole("searchbox")).toHaveCount(0);
+    await expect(
+      page.getByRole("region", { name: /^(Movies|Shows|Live TV) results$/ }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("region", { name: "Movies library", exact: true }),
+    ).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "Stop playback", exact: true })
+      .click();
+    await checkReleasedPlayback();
+    await expect.poll(() => page.url()).toBe(searchOrigin);
+    await expect(
+      page.getByRole("searchbox", { name: "Search library", exact: true }),
+    ).toHaveValue("Test");
+    await expect(
+      page
+        .getByRole("region", { name: "Movies results", exact: true })
+        .getByRole("button", { name: "Open Test movie", exact: true }),
+    ).toHaveAttribute("aria-expanded", "true");
+    await page
+      .getByRole("region", { name: "Expanded title", exact: true })
+      .getByRole("button", { name: "Play", exact: true })
+      .click();
+    await page.waitForFunction(progressing, undefined, { timeout: 15000 });
+    await page.goBack();
+    await checkReleasedPlayback();
+    await expect.poll(() => page.url()).toBe(searchOrigin);
+    await expect(
+      page.getByRole("searchbox", { name: "Search library", exact: true }),
+    ).toHaveValue("Test");
+    console.log(
+      "Search-origin playback hides search results; Stop and browser Back restore its exact query and release the stream",
+    );
+    await navigateLibrary("live");
+    await page
+      .getByRole("button", { name: "Open Test live", exact: true })
+      .click();
+    await page.getByRole("button", { name: "Play", exact: true }).click();
+    await page.waitForFunction(progressing, undefined, { timeout: 15000 });
+    const firstLiveSource = (await page.evaluate(videoState)).src;
+    await page
+      .getByRole("complementary", { name: "Watch context", exact: true })
+      .getByRole("region", { name: "Channels", exact: true })
+      .getByRole("button", { name: "Watch Test live two", exact: true })
+      .click();
+    await page.waitForFunction(
+      (previous) => {
+        const video = document.querySelector("video");
+        return (
+          video &&
+          video.currentSrc !== previous &&
+          !video.paused &&
+          video.videoWidth > 0 &&
+          video.currentTime > 0.5
+        );
+      },
+      firstLiveSource,
+      { timeout: 15000 },
+    );
+    const liveStatus = await (await fetch(`${baseURL}/api/status`)).json();
+    if (liveStatus.activeStreams !== 1)
+      throw new Error("Channel tune lost its single stream slot");
+    console.log(
+      "One-click live channel switch decodes the next channel with one stream slot",
+    );
+    await page
+      .getByRole("button", { name: "Stop playback", exact: true })
+      .click();
+    await page.waitForFunction(
+      async (url) =>
+        (await (await fetch(`${url}/api/status`)).json()).activeStreams === 0,
+      baseURL,
+      { timeout: 10000 },
+    );
+    await checkReleasedMedia();
+    const finalHeap = await heapUsage();
+    console.log(
+      `JS heap after GC: ${(initialHeap / 1024 / 1024).toFixed(1)}MiB before playback, ${(finalHeap / 1024 / 1024).toFixed(1)}MiB after playback (decoder modules remain cached)`,
+    );
+    if (browserErrors.length) throw new Error(browserErrors.join("\n"));
+    console.log("Leaving player released stream slot; no browser errors");
+    await checkNativePlayback();
+  }
 } finally {
   for (const id of sessionIds) {
     await fetch(`${baseURL}/api/sessions/${encodeURIComponent(id)}`, {

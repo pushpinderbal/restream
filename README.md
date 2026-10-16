@@ -53,9 +53,9 @@ Start it with:
 docker compose up -d
 ```
 
-Open `http://localhost:8080`, or `http://<server-address>:8080` from another device. Choose **Live TV**, **Movies**, or **Series**, open a title, and press **Play**. Use **Settings** to check or refresh the library and programme guide. Stop playback to release a stream for another viewer.
+Open `http://localhost:8080`, or `http://<server-address>:8080` from another device. Open a title and press **Play**. **Settings** shows server configuration and refresh status. Configure refresh timing and category rules through environment variables, then restart. Leaving playback saves progress and releases the stream.
 
-**Dashboard** offers Continue watching, Up next and Recently played. History and progress stay in this browser; use **Clear history** to reset them.
+**Home** opens with a featured title, discovery rows, Continue watching, Up next and Recently played. Use the icon sidebar to open **Search**, **VOD**, **Live TV**, or **Settings** through the profile icon. Search opens blank. Enter at least two characters; after a 350 ms pause, it searches Live TV, movies, and shows together and groups the results by type. Stop or browser Back restores your query and results after playback. VOD has Movies and Shows tabs that update the catalog while the controls stay in place. On mobile, the same navigation sits at the bottom. The category menu includes search to quickly find a category. Content rows have arrow controls and support swiping. History and progress stay in this browser; use **Clear history** to reset them.
 
 **Trending** shows only provider-available titles. Set `TMDB_API_READ_ACCESS_TOKEN` or `TMDB_API_KEY` from your [TMDB account settings](https://www.themoviedb.org/settings/api), then restart Restream to enable it. Without a key, the dashboard shows **Explore**.
 
@@ -77,9 +77,9 @@ Pass these with Docker's `-e` option or add them to the Compose `environment` se
 | `STALKER_DEVICE_ID2` | - | Second registered device ID. Required only if your provider asks for it. |
 | `STALKER_USER_AGENT` | Built-in MAG user agent | Override the device identification only if your provider requires a specific value. |
 | `MAX_STREAMS` | `1` | Maximum simultaneous players. Increase only within your provider's allowance. Must be at least 1. |
-| `CATALOG_REFRESH_INTERVAL` | `24h` | How often to refresh the library and how long to keep saved movie/series listings. Minimum `1m`. |
-| `EPG_REFRESH_INTERVAL` | `6h` | How often to refresh the programme guide. Minimum `1m`. |
-| `EPISODE_CACHE_TTL` | `1h` | How long to keep an episode list before checking for updates when it is opened again. Minimum `1m`. |
+| `REFRESH_INTERVAL` | `6h` | Refresh cadence; guide and episode freshness adapt automatically. Range: `1m`–`168h`. |
+| `DASHBOARD_CATEGORIES` | - | Comma-separated category allowlist for all Dashboard sections. Empty includes all categories. |
+| `BLOCKED_CATEGORIES` | - | Comma-separated categories to hide from browsing and history and prevent playback. |
 | `STALKER_EPG_HOURS` | `6` | Hours of programme guide information to request. Range: 1–168. |
 | `STALKER_REQUEST_TIMEOUT` | `1m` | Maximum wait for a provider request. Minimum `1s`. |
 | `STALKER_REQUEST_INTERVAL` | `250ms` | Minimum delay between provider requests. Minimum `100ms`. |
@@ -91,6 +91,8 @@ Pass these with Docker's `-e` option or add them to the Compose `environment` se
 | `WEB_DIR` | `/app/web` | Location of the browser interface files. Change only if you provide those files at a different location. |
 | `TMDB_API_READ_ACCESS_TOKEN` | - | Optional TMDB read token for Trending. |
 | `TMDB_API_KEY` | - | Optional TMDB v3 API key; used when no read token is set. |
+
+Category lists match exact names or IDs, ignoring case; `*` matches all. Prefix with `live:`, `movie:` or `series:` to limit a rule to that section. Quote a CSV entry containing a comma. Dashboard rules affect Dashboard visibility without removing history records or changing ordinary library visibility. Configuration is environment-only; restart after changes. Previously saved UI preferences are ignored.
 
 FFmpeg and FFprobe are included in the Docker image and used automatically.
 

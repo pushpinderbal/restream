@@ -1,11 +1,11 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -30,17 +30,24 @@ func (p *failingEpisodeProvider) Episodes(_ context.Context, _ model.Item) ([]mo
 }
 
 func TestEpisodeFailureLoggedOnceWithoutPrivateDetails(t *testing.T) {
-	var logs bytes.Buffer
+	logs, err := os.CreateTemp(t.TempDir(), "episode-logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logs.Close()
 	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
 	defer slog.SetDefault(previous)
 	p := &failingEpisodeProvider{}
 	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
-	s, err := New(cfg, p, nil)
+	// Exercise episode retries without an unrelated background library refresh
+	// expiring the episode cache during the assertions below.
+	s, err := New(cfg, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	s.provider = p
 	q := model.BrowseQuery{Kind: "series", Category: "*", Page: 1}
 	if err := s.cache.setBrowseAtRevision(q, model.BrowsePage{Items: []model.Item{{ID: "series:229631", Kind: "series", Name: "Cached series", ProviderID: "229631"}}, Page: 1}, time.Hour, s.cache.libraryRevision()); err != nil {
 		t.Fatal(err)
@@ -51,7 +58,11 @@ func TestEpisodeFailureLoggedOnceWithoutPrivateDetails(t *testing.T) {
 	if status != 502 || strings.Contains(body, "private-token") {
 		t.Fatalf("episode response: %d %s", status, body)
 	}
-	text := logs.String()
+	data, err := os.ReadFile(logs.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
 	if strings.Count(text, "Episode load failed") != 1 || !strings.Contains(text, "seriesID=series:229631") || !strings.Contains(text, "stage=provider") || !strings.Contains(text, "reason=list_incomplete") {
 		t.Fatal("missing sanitized episode failure log", text)
 	}

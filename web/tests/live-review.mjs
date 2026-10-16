@@ -14,14 +14,53 @@ page.on("pageerror", (error) => errors.push(error.message));
 page.on("console", (message) => {
   if (message.type() === "error") errors.push(message.text());
 });
+const navigateLibrary = async (kind) => {
+  const navigation = page.getByRole("navigation", {
+    name: page.viewportSize().width <= 820 ? "Primary navigation" : "Library",
+    exact: true,
+  });
+  const types = page.getByRole("tablist", { name: "VOD type", exact: true });
+  if (kind === "live" || !(await types.isVisible()))
+    await navigation
+      .getByRole("button", {
+        name: kind === "live" ? "Live TV" : "VOD",
+        exact: true,
+      })
+      .click();
+  if (kind !== "live")
+    await types
+      .getByRole("tab", {
+        name: kind === "movie" ? "Movies" : "Shows",
+        exact: true,
+      })
+      .click();
+};
+const openSearch = async () => {
+  await page
+    .getByRole("navigation", {
+      name: page.viewportSize().width <= 820 ? "Primary navigation" : "Library",
+      exact: true,
+    })
+    .getByRole("button", { name: "Search", exact: true })
+    .click();
+  const input = page.getByRole("searchbox", {
+    name: "Search library",
+    exact: true,
+  });
+  await expect(input).toHaveValue("");
+  return input;
+};
 const report = { target, errors, interactions: [], timings: {} };
 try {
-  await page.goto(target);
+  const initialURL = new URL(target);
+  initialURL.searchParams.set("section", "live");
+  initialURL.searchParams.delete("view");
+  await page.goto(initialURL.href);
   await page
     .locator(".live-grid .media-card")
     .first()
     .waitFor({ timeout: 90000 });
-  await expect(page.locator("canvas.galaxy-field")).toBeVisible();
+  await expect(page.locator(".app-sidebar")).toBeVisible();
   await expect(page.locator(".on-air-feature, .library-heading")).toHaveCount(
     0,
   );
@@ -29,9 +68,7 @@ try {
     .locator(".media-card .artwork-reveal.is-revealed")
     .first()
     .waitFor({ timeout: 20000 });
-  report.interactions.push(
-    "Verified the original layout and background with provider logos",
-  );
+  report.interactions.push("Verified the sidebar layout with provider logos");
   await page.waitForTimeout(600);
   await page.screenshot({ path: new URL("desktop.png", directory).pathname });
   const tile = page.locator(".media-card").first();
@@ -45,25 +82,32 @@ try {
     path: new URL("channel-guide.png", directory).pathname,
   });
   await page.locator('.media-card[aria-expanded="true"]').click();
-  await page.getByRole("searchbox", { name: "Search channels" }).fill("news");
+  await openSearch();
+  await page
+    .getByRole("searchbox", { name: "Search library", exact: true })
+    .fill("news");
   await page.waitForTimeout(400);
   report.interactions.push("Searched the live provider's channels");
-  await page.getByRole("searchbox", { name: "Search channels" }).fill("");
-  await page
-    .getByRole("navigation", { name: "Library" })
-    .getByRole("button", { name: "Series", exact: true })
-    .click();
+  await page.getByRole("searchbox", { name: "Search library" }).fill("");
+  await navigateLibrary("series");
   if (process.env.RESTREAM_REVIEW_SERIES_SEARCH) {
+    await openSearch();
     await page
-      .getByRole("searchbox", { name: "Search titles" })
+      .getByRole("searchbox", { name: "Search library" })
       .fill(process.env.RESTREAM_REVIEW_SERIES_SEARCH);
   }
+  const seriesResults = page.getByRole("region", {
+    name: process.env.RESTREAM_REVIEW_SERIES_SEARCH
+      ? "Shows results"
+      : "Shows library",
+    exact: true,
+  });
   const seriesTile = process.env.RESTREAM_REVIEW_SERIES_TITLE
-    ? page.getByRole("button", {
+    ? seriesResults.getByRole("button", {
         name: `Open ${process.env.RESTREAM_REVIEW_SERIES_TITLE}`,
         exact: true,
       })
-    : page.locator(".media-card").first();
+    : seriesResults.getByRole("button", { name: /^Open / }).first();
   await seriesTile.waitFor({ timeout: 90000 });
   const started = Date.now();
   await seriesTile.click();
@@ -84,18 +128,12 @@ try {
   } else await page.keyboard.press("Escape");
   await page.waitForTimeout(600);
   await page.screenshot({ path: new URL("series.png", directory).pathname });
-  await page
-    .getByRole("navigation", { name: "Library" })
-    .getByRole("button", { name: "Movies", exact: true })
-    .click();
+  await navigateLibrary("movie");
   await page.locator(".media-card").first().waitFor({ timeout: 90000 });
   await page.waitForTimeout(600);
   await page.screenshot({ path: new URL("movies.png", directory).pathname });
   report.interactions.push("Browsed real movies and their posters");
-  await page
-    .getByRole("navigation", { name: "Library" })
-    .getByRole("button", { name: "Live TV", exact: true })
-    .click();
+  await navigateLibrary("live");
   await page.locator(".live-grid .media-card").first().waitFor();
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(600);
