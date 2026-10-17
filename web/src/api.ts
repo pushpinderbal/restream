@@ -1,10 +1,10 @@
-export type Kind = "live" | "movie" | "series" | "episode";
+type Kind = "live" | "movie" | "series" | "episode";
 export type Category = {
   id: string;
   name: string;
   kind: "live" | "movie" | "series";
 };
-export type CategoryVisibility = "show" | "block";
+type CategoryVisibility = "show" | "block";
 export type CategoryPreference = {
   kind: Category["kind"];
   id: string;
@@ -190,9 +190,6 @@ export const jsonRequest = <T>(path: string, method: string, data: unknown) =>
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-
-export const getPreferences = (signal?: AbortSignal) =>
-  request<Preferences>("/api/preferences", { signal });
 
 export function releaseSession(id: string, keepalive = false) {
   return fetch(`/api/sessions/${encodeURIComponent(id)}`, {

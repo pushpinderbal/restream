@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Item } from "./api";
 
-export const WATCH_HISTORY_KEY = "restream.watch-history.v1";
+const WATCH_HISTORY_KEY = "restream.watch-history.v1";
 const perSectionLimit = 12;
 const progressWriteInterval = 5000;
 const kinds = ["live", "movie", "series"] as const;
@@ -15,7 +15,7 @@ export type WatchHistoryEntry = {
   completed: boolean;
   updatedAt?: number;
 };
-export type HistoryUndo = { id: number; label: string };
+type HistoryUndo = { id: number; label: string };
 type HistoryState = { entries: WatchHistoryEntry[]; persistent: boolean };
 type PlaybackSelection = { title: Item; item: Item };
 

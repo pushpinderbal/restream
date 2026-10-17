@@ -392,20 +392,6 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.discovery-text-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 20px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: #d4d4d8;
-  font-size: 13px;
-}
-.discovery-text-link:hover {
-  color: #fff;
-}
 .discovery-explore-empty {
   margin-bottom: 18px;
   color: #a1a1aa;

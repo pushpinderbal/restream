@@ -7,10 +7,7 @@ import * as React from "react";
 interface InfiniteScrollProps {
   isLoading: boolean;
   hasMore: boolean;
-  next: () => unknown;
-  threshold?: number;
-  root?: Element | Document | null;
-  rootMargin?: string;
+  next: () => void;
   children: React.ReactNode;
 }
 
@@ -18,9 +15,6 @@ export default function InfiniteScroll({
   isLoading,
   hasMore,
   next,
-  threshold = 0,
-  root = null,
-  rootMargin = "300px 0px",
   children,
 }: InfiniteScrollProps) {
   const observer = React.useRef<IntersectionObserver | null>(null);
@@ -37,12 +31,12 @@ export default function InfiniteScroll({
           observer.current = null;
           next();
         },
-        { threshold: Math.max(0, Math.min(1, threshold)), root, rootMargin },
+        { threshold: 0, root: null, rootMargin: "300px 0px" },
       );
       observer.current = current;
       current.observe(element);
     },
-    [hasMore, isLoading, next, threshold, root, rootMargin],
+    [hasMore, isLoading, next],
   );
   React.useEffect(() => () => observer.current?.disconnect(), []);
   const items = React.Children.toArray(children);

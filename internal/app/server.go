@@ -217,7 +217,7 @@ func (s *Server) static() http.Handler {
 		}
 		if r.URL.Path == "/" {
 			if _, err := os.Stat(filepath.Join(root, "index.html")); err != nil {
-				http.Error(w, "Web interface files are missing.", 503)
+				http.Error(w, "Web interface files are missing.", http.StatusServiceUnavailable)
 				return
 			}
 		}

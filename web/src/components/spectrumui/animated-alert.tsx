@@ -60,5 +60,3 @@ export function AnimatedAlert({
     </div>
   );
 }
-
-export { AnimatedAlert as Alert };

@@ -48,7 +48,7 @@ const initialResults = (): Record<SearchKind, Results> => ({
 const normalize = (text: string) =>
   text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
 
-export type SearchPageProps = {
+type SearchPageProps = {
   value: string;
   onQueryChange: (value: string) => void;
   enabled: boolean;
@@ -226,8 +226,6 @@ export function SearchPage({
     <div className="global-search-page">
       <BeamSearch
         className="global-search-field"
-        theme="dark"
-        colorVariant="mono"
         autoFocus
         value={value}
         ariaLabel="Search library"

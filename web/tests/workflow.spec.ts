@@ -699,9 +699,7 @@ async function mockApi(
       if (options.refreshFailure)
         return json({ error: "Refresh is temporarily unavailable" }, 503);
       const target = route.request().postDataJSON().target as
-        | "all"
-        | "catalog"
-        | "epg";
+        "all" | "catalog" | "epg";
       events.push(`REFRESH:${target}`);
       for (const kind of ["catalog", "epg"] as const) {
         if (target !== "all" && target !== kind) continue;
@@ -3939,7 +3937,7 @@ for (const width of [1440, 390, 320]) {
   });
 }
 
-test("native HLS playback keeps the decoder and worker out of browser requests", async ({
+test("native HLS plays and seeks locally without loading the decoder or worker", async ({
   page,
 }) => {
   await mockApi(page);
@@ -3957,6 +3955,34 @@ test("native HLS playback keeps the decoder and worker out of browser requests",
     /\/api\/streams\/session-1\/0\/index\.m3u8$/,
   );
   await playableVideo(page);
+  const video = page.locator("video");
+  const source = await video.getAttribute("src");
+  let serverSeeks = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.endsWith("/seek")) serverSeeks++;
+  });
+  await page.getByRole("button", { name: "Pause", exact: true }).click();
+  const slider = page.getByRole("slider", { name: "Seek position" });
+  await slider.press("ArrowRight");
+  await expect(video).toHaveJSProperty("currentTime", 31);
+  // Some native decoders expose buffered media before a seekable range.
+  await video.evaluate((element) => {
+    Object.defineProperties(element, {
+      seekable: {
+        configurable: true,
+        get: () => ({ length: 0 }),
+      },
+      buffered: {
+        configurable: true,
+        get: () => ({ length: 1, start: () => 0, end: () => 100 }),
+      },
+    });
+  });
+  await slider.press("ArrowRight");
+  await expect(video).toHaveJSProperty("currentTime", 32);
+  await expect(video).toHaveJSProperty("paused", true);
+  await expect(video).toHaveAttribute("src", source!);
+  expect(serverSeeks).toBe(0);
   await page.getByRole("button", { name: "Stop playback" }).click();
   await expect(page.locator("video")).toHaveCount(0);
   expect(decoderRequests).toEqual([]);
@@ -4497,14 +4523,23 @@ test("Play animates on hover and keyboard focus, respects reduced motion and sta
     exact: true,
   });
   const glyph = play.locator(".play-action-glyph");
-  const running = () =>
-    glyph.evaluate((element) =>
-      element
-        .getAnimations()
-        .some((animation) => animation.playState === "running"),
-    );
+  // Capture the event before interacting so a busy runner cannot miss the
+  // short animation between polling samples.
+  await glyph.evaluate((element) => {
+    element.setAttribute("data-animation-starts", "0");
+    element.addEventListener("animationstart", (event) => {
+      if ((event as AnimationEvent).animationName === "play-action-forward")
+        element.setAttribute(
+          "data-animation-starts",
+          String(Number(element.getAttribute("data-animation-starts")) + 1),
+        );
+    });
+  });
+  const starts = async () =>
+    Number(await glyph.getAttribute("data-animation-starts"));
   await play.hover();
-  await expect.poll(running).toBe(true);
+  await expect.poll(starts).toBeGreaterThan(0);
+  const hoverStarts = await starts();
   if (process.env.CAPTURE_SCREENSHOTS) {
     await glyph.evaluate((element) =>
       element.getAnimations().forEach((animation) => {
@@ -4523,7 +4558,7 @@ test("Play animates on hover and keyboard focus, respects reduced motion and sta
   await page.keyboard.press("Tab");
   await play.focus();
   await expect(play).toBeFocused();
-  await expect.poll(running).toBe(true);
+  await expect.poll(starts).toBeGreaterThan(hoverStarts);
   await page.emulateMedia({ reducedMotion: "reduce" });
   await expect
     .poll(() => glyph.evaluate((element) => element.getAnimations().length))
@@ -6337,12 +6372,12 @@ for (const width of [390, 320]) {
           ]);
           return Boolean(
             playBounds &&
-              closeBounds &&
-              navBounds &&
-              playBounds.y >= 0 &&
-              closeBounds.y >= 0 &&
-              playBounds.y + playBounds.height <= navBounds.y + 1 &&
-              closeBounds.y + closeBounds.height <= navBounds.y + 1,
+            closeBounds &&
+            navBounds &&
+            playBounds.y >= 0 &&
+            closeBounds.y >= 0 &&
+            playBounds.y + playBounds.height <= navBounds.y + 1 &&
+            closeBounds.y + closeBounds.height <= navBounds.y + 1,
           );
         },
         {
