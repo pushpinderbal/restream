@@ -10,19 +10,21 @@ import (
 	"github.com/pushpinderbal/restream/internal/model"
 )
 
-func TestCategoryEnvironmentAppliesCSVNamesIDsAndScopedRulesAcrossAPI(t *testing.T) {
-	t.Setenv("DASHBOARD_CATEGORIES", ` "live:SPORTS", movie:1, series:comedy, `)
-	t.Setenv("BLOCKED_CATEGORIES", "movie:BLOCKED FILMS,series:Drama,movie:Hidden films,movie:Future adult,live:General")
-	cfg, err := LoadConfig()
+func TestCategorySettingsApplyNamesIDsAndScopedRulesAcrossAPI(t *testing.T) {
+	dashboard, err := parseCategorySelectors("Home categories", "live:SPORTS,movie:1,series:comedy")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.DataDir = t.TempDir()
+	blocked, err := parseCategorySelectors("Blocked categories", "movie:BLOCKED FILMS,series:Drama,movie:Hidden films,movie:Future adult,live:General")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{DataDir: t.TempDir(), categoryEnvironment: categoryEnvironment{dashboard: dashboard, blocked: blocked}}
 	s, ts, _, _ := policyFixtureWithConfig(t, cfg)
 	code, body := request(t, ts.URL, "GET", "/api/preferences", "")
 	var preferences preferenceResponse
 	if code != 200 || json.Unmarshal([]byte(body), &preferences) != nil || len(preferences.Configuration.DashboardCategories) != 3 || len(preferences.Configuration.BlockedCategories) != 5 {
-		t.Fatalf("environment preferences: %d %s", code, body)
+		t.Fatalf("category preferences: %d %s", code, body)
 	}
 	for _, path := range []string{"/api/catalog", "/api/epg", "/api/categories", "/api/browse?kind=movie&category=*&page=1"} {
 		code, body := request(t, ts.URL, "GET", path, "")
@@ -58,14 +60,14 @@ func TestCategoryEnvironmentAppliesCSVNamesIDsAndScopedRulesAcrossAPI(t *testing
 	if err := s.cache.setCategories(categories); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.cache.setBrowseAtRevision(model.BrowseQuery{Kind: "movie", Category: "future", Page: 1}, model.BrowsePage{Items: []model.Item{{ID: "movie:future", Kind: "movie", Name: "Future title", CategoryID: "future"}}, Page: 1}, time.Hour, s.cache.libraryRevision()); err != nil {
+	if err := seedBrowsePage(s.cache, model.BrowseQuery{Kind: "movie", Category: "future", Page: 1}, model.BrowsePage{Items: []model.Item{{ID: "movie:future", Kind: "movie", Name: "Future title", CategoryID: "future"}}, Page: 1}); err != nil {
 		t.Fatal(err)
 	}
 	code, body = request(t, ts.URL, "POST", "/api/sessions", `{"itemId":"movie:future"}`)
 	if code != 403 {
-		t.Fatalf("new category bypassed environment: %d %s", code, body)
+		t.Fatalf("new category bypassed settings: %d %s", code, body)
 	}
-	// No UI/API request can weaken deployment restrictions.
+	// The legacy preferences endpoint remains read-only; edits use /api/settings.
 	if code, body := request(t, ts.URL, "PUT", "/api/preferences", `{"refreshIntervalSeconds":43200,"categories":[]}`); code != 405 {
 		t.Fatal(code, body)
 	}
@@ -75,66 +77,43 @@ func TestCategoryEnvironmentAppliesCSVNamesIDsAndScopedRulesAcrossAPI(t *testing
 	}
 }
 
-func TestEnvironmentIgnoresAllPreviouslySavedPreferences(t *testing.T) {
-	dir := t.TempDir()
-	s, ts, _, _ := policyFixtureWithConfig(t, Config{DataDir: dir})
-	if _, err := s.cache.db.Exec(`CREATE TABLE IF NOT EXISTS preferences(id INTEGER PRIMARY KEY,data BLOB); INSERT OR REPLACE INTO preferences(id,data) VALUES(1,?)`, `{"refreshIntervalSeconds":60,"categories":[{"kind":"movie","id":"1","visibility":"block","dashboard":false}]}`); err != nil {
-		t.Fatal(err)
+func TestLoadConfigIgnoresAllApplicationSettingEnvironmentVariables(t *testing.T) {
+	for _, name := range []string{
+		"MAX_STREAMS", "TRANSCODE_MODE", "REFRESH_INTERVAL", "DASHBOARD_CATEGORIES", "BLOCKED_CATEGORIES", "STALKER_EPG_HOURS", "TMDB_API_READ_ACCESS_TOKEN", "TMDB_API_KEY",
+	} {
+		t.Setenv(name, "invalid-removed-setting")
 	}
-	ts.Close()
-	s.Close()
-	t.Setenv("REFRESH_INTERVAL", "12h")
-	t.Setenv("DASHBOARD_CATEGORIES", "movie:Films")
-	t.Setenv("BLOCKED_CATEGORIES", "movie:Hidden films,series:Drama")
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.DataDir = dir
-	s, ts = policyTestServer(t, cfg, nil, nil)
-	if s.categoryPolicy("movie", "1").Visibility != "show" || !s.categoryPolicy("movie", "1").Dashboard || s.categoryPolicy("movie", "2").Visibility != "block" || s.categoryPolicy("series", "1").Visibility != "block" || s.preferencesSnapshot().value.RefreshIntervalSeconds != 43200 {
-		t.Fatal("saved preferences overrode environment")
+	if cfg.TMDBReadAccessToken != "" || cfg.MaxStreams != 1 || cfg.TranscodeMode != "auto" || cfg.EPGHours != 6 || cfg.RefreshInterval != 24*time.Hour || len(cfg.categoryEnvironment.dashboard) != 0 || len(cfg.categoryEnvironment.blocked) != 0 {
+		t.Fatal("application settings were read from the environment")
 	}
-	// Corrupt saved rows are also irrelevant and must not prevent startup.
-	if _, err := s.cache.db.Exec(`UPDATE preferences SET data='not JSON' WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
-	ts.Close()
-	s.Close()
-	for _, name := range []string{"DASHBOARD_CATEGORIES", "BLOCKED_CATEGORIES"} {
-		t.Setenv(name, "")
-	}
-	cfg, err = LoadConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.DataDir = dir
-	s, ts = policyTestServer(t, cfg, nil, nil)
-	if s.categoryPolicy("movie", "1").Visibility != "show" || !s.categoryPolicy("movie", "4").Dashboard || s.preferencesSnapshot().value.RefreshIntervalSeconds != 43200 {
-		t.Fatal("removing environment rules restored stale saved choices")
-	}
+	cfg.DataDir = t.TempDir()
+	_, ts, _, _ := policyFixtureWithConfig(t, cfg)
 	code, body := request(t, ts.URL, "GET", "/api/preferences", "")
-	if code != 200 || !strings.Contains(body, `"categories":[]`) || !strings.Contains(body, `"dashboardCategories":[]`) {
+	if code != 200 || !strings.Contains(body, `"dashboardCategories":[]`) || !strings.Contains(body, `"blockedCategories":[]`) {
 		t.Fatal(code, body)
 	}
 }
 
-func TestDashboardEnvironmentNameScopesCSVAndValidation(t *testing.T) {
-	t.Setenv("DASHBOARD_CATEGORIES", `"movie:Action, Adventure", SERIES:Comedy, live:2`)
-	t.Setenv("BLOCKED_CATEGORIES", "movie:Hidden films,series:Drama,movie:3,movie:Private")
-	t.Setenv("EXPLORE_CATEGORIES", `not a valid " CSV`)
-	cfg, err := LoadConfig()
+func TestCategorySettingsNameScopesAndValidation(t *testing.T) {
+	dashboard, err := parseCategorySelectors("Home categories", `"movie:Action, Adventure", SERIES:Comedy, live:2`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.DataDir = t.TempDir()
-	s, ts, _, _ := policyFixtureWithConfig(t, cfg)
+	blocked, err := parseCategorySelectors("Blocked categories", "movie:Hidden films,series:Drama,movie:3,movie:Private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, ts, _, _ := policyFixtureWithConfig(t, Config{DataDir: t.TempDir(), categoryEnvironment: categoryEnvironment{dashboard: dashboard, blocked: blocked}})
 	if !s.preferencesSnapshot().category("movie", "99", "Action, Adventure").Dashboard || s.preferencesSnapshot().category("series", "99", "Action, Adventure").Dashboard || !s.categoryPolicy("series", "2").Dashboard || !s.categoryPolicy("live", "2").Dashboard || s.categoryPolicy("movie", "2").Dashboard {
-		t.Fatal("CSV/case/section scope mismatch")
+		t.Fatal("case/section scope mismatch")
 	}
 	_, body := request(t, ts.URL, "GET", "/api/preferences", "")
-	if !strings.Contains(body, `"movie:Action, Adventure"`) || !strings.Contains(body, `"SERIES:Comedy"`) {
-		t.Fatal("configuration labels lost original tokens", body)
+	if !strings.Contains(body, `"movie:Action, Adventure"`) {
+		t.Fatal("category labels lost original tokens", body)
 	}
 	s.cache.mu.RLock()
 	categories := append([]model.Category(nil), s.cache.categories...)
@@ -142,10 +121,10 @@ func TestDashboardEnvironmentNameScopesCSVAndValidation(t *testing.T) {
 	if err := s.cache.setCategories(append(categories, model.Category{Kind: "movie", ID: "abc", Name: "Private"})); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.cache.setBrowseAtRevision(model.BrowseQuery{Kind: "movie", Category: "*", Page: 2}, model.BrowsePage{Page: 2, Items: []model.Item{
+	if err := seedBrowsePage(s.cache, model.BrowseQuery{Kind: "movie", Category: "*", Page: 2}, model.BrowsePage{Page: 2, Items: []model.Item{
 		{ID: "movie:case-name", Kind: "movie", Name: "Case name", Category: "bLoCkEd FiLmS"},
 		{ID: "movie:case-id", Kind: "movie", Name: "Case ID", CategoryID: "AbC"},
-	}}, time.Hour, s.cache.libraryRevision()); err != nil {
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"movie:case-name", "movie:case-id"} {
@@ -153,28 +132,9 @@ func TestDashboardEnvironmentNameScopesCSVAndValidation(t *testing.T) {
 			t.Fatal("case variant bypassed category resolution", id, code, body)
 		}
 	}
-	t.Setenv("DASHBOARD_CATEGORIES", "")
-	cfg, err = LoadConfig()
-	if err != nil || len(cfg.categoryEnvironment.dashboard) != 0 {
-		t.Fatal("removed EXPLORE_CATEGORIES alias still affected dashboard", err)
-	}
-	for _, value := range []string{`movie:`, `"unclosed`, `Movies
-Shows`} {
-		t.Setenv("DASHBOARD_CATEGORIES", value)
-		if _, err := LoadConfig(); err == nil {
-			t.Fatal("invalid selector accepted", value)
-		}
-	}
-	t.Setenv("DASHBOARD_CATEGORIES", "*")
-	for _, value := range []string{"0", "59s", "169h"} {
-		t.Setenv("REFRESH_INTERVAL", value)
-		if _, err := LoadConfig(); err == nil {
-			t.Fatal("invalid refresh cadence accepted", value)
-		}
-	}
 }
 
-func TestBlockedEnvironmentDoesNotRequireUnrelatedKindCategoryMetadata(t *testing.T) {
+func TestBlockedSettingsDoNotRequireUnrelatedKindCategoryMetadata(t *testing.T) {
 	for _, test := range []struct {
 		name, blocked string
 		movies, shows bool

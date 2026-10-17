@@ -31,7 +31,6 @@ type Preferences struct {
 type preferenceSnapshot struct {
 	value       Preferences
 	updatedAt   time.Time
-	unified     bool
 	blocked     bool
 	environment categoryEnvironment
 }
@@ -53,22 +52,14 @@ func containsCategory(categories []string, id string) bool {
 }
 
 func (s *Server) initPreferences() error {
-	cadence := s.cfg.RefreshInterval
-	if cadence <= 0 {
-		cadence = s.cfg.CatalogRefresh
-	}
-	if cadence <= 0 {
-		cadence = 6 * time.Hour
-	}
-	value := Preferences{RefreshIntervalSeconds: int64(cadence.Seconds()), Categories: []CategoryPreference{}}
+	value := Preferences{RefreshIntervalSeconds: int64(s.cfg.RefreshInterval.Seconds()), Categories: []CategoryPreference{}}
 	updatedAt, err := s.configurationVersion(value.RefreshIntervalSeconds)
 	if err != nil {
 		return err
 	}
-	// Old SQLite preference rows are deliberately never read. Environment
-	// configuration is authoritative, including after a deployment removes a rule.
+	// The saved application configuration is authoritative for each server generation.
 	s.preferencesService = &preferencesService{snapshot: &preferenceSnapshot{
-		value: value, updatedAt: updatedAt, unified: s.cfg.RefreshInterval > 0,
+		value: value, updatedAt: updatedAt,
 		blocked: len(s.cfg.categoryEnvironment.blocked) > 0, environment: s.cfg.categoryEnvironment,
 	}}
 	return nil
@@ -118,7 +109,7 @@ func (s *Server) preferencesSnapshot() *preferenceSnapshot {
 func (s *Server) getPreferences(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
-		fail(w, http.StatusMethodNotAllowed, "read_only", "Configuration is set through environment variables.")
+		fail(w, http.StatusMethodNotAllowed, "read_only", "Use application settings to update configuration.")
 		return
 	}
 	respond(w, http.StatusOK, s.effectivePreferences(s.preferencesSnapshot()))
@@ -331,19 +322,11 @@ func (s *Server) policyMedia(next http.Handler) http.Handler {
 }
 
 func (s *Server) episodeTTL() time.Duration {
-	p := s.preferencesSnapshot()
-	if p.unified {
-		return max(time.Minute, min(time.Hour, time.Duration(p.value.RefreshIntervalSeconds)*time.Second/6))
-	}
-	return s.cfg.EpisodeCacheTTL
+	return 30 * time.Minute
 }
 
 func (s *Server) discoveryRefreshInterval() time.Duration {
-	p := s.preferencesSnapshot()
-	if p.unified {
-		return time.Duration(p.value.RefreshIntervalSeconds) * time.Second
-	}
-	return min(discoveryTTL, s.refreshInterval(true))
+	return s.refreshInterval(true)
 }
 
 func (s *Server) nextScheduledRefresh(catalog bool, last time.Time, interval time.Duration) time.Time {
@@ -351,7 +334,7 @@ func (s *Server) nextScheduledRefresh(catalog bool, last time.Time, interval tim
 		return time.Now()
 	}
 	next := last.Add(interval)
-	if catalog || !s.preferencesSnapshot().unified {
+	if catalog {
 		return next
 	}
 	s.cache.mu.RLock()

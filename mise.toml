@@ -1,45 +1,31 @@
 [tools]
+air = "1.67.4"
 bun = "1.4.0"
+ffmpeg = "9.0.2"
 go = "1.27"
 node = "26.8.1"
 
 [tasks.dev]
-description = "Run the Docker development stack with UI hot reload and backend rebuilds"
-run = "docker compose -f compose.dev.yaml up --build --watch"
+description = "Run the local Go API and Vite UI with automatic reloads"
+depends = ["dev:api", "dev:web"]
 
-[tasks."dev:down"]
-description = "Stop the Docker development stack"
-run = "docker compose -f compose.dev.yaml down"
+[tasks."dev:api"]
+description = "Run the local Go API with Air"
+run = "air"
 
-[tasks."dev:ui"]
-description = "Run the UI locally against a backend on localhost:8080"
+[tasks."dev:web"]
+description = "Run the local Vite UI on localhost:5173"
 dir = "web"
-run = ["bun install --frozen-lockfile", "bun run dev"]
-
-[tasks.frontend]
-description = "Install locked frontend dependencies and build the production UI"
-dir = "web"
-run = ["bun install --frozen-lockfile", "bun run build"]
-
-[tasks."dev:logs"]
-description = "Follow development container logs"
-run = "docker compose -f compose.dev.yaml logs -f"
+run = ["bun install --frozen-lockfile", "bun run dev -- --port 5173 --strictPort"]
 
 [tasks.build]
-description = "Build the Docker image"
-run = "docker build -t ghcr.io/pushpinderbal/restream:latest ."
+description = "Build the Go binary for local development and checks"
+run = "go build -o bin/restream ./cmd/restream"
 
-[tasks.up]
-description = "Pull and start the container"
-run = ["docker compose pull", "docker compose up -d"]
-
-[tasks.down]
-description = "Stop the container"
-run = "docker compose down"
-
-[tasks.logs]
-description = "Follow container logs"
-run = "docker compose logs -f"
+[tasks.frontend]
+description = "Build frontend assets for local checks and playback tests"
+dir = "web"
+run = ["bun install --frozen-lockfile", "bun run build"]
 
 [tasks.test]
 description = "Run Go tests against the simulated portal"
@@ -48,9 +34,13 @@ run = "go test ./..."
 [tasks."test:browser"]
 description = "Run browser workflow tests"
 dir = "web"
-run = ["bun install --frozen-lockfile", "node node_modules/@playwright/test/cli.js install chromium", "bun run test:browser"]
+run = ["bun install --frozen-lockfile", 'if [ -z "${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-}" ]; then node node_modules/@playwright/test/cli.js install chromium; fi', "bun run test:browser"]
 
 [tasks."test:playback"]
 description = "Run FFmpeg-to-browser integration test"
 depends = ["frontend"]
-run = ["cd web && node node_modules/@playwright/test/cli.js install chromium", "RESTREAM_BROWSER_TESTS=1 go test ./internal/app -run '^TestPortalToBrowserPlayback$' -count=1 -v"]
+run = ['if [ -z "${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-}" ]; then cd web && node node_modules/@playwright/test/cli.js install chromium; fi', "RESTREAM_BROWSER_TESTS=1 go test ./internal/app -run '^TestPortalToBrowserPlayback$' -count=1 -v"]
+
+[tasks."test:container"]
+description = "Build and smoke-test the packaged app using temporary containers and storage"
+run = "bun scripts/test-container.mjs"

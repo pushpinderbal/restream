@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,42 +12,28 @@ import (
 	"time"
 
 	"github.com/pushpinderbal/restream/internal/app"
-	"github.com/pushpinderbal/restream/internal/model"
-	"github.com/pushpinderbal/restream/internal/stalker"
-	"github.com/pushpinderbal/restream/internal/stream"
 )
 
 func main() {
-	if err := run(); err != nil {
+	development := flag.Bool("dev", false, "Use local data and web paths for development with Vite")
+	flag.Parse()
+	if err := run(*development); err != nil {
 		slog.Error("Restream stopped", "error", err)
 		os.Exit(1)
 	}
 }
-func run() error {
+func run(development bool) error {
 	cfg, err := app.LoadConfig()
 	if err != nil {
 		return err
 	}
-	var provider model.Provider
-	if cfg.PortalURL != "" {
-		provider, err = stalker.New(stalker.Config{RequestTimeout: cfg.RequestTimeout, RequestInterval: cfg.RequestInterval, EPGHours: cfg.EPGHours, MaxResponseBytes: cfg.MaxResponseBytes, PortalURL: cfg.PortalURL, MAC: cfg.MAC, Timezone: cfg.Timezone, UserAgent: cfg.UserAgent, SerialNumber: cfg.SerialNumber, DeviceID: cfg.DeviceID, DeviceID2: cfg.DeviceID2})
-		if err != nil {
-			return err
+	if development {
+		cfg.DataDir, cfg.WebDir = "./data", "./web/dist"
+		if os.Getenv("LISTEN_ADDR") == "" {
+			cfg.ListenAddr = "127.0.0.1:8080"
 		}
 	}
-	var manager *stream.Manager
-	if provider != nil {
-		manager, err = stream.New(stream.Config{MaxStreams: cfg.MaxStreams, SessionTTL: cfg.SessionTTL, DataDir: cfg.DataDir, TranscodeMode: cfg.TranscodeMode}, provider.Resolve)
-		if err != nil {
-			return err
-		}
-		defer manager.Close()
-	}
-	var streams app.Streams
-	if manager != nil {
-		streams = manager
-	}
-	server, err := app.New(cfg, provider, streams)
+	server, err := app.NewRuntime(cfg)
 	if err != nil {
 		return err
 	}
@@ -56,7 +43,7 @@ func run() error {
 	defer stop()
 	done := make(chan error, 1)
 	go func() {
-		slog.Info("Restream listening", "address", cfg.ListenAddr, "configured", provider != nil, "max_streams", cfg.MaxStreams)
+		slog.Info("Restream listening", "address", cfg.ListenAddr)
 		done <- httpServer.ListenAndServe()
 	}()
 	select {

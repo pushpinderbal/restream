@@ -39,21 +39,20 @@ func TestEpisodeFailureLoggedOnceWithoutPrivateDetails(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
 	defer slog.SetDefault(previous)
 	p := &failingEpisodeProvider{}
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
-	// Exercise episode retries without an unrelated background library refresh
-	// expiring the episode cache during the assertions below.
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", RefreshInterval: time.Hour}
+	// Keep the provider under direct fixture control while testing shared retries.
 	s, err := New(cfg, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	t.Cleanup(func() { s.Close() })
 	s.provider = p
 	q := model.BrowseQuery{Kind: "series", Category: "*", Page: 1}
-	if err := s.cache.setBrowseAtRevision(q, model.BrowsePage{Items: []model.Item{{ID: "series:229631", Kind: "series", Name: "Cached series", ProviderID: "229631"}}, Page: 1}, time.Hour, s.cache.libraryRevision()); err != nil {
+	if err := seedBrowsePage(s.cache, q, model.BrowsePage{Items: []model.Item{{ID: "series:229631", Kind: "series", Name: "Cached series", ProviderID: "229631"}}, Page: 1}); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(s)
-	defer ts.Close()
+	t.Cleanup(func() { ts.Close() })
 	status, body := request(t, ts.URL, "GET", "/api/series/series:229631/episodes", "")
 	if status != 502 || strings.Contains(body, "private-token") {
 		t.Fatalf("episode response: %d %s", status, body)
@@ -69,7 +68,32 @@ func TestEpisodeFailureLoggedOnceWithoutPrivateDetails(t *testing.T) {
 	if strings.Contains(text, "private-token") || strings.Contains(text, "private.invalid") {
 		t.Fatal("private provider error leaked into log")
 	}
+	// A failed cold check has a shared retry deadline, even after restart.
+	for range 10 {
+		status, body = request(t, ts.URL, "GET", "/api/series/series:229631/episodes", "")
+		if status != 502 || strings.Contains(body, "private-token") {
+			t.Fatal(status, body)
+		}
+	}
+	if p.calls.Load() != 1 {
+		t.Fatal("failed checks were retried on every visit", p.calls.Load())
+	}
+	ts.Close()
+	s.Close()
+	s, err = New(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.provider = p
+	ts = httptest.NewServer(s)
 	p.healthy.Store(true)
+	status, body = request(t, ts.URL, "GET", "/api/series/series:229631/episodes", "")
+	if status != 502 || p.calls.Load() != 1 {
+		t.Fatal("restart forgot provider retry delay", status, body, p.calls.Load())
+	}
+	if _, err := s.cache.db.Exec(`UPDATE cache_retries SET retry_at=0`); err != nil {
+		t.Fatal(err)
+	}
 	status, body = request(t, ts.URL, "GET", "/api/series/series:229631/episodes", "")
 	if status != 200 || !strings.Contains(body, "Pilot") || strings.Contains(body, "private-playback") || p.calls.Load() != 2 {
 		t.Fatal("episode retry did not save public result", status, body, p.calls.Load())
@@ -82,13 +106,12 @@ func TestEpisodeFailureLoggedOnceWithoutPrivateDetails(t *testing.T) {
 
 func TestCachedEpisodePlaybackRetainsProviderIdentityAfterRestart(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := Config{DataDir: dataDir, WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", MaxStreams: 1, CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
+	cfg := Config{DataDir: dataDir, WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", MaxStreams: 1, RefreshInterval: time.Hour}
 	cache, err := openStore(dataDir, cfg.PortalURL, cfg.MAC)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Keep metadata fresh so restarting uses the saved episode list without
-	// triggering a library refresh, which deliberately expires saved lists.
+	// Keep saved metadata and episode lists fresh across the restart.
 	provider := &fixtureProvider{}
 	live, err := provider.Catalog(context.Background())
 	if err != nil {
@@ -105,7 +128,7 @@ func TestCachedEpisodePlaybackRetainsProviderIdentityAfterRestart(t *testing.T) 
 		t.Fatal(err)
 	}
 	series := model.Item{ID: "series:229631", Kind: "series", Name: "Show", ProviderID: "229631"}
-	if err := cache.setBrowseAtRevision(model.BrowseQuery{Kind: "series", Category: "*", Page: 1}, model.BrowsePage{Page: 1, Items: []model.Item{series}}, time.Hour, cache.libraryRevision()); err != nil {
+	if err := seedBrowsePage(cache, model.BrowseQuery{Kind: "series", Category: "*", Page: 1}, model.BrowsePage{Page: 1, Items: []model.Item{series}}); err != nil {
 		t.Fatal(err)
 	}
 	episode := model.Item{ID: "episode:229631:16659:730024", Kind: "episode", Name: "Pilot", Season: 1, Episode: 1, ProviderID: "730024", SeriesID: "229631", EpisodeID: "730024"}

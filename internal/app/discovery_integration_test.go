@@ -57,9 +57,6 @@ func discoveryTestServer(t *testing.T, cfg Config, p model.Provider) (*Server, *
 	if cfg.WebDir == "" {
 		cfg.WebDir = t.TempDir()
 	}
-	if cfg.CatalogRefresh == 0 {
-		cfg.CatalogRefresh = 24 * time.Hour
-	}
 	// Keep the scheduled live/EPG refresh out of these discovery fixtures. The
 	// API and its real cache/background-refresh lifecycle remain under test.
 	s, err := New(cfg, nil, nil)
@@ -145,11 +142,11 @@ func configureDiscoveryMetadata(t *testing.T, s *Server, fail *atomic.Bool) *ato
 	calls := &atomic.Int32{}
 	s.discoveryService.client.Transport = discoveryTransport(func(req *http.Request) (*http.Response, error) {
 		calls.Add(1)
-		if req.URL.Scheme != "https" || req.URL.Host != "api.themoviedb.org" || req.Header.Get("Authorization") != "Bearer private-token" {
+		if req.URL.Scheme != "https" || req.URL.Host != "api.themoviedb.org" || req.Header.Get("Authorization") != "Bearer private-token" || req.URL.Query().Has("api_key") || strings.Contains(req.URL.RawQuery, "private-token") {
 			t.Error("invalid metadata request identity", req.URL.Host)
 		}
 		if fail != nil && fail.Load() {
-			return nil, errors.New("failed https://api.themoviedb.org/?api_key=private-token")
+			return nil, errors.New("failed metadata request using Bearer private-token")
 		}
 		var titles []tmdbTitle
 		switch req.URL.Path {
@@ -211,8 +208,11 @@ func TestDiscoveryMatchesOnlyConfirmedTitlesAndProxiesKnownArtwork(t *testing.T)
 		t.Fatal("unsafe metadata image URL accepted")
 	}
 	first := result.TrendingMovies[0]
-	if first.Name != "Available Movie" || first.Year != 2025 || first.Rating != 8.1 || !strings.HasPrefix(first.Poster, "/api/discovery/images/") {
+	if first.Name != "Available Movie" || first.Year != 2025 || first.ReleaseDate != "2025-01-01" || first.Rating != 8.1 || !strings.HasPrefix(first.Poster, "/api/discovery/images/") {
 		t.Fatal("canonical metadata missing", first)
+	}
+	if result.TrendingSeries[0].ReleaseDate != "2022-01-01" {
+		t.Fatal("show first-air date missing", result.TrendingSeries[0])
 	}
 	pixel, _ := base64.StdEncoding.DecodeString("R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=")
 	var imageCalls atomic.Int32
@@ -240,8 +240,8 @@ func TestDiscoveryMatchesOnlyConfirmedTitlesAndProxiesKnownArtwork(t *testing.T)
 	if err := s.cache.invalidateLibrary(); err != nil {
 		t.Fatal(err)
 	}
-	if image := getArtwork(t, ts.URL+first.Poster); image.status != 404 {
-		t.Fatal("old-revision metadata image survived library invalidation")
+	if image := getArtwork(t, ts.URL+first.Poster); image.status != 200 {
+		t.Fatal("cached metadata image disappeared during library invalidation")
 	}
 }
 
@@ -253,6 +253,10 @@ func TestDiscoverySavedFallbackBackoffAndProviderInvalidation(t *testing.T) {
 	failed.Store(true)
 	s.discoveryService.mu.Lock()
 	s.discoveryService.record.NextAttempt = time.Time{}
+	for kind, metadata := range s.discoveryService.record.Metadata {
+		metadata.FetchedAt = time.Now().Add(-25 * time.Hour)
+		s.discoveryService.record.Metadata[kind] = metadata
+	}
 	s.discoveryService.mu.Unlock()
 	readDiscovery(t, ts)
 	var fallback discoveryResponse
@@ -276,16 +280,16 @@ func TestDiscoverySavedFallbackBackoffAndProviderInvalidation(t *testing.T) {
 	if read.Refreshing || read.Error == "" || len(read.TrendingMovies) != len(warm.TrendingMovies) {
 		t.Fatal("failure/backoff snapshot was not persistent", read)
 	}
-	// A revision invalidates matches even though the old items stay available
-	// to existing players. A held new search cannot leak those old matches.
+	// A new revision keeps saved rail entries visible while availability is
+	// rechecked. Provider failure must not blank the cached rail.
 	gate := make(chan struct{})
 	restored.provider = &discoveryFixtureProvider{gate: gate}
 	if err := restored.cache.invalidateLibrary(); err != nil {
 		t.Fatal(err)
 	}
 	cold := readDiscovery(t, restoredTS)
-	if len(cold.TrendingMovies) != 0 || len(cold.ExploreMovies) != 0 || !cold.Refreshing {
-		t.Fatal("old playback items treated as current availability", cold)
+	if len(cold.TrendingMovies) != len(warm.TrendingMovies) || len(cold.ExploreMovies) == 0 || !cold.Refreshing {
+		t.Fatal("saved discovery disappeared while revalidating", cold)
 	}
 	close(gate)
 	waitFor(t, func() bool {
@@ -331,7 +335,7 @@ func TestDiscoveryShutdownCancelsHeldProviderAndRejectsMetadataRedirects(t *test
 	}
 }
 
-func TestDiscoveryExpiresAvailabilityWithoutRemovingPlaybackRecords(t *testing.T) {
+func TestDiscoveryRetainsSavedRailWhenBrowsePagesExpire(t *testing.T) {
 	s, ts := discoveryTestServer(t, Config{TMDBReadAccessToken: "private-token"}, matchingDiscoveryProvider())
 	configureDiscoveryMetadata(t, s, nil)
 	warm := waitDiscovery(t, ts)
@@ -342,8 +346,8 @@ func TestDiscoveryExpiresAvailabilityWithoutRemovingPlaybackRecords(t *testing.T
 		t.Fatal(err)
 	}
 	cold := readDiscovery(t, ts)
-	if len(cold.TrendingMovies) != 0 || len(cold.ExploreMovies) != 0 || len(cold.TrendingSeries) != 1 {
-		t.Fatal("expired browse pages still counted as available", cold)
+	if len(cold.TrendingMovies) != len(warm.TrendingMovies) || len(cold.ExploreMovies) != len(warm.ExploreMovies) || len(cold.TrendingSeries) != 1 {
+		t.Fatal("page expiry discarded the saved rail", cold)
 	}
 	if _, exists := s.cache.item("movie:1"); !exists {
 		t.Fatal("expiry removed the existing playback record")

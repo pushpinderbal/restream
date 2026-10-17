@@ -7,6 +7,8 @@ import {
   type Program,
 } from "../api";
 import { Artwork } from "./artwork";
+import { Spinner } from "./spectrumui/spinner-dependencies";
+import { AnimatedAlert } from "./spectrumui/animated-alert";
 import { Button } from "./ui/button";
 
 function sameCategory(item: Item, other: Item) {
@@ -152,11 +154,19 @@ export function MovieSuggestions({
           </span>
           <span className="watch-suggestion-copy">
             <strong>{title.name}</strong>
-            <small>{pending === title.item.id ? "Opening…" : "Movie"}</small>
+            <small>
+              {pending === title.item.id ? (
+                <span role="status" aria-label="Opening movie">
+                  <Spinner size="small" className="app-spinner" />
+                </span>
+              ) : (
+                "Movie"
+              )}
+            </small>
           </span>
         </Button>
       ))}
-      {error && <p role="alert">{error}</p>}
+      {error && <AnimatedAlert>{error}</AnimatedAlert>}
     </section>
   );
 }

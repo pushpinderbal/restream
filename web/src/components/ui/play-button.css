@@ -1,0 +1,30 @@
+.play-action-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .play-action:not(:disabled):not([aria-disabled="true"]):not(
+      [aria-busy="true"]
+    ):is(:hover, :focus-visible)
+    .play-action-glyph {
+    animation: play-action-forward 360ms ease-out;
+  }
+}
+
+@keyframes play-action-forward {
+  0%,
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  45% {
+    opacity: 0;
+    transform: translateX(6px);
+  }
+  46% {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+}

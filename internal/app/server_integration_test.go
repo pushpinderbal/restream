@@ -93,7 +93,7 @@ func (p *fixtureProvider) Browse(ctx context.Context, q model.BrowseQuery) (mode
 	return model.BrowsePage{Items: []model.Item{item}, Page: q.Page, Total: 1, HasMore: false}, nil
 }
 func TestPassiveBrowseSharedAndPersistent(t *testing.T) {
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", RefreshInterval: time.Hour}
 	gate := make(chan struct{})
 	p := &fixtureProvider{browseGate: gate}
 	s, err := New(cfg, p, nil)
@@ -218,7 +218,7 @@ func TestHTTPUnconfiguredAndValidation(t *testing.T) {
 }
 
 func TestCatalogETag(t *testing.T) {
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", RefreshInterval: time.Hour}
 	s, err := New(cfg, &fixtureProvider{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -264,7 +264,7 @@ func TestImageSharedAcrossBrowsersAndRefreshStatus(t *testing.T) {
 	defer imageServer.Close()
 	gate := make(chan struct{})
 	p := &fixtureProvider{imageURL: imageServer.URL + "/logo", catalogGate: gate}
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", RefreshInterval: time.Hour}
 	s, err := New(cfg, p, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -332,7 +332,7 @@ func TestPlaybackHTTPAdmissionAndStop(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg required")
 	}
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), MaxStreams: 2, CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), MaxStreams: 2, RefreshInterval: time.Hour}
 	manager, err := stream.New(stream.Config{MaxStreams: 2, DataDir: cfg.DataDir}, func(ctx context.Context, item model.Item) (model.Source, error) {
 		<-ctx.Done()
 		return model.Source{}, ctx.Err()
@@ -418,7 +418,7 @@ func TestPlaybackHTTPAdmissionAndStop(t *testing.T) {
 }
 
 func TestBrowsePageKeysAndExpiry(t *testing.T) {
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11", CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11", RefreshInterval: time.Hour}
 	p := &fixtureProvider{}
 	s, err := New(cfg, nil, nil)
 	if err != nil {
@@ -466,10 +466,18 @@ func TestBrowsePageKeysAndExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	request(t, ts.URL, "GET", paths[0], "")
-	p.mu.Lock()
-	calls = p.browseCalls
-	p.mu.Unlock()
-	if calls != len(paths)+1 {
-		t.Fatal("expired page did not refresh")
+	waitFor(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.browseCalls == len(paths)+1
+	})
+}
+
+// Seed fixture pages through the same generation checks used by provider responses.
+func seedBrowsePage(s *store, q model.BrowseQuery, page model.BrowsePage) error {
+	generation, err := s.listingRevision(q)
+	if err != nil {
+		return err
 	}
+	return s.setBrowsePage(q, page, s.cacheRevision(), generation)
 }

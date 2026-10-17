@@ -79,7 +79,7 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"js": data})
 	}))
 	defer portal.Close()
-	cfg := Config{PortalURL: portal.URL + "/stalker_portal/c/", MAC: "00:11:22:33:44:55", DataDir: t.TempDir(), WebDir: t.TempDir(), MaxStreams: 1, CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
+	cfg := Config{PortalURL: portal.URL + "/stalker_portal/c/", MAC: "00:11:22:33:44:55", DataDir: t.TempDir(), WebDir: t.TempDir(), MaxStreams: 1, RefreshInterval: time.Hour}
 	if os.Getenv("RESTREAM_BROWSER_TESTS") == "1" {
 		var err error
 		cfg.WebDir, err = filepath.Abs("../../web/dist")

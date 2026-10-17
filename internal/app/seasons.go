@@ -12,48 +12,65 @@ import (
 	"github.com/pushpinderbal/restream/internal/model"
 )
 
-// loadEpisodeList shares provider work and keeps navigation and each season in
-// separate persistent cache entries. A disconnected browser can stop waiting.
-func (s *Server) loadEpisodeList(r *http.Request, series model.Item, key string, revision time.Time, load func(context.Context) ([]model.Item, error)) ([]model.Item, error) {
-	if items, ok := s.cache.getEpisodes(key, s.episodeTTL()); ok {
-		return items, nil
+// Navigation and each selected season have independent shared cooldowns.
+func (s *Server) loadEpisodeList(r *http.Request, series model.Item, key string, revision time.Time, load func(context.Context) ([]model.Item, error)) ([]model.Item, cacheStatus, error) {
+	items, cached, fresh := s.cache.episodeSnapshot(key, s.episodeTTL())
+	if fresh {
+		return items, cacheStatus{}, nil
 	}
-	result := s.episodeFlights.DoChan(key+"\x00"+revision.Format(time.RFC3339Nano), func() (any, error) {
-		s.browseMu.Lock()
-		if s.browseClosed {
-			s.browseMu.Unlock()
-			return nil, context.Canceled
+	status := cacheStatus{Stale: true}
+	entry := "episodes:" + key
+	eligible, err := s.cacheEligible(entry)
+	if err != nil {
+		return items, status, err
+	}
+	if !eligible {
+		if cached {
+			return items, status, nil
 		}
-		s.browseWG.Add(1)
-		s.browseMu.Unlock()
-		defer s.browseWG.Done()
-		if items, ok := s.cache.getEpisodes(key, s.episodeTTL()); ok {
-			return items, nil
+		return nil, status, errCacheRetry
+	}
+	result := s.cacheFlight(&s.episodeFlights, entry+"\x00"+revision.Format(time.RFC3339Nano), func() (any, error) {
+		if saved, fresh := s.cache.getEpisodes(key, s.episodeTTL()); fresh {
+			return saved, nil
+		}
+		eligible, err := s.cacheEligible(entry)
+		if err != nil {
+			return nil, err
+		}
+		if !eligible {
+			return nil, errCacheRetry
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
 		defer cancel()
 		started := time.Now()
-		items, err := load(ctx)
+		loaded, err := load(ctx)
 		if err != nil {
 			if s.ctx.Err() == nil {
 				slog.Warn("Episode load failed", "seriesID", safeEpisodeLogID(series.ID), "stage", "provider", "reason", episodeFailureReason(err), "elapsed", time.Since(started).Round(time.Millisecond))
 			}
+			if saveErr := s.cache.cacheFailed(entry, err); saveErr != nil {
+				return nil, saveErr
+			}
 			return nil, err
 		}
-		if err = s.cache.setEpisodeListAtRevision(series.ID, key, items, revision); err != nil {
+		if err = s.cache.setEpisodeListAtRevision(series.ID, key, loaded, revision); err != nil {
 			return nil, err
 		}
-		return items, nil
+		if _, err = s.cache.db.Exec(`DELETE FROM cache_retries WHERE entry=?`, entry); err != nil {
+			return nil, err
+		}
+		return loaded, nil
 	})
-	select {
-	case <-r.Context().Done():
-		return nil, r.Context().Err()
-	case loaded := <-result:
-		if loaded.Err != nil {
-			return nil, loaded.Err
-		}
-		return loaded.Val.([]model.Item), nil
+	if cached {
+		status.Refreshing = true
+		return items, status, nil
 	}
+	value, err := waitCache(r.Context(), result)
+	if err != nil {
+		return nil, status, err
+	}
+	return value.([]model.Item), cacheStatus{}, nil
 }
 
 func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series model.Item) {
@@ -63,22 +80,18 @@ func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series m
 		fail(w, 400, "invalid", "Choose a valid season.")
 		return
 	}
-	revision := s.cache.libraryRevision()
-	// Reuse a fresh complete list from an older browser or provider when possible.
-	rows, complete := s.cache.getEpisodes(series.ID, s.episodeTTL())
+	revision := s.cache.cacheRevision()
 	provider, supportsSeasons := s.provider.(model.SeasonProvider)
-	if !complete {
-		key := series.ID
-		load := func(ctx context.Context) ([]model.Item, error) { return s.provider.Episodes(ctx, series) }
-		if supportsSeasons {
-			key += "#seasons"
-			load = func(ctx context.Context) ([]model.Item, error) { return provider.Seasons(ctx, series) }
-		}
-		rows, err = s.loadEpisodeList(r, series, key, revision, load)
-		if err != nil {
-			seasonFailure(w, err)
-			return
-		}
+	key := series.ID
+	load := func(ctx context.Context) ([]model.Item, error) { return s.provider.Episodes(ctx, series) }
+	if supportsSeasons {
+		key += "#seasons"
+		load = func(ctx context.Context) ([]model.Item, error) { return provider.Seasons(ctx, series) }
+	}
+	rows, status, err := s.loadEpisodeList(r, series, key, revision, load)
+	if err != nil {
+		seasonFailure(w, err)
+		return
 	}
 	set := map[int]bool{}
 	for _, row := range rows {
@@ -111,9 +124,12 @@ func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series m
 		}
 		if row.Kind == "season" && supportsSeasons {
 			key := series.ID + "#season:" + row.ID
-			items, err = s.loadEpisodeList(r, series, key, revision, func(ctx context.Context) ([]model.Item, error) {
+			var episodeStatus cacheStatus
+			items, episodeStatus, err = s.loadEpisodeList(r, series, key, revision, func(ctx context.Context) ([]model.Item, error) {
 				return provider.SeasonEpisodes(ctx, series, row)
 			})
+			status.Stale = status.Stale || episodeStatus.Stale
+			status.Refreshing = status.Refreshing || episodeStatus.Refreshing
 			if err != nil {
 				seasonFailure(w, err)
 				return
@@ -133,7 +149,7 @@ func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series m
 		blocked(w)
 		return
 	}
-	respond(w, 200, map[string]any{"items": publicItems(items), "seasons": seasons, "season": number})
+	respond(w, 200, map[string]any{"items": publicItems(items), "seasons": seasons, "season": number, "refreshing": status.Refreshing, "stale": status.Stale})
 }
 
 func seasonFailure(w http.ResponseWriter, err error) {

@@ -1,8 +1,8 @@
-import { FilmSlateIcon } from "@phosphor-icons/react/dist/csr/FilmSlate";
-import { HouseIcon } from "@phosphor-icons/react/dist/csr/House";
+import { BroadcastIcon } from "@phosphor-icons/react/dist/csr/Broadcast";
+import { CompassIcon } from "@phosphor-icons/react/dist/csr/Compass";
+import { FilmReelIcon } from "@phosphor-icons/react/dist/csr/FilmReel";
 import { MagnifyingGlassIcon } from "@phosphor-icons/react/dist/csr/MagnifyingGlass";
-import { MonitorIcon } from "@phosphor-icons/react/dist/csr/Monitor";
-import { UserCircleIcon } from "@phosphor-icons/react/dist/csr/UserCircle";
+import { SlidersHorizontalIcon } from "@phosphor-icons/react/dist/csr/SlidersHorizontal";
 import { BrandMark } from "./brand-mark";
 import "./navigation.css";
 import { Button } from "./ui/button";
@@ -16,10 +16,10 @@ import {
 type Destination = "home" | "search" | "vod" | "live" | "settings";
 const destinations = [
   { id: "search", label: "Search", icon: MagnifyingGlassIcon },
-  { id: "home", label: "Home", icon: HouseIcon },
-  { id: "vod", label: "VOD", icon: FilmSlateIcon },
-  { id: "live", label: "Live TV", icon: MonitorIcon },
-  { id: "settings", label: "Settings", icon: UserCircleIcon },
+  { id: "home", label: "Home", icon: CompassIcon },
+  { id: "vod", label: "VOD", icon: FilmReelIcon },
+  { id: "live", label: "Live TV", icon: BroadcastIcon },
+  { id: "settings", label: "Settings", icon: SlidersHorizontalIcon },
 ] as const;
 
 export function AppNavigation({
@@ -38,7 +38,7 @@ export function AppNavigation({
       key={id}
       variant="ghost"
       size="icon-lg"
-      className={`navigation-icon${active === id ? " active" : ""}${id === "settings" ? " navigation-profile" : ""}`}
+      className={`navigation-icon${active === id ? " active" : ""}`}
       aria-label={label}
       aria-current={active === id ? "page" : undefined}
       onClick={() => onNavigate(id)}
@@ -46,7 +46,7 @@ export function AppNavigation({
       <Icon
         className="size-[32px]"
         size={32}
-        weight="light"
+        weight={active === id ? "fill" : "duotone"}
         aria-hidden="true"
       />
     </Button>
@@ -55,11 +55,7 @@ export function AppNavigation({
     <Tooltip key={destination.id}>
       <TooltipTrigger asChild>{renderLink(destination)}</TooltipTrigger>
       <TooltipContent className="navigation-tooltip" side="right">
-        {destination.id === "settings"
-          ? "Profile & settings"
-          : destination.id === "vod"
-            ? "Movies & shows"
-            : destination.label}
+        {destination.id === "vod" ? "Movies & shows" : destination.label}
       </TooltipContent>
     </Tooltip>
   ));

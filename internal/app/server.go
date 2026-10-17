@@ -90,8 +90,8 @@ const defaultArtwork = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320
 var fallbackArtwork = imageData{data: []byte(defaultArtwork), mime: "image/svg+xml", fallback: true}
 
 func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) {
-	if cfg.EpisodeCacheTTL <= 0 {
-		cfg.EpisodeCacheTTL = time.Hour
+	if cfg.RefreshInterval <= 0 {
+		cfg.RefreshInterval = 24 * time.Hour
 	}
 	cache, err := openStore(cfg.DataDir, cfg.PortalURL, cfg.MAC)
 	if err != nil {
@@ -215,7 +215,7 @@ func (s *Server) static() http.Handler {
 		}
 		if r.URL.Path == "/" {
 			if _, err := os.Stat(filepath.Join(root, "index.html")); err != nil {
-				http.Error(w, "Web interface files are missing from the container image.", 503)
+				http.Error(w, "Web interface files are missing.", 503)
 				return
 			}
 		}
@@ -343,7 +343,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 // refresh worker or tie shared work to the requesting browser's lifetime.
 func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
 	if s.provider == nil {
-		fail(w, 503, "unconfigured", "Configure the portal on the server first.")
+		fail(w, 503, "unconfigured", "Connect your provider in Settings first.")
 		return
 	}
 	var input struct {
@@ -372,6 +372,13 @@ func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
 		s.stateMu.Unlock()
 		fail(w, 503, "unavailable", "The server is shutting down.")
 		return
+	}
+	if input.Target != "epg" && !s.catalogSync.Running && !s.catalogSync.Queued {
+		if err := s.cache.invalidateLibrary(); err != nil {
+			s.stateMu.Unlock()
+			fail(w, 500, "cache", "Could not prepare the library refresh.")
+			return
+		}
 	}
 	for idx, state := range []*refreshState{&s.catalogSync, &s.epgSync} {
 		if (idx == 0 && input.Target == "epg") || (idx == 1 && input.Target == "catalog") {
@@ -456,7 +463,7 @@ func writeSnapshot(w http.ResponseWriter, r *http.Request, data []byte, tag stri
 }
 func (s *Server) episodes(w http.ResponseWriter, r *http.Request) {
 	if s.provider == nil {
-		fail(w, 503, "unconfigured", "Configure the portal on the server first.")
+		fail(w, 503, "unconfigured", "Connect your provider in Settings first.")
 		return
 	}
 	id := r.PathValue("id")
@@ -473,48 +480,16 @@ func (s *Server) episodes(w http.ResponseWriter, r *http.Request) {
 		s.seasonEpisodes(w, r, item)
 		return
 	}
-	revision := s.cache.libraryRevision()
-	items, cached := s.cache.getEpisodes(id, s.episodeTTL())
-	if !cached {
-		key := id + "\x00" + revision.Format(time.RFC3339Nano)
-		value, err, _ := s.episodeFlights.Do(key, func() (any, error) {
-			cachedItems, exists := s.cache.getEpisodes(id, s.episodeTTL())
-			if exists {
-				return cachedItems, nil
-			}
-			started := time.Now()
-			ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
-			defer cancel()
-			loaded, err := s.provider.Episodes(ctx, item)
-			if err != nil {
-				if s.ctx.Err() == nil {
-					slog.Warn("Episode load failed", "seriesID", safeEpisodeLogID(id), "stage", "provider", "reason", episodeFailureReason(err), "elapsed", time.Since(started).Round(time.Millisecond))
-				}
-				return nil, err
-			}
-			if err = s.cache.setEpisodesAtRevision(id, loaded, revision); err != nil {
-				if !errors.Is(err, errSeriesRemoved) {
-					slog.Warn("Episode load failed", "seriesID", safeEpisodeLogID(id), "stage", "cache", "reason", "write_failed", "elapsed", time.Since(started).Round(time.Millisecond))
-				}
-				return nil, err
-			}
-			return loaded, nil
-		})
-		if err != nil {
-			if errors.Is(err, errSeriesRemoved) {
-				fail(w, 404, "not_found", "Series not found.")
-				return
-			}
-			fail(w, 502, "upstream", "Could not load episodes from the portal. Try again.")
-			return
-		}
-		items = value.([]model.Item)
+	items, status, err := s.loadEpisodeList(r, item, id, s.cache.cacheRevision(), func(ctx context.Context) ([]model.Item, error) { return s.provider.Episodes(ctx, item) })
+	if err != nil {
+		seasonFailure(w, err)
+		return
 	}
 	if s.blockedItem(item) {
 		blocked(w)
 		return
 	}
-	respond(w, 200, map[string]any{"items": publicItems(items)})
+	respond(w, 200, map[string]any{"items": publicItems(items), "refreshing": status.Refreshing, "stale": status.Stale})
 }
 func safeEpisodeLogID(id string) string {
 	value, ok := strings.CutPrefix(id, "series:")
@@ -555,21 +530,11 @@ func episodeFailureReason(err error) string {
 }
 func (s *Server) refreshInterval(catalog bool) time.Duration {
 	p := s.preferencesSnapshot()
-	if p.unified {
-		cadence := time.Duration(p.value.RefreshIntervalSeconds) * time.Second
-		if catalog {
-			return cadence
-		}
-		return max(time.Minute, min(cadence/4, 6*time.Hour))
-	}
-	interval := s.cfg.EPGRefresh
+	cadence := time.Duration(p.value.RefreshIntervalSeconds) * time.Second
 	if catalog {
-		interval = s.cfg.CatalogRefresh
+		return cadence
 	}
-	if interval <= 0 {
-		interval = 6 * time.Hour
-	}
-	return interval
+	return time.Hour
 }
 func (s *Server) scheduler(catalog bool) {
 	defer s.wg.Done()
@@ -687,7 +652,7 @@ func (s *Server) doRefresh(catalog, epg bool) error {
 		}
 		cancel()
 		if err == nil {
-			err = s.cache.invalidateLibrary()
+			err = s.cache.publishLibrary()
 		}
 		message := ""
 		if err != nil {
@@ -752,7 +717,7 @@ func (s *Server) categories(w http.ResponseWriter, r *http.Request) {
 func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 	provider, ok := s.provider.(model.BrowseProvider)
 	if !ok {
-		fail(w, 503, "unconfigured", "Configure the portal on the server first.")
+		fail(w, 503, "unconfigured", "Connect your provider in Settings first.")
 		return
 	}
 	q := model.BrowseQuery{Kind: r.URL.Query().Get("kind"), Category: r.URL.Query().Get("category"), Search: strings.TrimSpace(r.URL.Query().Get("search")), Page: 1}
@@ -781,93 +746,28 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.cache.mu.RLock()
-	if q.Kind == "series" {
-		for _, c := range s.cache.categories {
-			if c.Kind == "series" && (q.Category == "*" || q.Category == c.ID) {
-				q.SourceType = c.SourceType
-				break
-			}
-		}
-	}
+	q.SourceType = s.cache.browseSourceTypeLocked(q)
 	s.cache.mu.RUnlock()
-	page, found, err := s.cache.browse(q, s.refreshInterval(true))
-	if err != nil {
-		fail(w, 500, "cache", "Could not read the saved page.")
-		return
-	}
-	if found {
-		page.Items = publicItems(s.visibleItems(page.Items, false))
-		respond(w, 200, page)
-		return
-	}
-	// The fetch belongs to the server lifetime, so disconnecting one browser does
-	// not cancel work shared by other viewers.
-	revision := s.cache.libraryRevision()
-	key := q.Kind + "\x00" + q.Category + "\x00" + q.Search + "\x00" + strconv.Itoa(q.Page) + "\x00" + revision.Format(time.RFC3339Nano)
-	s.browseMu.Lock()
-	if s.browseClosed {
-		s.browseMu.Unlock()
-		fail(w, 503, "unavailable", "Server is stopping.")
-		return
-	}
-	s.browseWG.Add(1)
-	result := s.browseFlights.DoChan(key, func() (any, error) {
-
-		if saved, ok, err := s.cache.browse(q, s.refreshInterval(true)); err != nil {
-			return nil, err
-		} else if ok {
-			return saved, nil
-		}
-		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
-		defer cancel()
-		if !s.browseCategoryAllowed(q.Kind, q.Category) {
-			return model.BrowsePage{Items: []model.Item{}, Page: q.Page}, nil
-		}
-		loaded, err := provider.Browse(ctx, q)
-		if err != nil {
-			return nil, err
-		}
-		s.cache.mu.RLock()
-		categoryNames := make(map[string]string)
-		for _, c := range s.cache.categories {
-			if c.Kind == q.Kind {
-				categoryNames[c.ID] = c.Name
-			}
-		}
-		s.cache.mu.RUnlock()
-		for n := range loaded.Items {
-			item := &loaded.Items[n]
-			if item.CategoryID == "" && q.Category != "*" {
-				item.CategoryID = q.Category
-			}
-			if name := categoryNames[item.CategoryID]; name != "" {
-				item.Category = name
-			}
-		}
-		if err = s.cache.setBrowseAtRevision(q, loaded, s.refreshInterval(true), revision); err != nil {
-			return nil, err
-		}
-		return loaded, nil
-	})
-	s.browseMu.Unlock()
-	done := make(chan singleflight.Result, 1)
-	go func() { res := <-result; done <- res; s.browseWG.Done() }()
-	select {
-	case <-r.Context().Done():
-		return
-	case res := <-done:
-		if res.Err != nil {
-			fail(w, 502, "upstream", "Could not load this page from the portal. Try again.")
+	through := q.Page
+	if raw := r.URL.Query().Get("through"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < q.Page || n > 10000 || n-q.Page >= 100 {
+			fail(w, 400, "invalid", "Invalid page range.")
 			return
 		}
-		page = res.Val.(model.BrowsePage)
-		page.Items = publicItems(s.visibleItems(page.Items, false))
-		respond(w, 200, page)
+		through = n
 	}
+	page, err := s.loadBrowseRange(r.Context(), provider, q, through)
+	if err != nil {
+		fail(w, 502, "upstream", "Could not load this page from the portal. Try again.")
+		return
+	}
+	page.Items = publicItems(s.visibleItems(page.Items, false))
+	respond(w, 200, page)
 }
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	if s.provider == nil || s.streams == nil {
-		fail(w, 503, "unconfigured", "Configure the portal on the server first.")
+		fail(w, 503, "unconfigured", "Connect your provider in Settings first.")
 		return
 	}
 	var body struct {

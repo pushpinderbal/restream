@@ -1,6 +1,7 @@
 import type { LucideIcon } from "lucide-react";
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { useId, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { cn } from "../../lib/utils";
+import { TabIndicator } from "./tab-indicator";
 
 export type SectionTab = {
   value: string;
@@ -48,6 +49,7 @@ export function SectionTabs({
   onValueChange: (value: string) => void;
   className?: string;
 }) {
+  const indicatorId = useId();
   return (
     <div
       className={cn("section-tabs", className)}
@@ -63,7 +65,9 @@ export function SectionTabs({
           aria-pressed={value === key}
           disabled={disabled}
           onClick={() => onValueChange(key)}
-        />
+        >
+          {value === key && <TabIndicator id={indicatorId} />}
+        </SectionTabButton>
       ))}
     </div>
   );

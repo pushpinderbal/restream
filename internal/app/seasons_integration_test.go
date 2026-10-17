@@ -16,17 +16,31 @@ type seasonFixture struct {
 	fixtureProvider
 	seasonMu   sync.Mutex
 	navigation int
+	newSeason  bool
+	gate       <-chan struct{}
 	loaded     []int
 }
 
-func (p *seasonFixture) Seasons(_ context.Context, series model.Item) ([]model.Item, error) {
+func (p *seasonFixture) Seasons(ctx context.Context, series model.Item) ([]model.Item, error) {
 	p.seasonMu.Lock()
-	defer p.seasonMu.Unlock()
 	p.navigation++
-	return []model.Item{
+	gate, newSeason := p.gate, p.newSeason
+	p.seasonMu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	items := []model.Item{
 		{ID: "season:2:55", Kind: "season", ProviderID: "55", Season: 5, SourceType: "vod"},
 		{ID: "season:2:11", Kind: "season", ProviderID: "11", Season: 1, SourceType: "vod"},
-	}, nil
+	}
+	if newSeason {
+		items = append(items, model.Item{ID: "season:2:66", Kind: "season", ProviderID: "66", Season: 6})
+	}
+	return items, nil
 }
 
 func (p *seasonFixture) SeasonEpisodes(_ context.Context, series, season model.Item) ([]model.Item, error) {
@@ -38,7 +52,7 @@ func (p *seasonFixture) SeasonEpisodes(_ context.Context, series, season model.I
 
 func TestSelectedSeasonIsLazySharedAndPersistent(t *testing.T) {
 	p := &seasonFixture{}
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", CatalogRefresh: time.Hour, EPGRefresh: time.Hour}
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", RefreshInterval: time.Hour}
 	s, err := New(cfg, p, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -104,5 +118,55 @@ func TestSelectedSeasonIsLazySharedAndPersistent(t *testing.T) {
 	episode, ok := s.cache.item("episode:2:55:1")
 	if !ok || episode.Command != "private-command" || episode.EpisodeID != "1" {
 		t.Fatal("playback identity lost")
+	}
+}
+
+func TestSeasonNavigationAndSelectedEpisodesRevalidateIndependently(t *testing.T) {
+	p := &seasonFixture{}
+	s, err := New(Config{DataDir: t.TempDir(), WebDir: t.TempDir(), RefreshInterval: 24 * time.Hour}, p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
+	t.Cleanup(func() { ts.Close(); s.Close() })
+	waitFor(t, func() bool { return !s.cache.libraryRevision().IsZero() })
+	libraryItems(t, ts, "/api/browse?kind=series&category=7&page=1", 1)
+	path := "/api/series/series:2/episodes?season=1"
+	libraryItems(t, ts, path, 1)
+	gate := make(chan struct{})
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(gate) }) })
+	p.seasonMu.Lock()
+	p.newSeason, p.gate = true, gate
+	p.seasonMu.Unlock()
+	s.cache.mu.Lock()
+	s.cache.episodesAt["series:2#seasons"] = time.Now().Add(-31 * time.Minute)
+	s.cache.mu.Unlock()
+	for range 12 {
+		libraryItems(t, ts, path, 1)
+	}
+	waitFor(t, func() bool { p.seasonMu.Lock(); defer p.seasonMu.Unlock(); return p.navigation == 2 })
+	p.seasonMu.Lock()
+	if len(p.loaded) != 1 {
+		t.Error("navigation check fetched episode lists", p.loaded)
+	}
+	p.seasonMu.Unlock()
+	release.Do(func() { close(gate) })
+	waitFor(t, func() bool {
+		_, body := request(t, ts.URL, "GET", path, "")
+		return strings.Contains(body, `"seasons":[1,5,6]`)
+	})
+	s.cache.mu.Lock()
+	s.cache.episodesAt["series:2#season:season:2:11"] = time.Now().Add(-31 * time.Minute)
+	s.cache.mu.Unlock()
+	libraryItems(t, ts, path, 1)
+	waitFor(t, func() bool { p.seasonMu.Lock(); defer p.seasonMu.Unlock(); return len(p.loaded) == 2 })
+	for range 12 {
+		libraryItems(t, ts, path, 1)
+	}
+	p.seasonMu.Lock()
+	defer p.seasonMu.Unlock()
+	if p.navigation != 2 || len(p.loaded) != 2 || p.loaded[0] != 1 || p.loaded[1] != 1 {
+		t.Fatal("cooldowns repeated work or eagerly loaded other seasons", p.navigation, p.loaded)
 	}
 }

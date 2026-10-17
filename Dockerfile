@@ -29,7 +29,7 @@ RUN apk add --no-cache ffmpeg ca-certificates tzdata \
     && chown 10001:10001 /data
 COPY --from=backend /restream /app/restream
 COPY LICENSE /app/
-ENV LISTEN_ADDR=:8080 DATA_DIR=/data WEB_DIR=/app/web
+ENV LISTEN_ADDR=:8080
 WORKDIR /app
 USER 10001:10001
 EXPOSE 8080

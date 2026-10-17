@@ -57,6 +57,10 @@ export function CategorySelect({
           collisionPadding={12}
           aria-label="Choose category"
         >
+          <div className="category-select-heading">
+            <span>Categories</span>
+            <span className="category-select-count">{categories.length}</span>
+          </div>
           <Command
             className="category-select-command"
             defaultValue={value}
@@ -79,6 +83,7 @@ export function CategorySelect({
                   value={option.id}
                   keywords={[option.name]}
                   data-current={value === option.id}
+                  data-all={option.id === "*" || undefined}
                   className="category-select-option"
                   onSelect={() => {
                     setOpen(false);

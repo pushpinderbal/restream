@@ -25,6 +25,7 @@ import { AppNavigation } from "./components/app-navigation";
 import { LibraryBrowser } from "./components/library-browser";
 import { SearchPage } from "./components/search-page";
 import { Button } from "./components/ui/button";
+import { PlayButton } from "./components/ui/play-button";
 import { Skeleton } from "./components/ui/skeleton";
 import { Artwork } from "./components/artwork";
 import { Dashboard } from "./components/dashboard";
@@ -35,6 +36,10 @@ import {
 import { useWatchHistory, type WatchHistoryEntry } from "./watch-history";
 import { createContentPolicy } from "./content-preferences";
 import { Spinner } from "./components/spectrumui/spinner-dependencies";
+import InfiniteScroll from "./components/spectrumui/infinite-scroll";
+import { AnimatedAlert } from "./components/spectrumui/animated-alert";
+import { LoadingButton } from "./components/spectrumui/loading-button";
+import { UndoPill } from "./components/spectrumui/undo-pill";
 import {
   Select,
   SelectContent,
@@ -45,6 +50,8 @@ import {
 import {
   ApiError,
   jsonRequest,
+  loadBrowsePage,
+  waitForRefresh,
   releaseSession,
   request,
   type BrowsePage,
@@ -246,6 +253,8 @@ function App() {
   );
   const [playerError, setPlayerError] = useState("");
   const [playerRetry, setPlayerRetry] = useState(0);
+  const [playerRetrying, setPlayerRetrying] = useState(false);
+  const playerRetryMessage = useRef("");
   const playerOrigin = useRef<PlayerOrigin | null>(playerOriginFromHistory());
   const playerOpenRef = useRef(playerOpen);
   playerOpenRef.current = playerOpen;
@@ -255,6 +264,7 @@ function App() {
     navigationRevision.current++;
     pendingPlayback.current?.abort();
     pendingPlayback.current = null;
+    setPlayerRetrying(false);
   }, []);
   const watchHistory = useWatchHistory();
   const historyEntries = useRef(watchHistory.entries);
@@ -299,9 +309,9 @@ function App() {
   const [catalogGrid, setCatalogGrid] = useState<HTMLDivElement | null>(null);
   const [gridColumns, setGridColumns] = useState(1);
   const libraryScroll = useRef(0);
-  const [loadSentinel, setLoadSentinel] = useState<HTMLDivElement | null>(null);
   const browseAbort = useRef<AbortController | null>(null);
   const browseGeneration = useRef(0);
+  const browseSnapshot = useRef<BrowsePage | null>(null);
   const [now, setNow] = useState(Date.now());
   const [visibleCount, setVisibleCount] = useState(72);
   const lastVodTab = useRef<"movie" | "series">(
@@ -496,7 +506,10 @@ function App() {
         if (alive) setSelected(item);
       })
       .catch((cause) => {
-        if (alive) setDetailError(message(cause));
+        if (alive) {
+          setDetailError(message(cause));
+          setPlayerRetrying(false);
+        }
       });
     return () => {
       alive = false;
@@ -536,67 +549,44 @@ function App() {
     status?.preferencesUpdatedAt,
   ]);
   const fetchPage = useCallback(
-    (page: number, generation: number, pagesToLoad = 3) => {
+    (page: number, generation: number, refreshRange = false) => {
       if (tab === "live" || discoveryContext || searchContext || settingsOpen)
         return;
       browseAbort.current?.abort();
       const controller = new AbortController();
       browseAbort.current = controller;
       setBrowseLoading(true);
-      setBrowseError("");
       const isCurrent = () =>
         !controller.signal.aborted && generation === browseGeneration.current;
-      void (async () => {
-        try {
-          const collected: Item[] = [];
-          let populatedPages = 0;
-          // Portal pages may mix movies and series. Check a few pages per action
-          // so a filtered empty page does not make a section look empty.
-          for (let nextPage = page; nextPage < page + 5; nextPage++) {
-            const params = new URLSearchParams({
-              kind: tab,
-              category,
-              search: search,
-              page: String(nextPage),
-            });
-            const result = await request<BrowsePage>(`/api/browse?${params}`, {
-              signal: controller.signal,
-            });
-            if (!isCurrent()) return;
-            setBrowsePage(nextPage);
-            setHasMore(result.hasMore);
-            if (result.items?.length) {
-              collected.push(...result.items);
-              populatedPages++;
-              if (populatedPages >= pagesToLoad) break;
-            }
-            if (!result.hasMore) break;
-          }
-          if (collected.length && isCurrent())
-            setBrowseItems((old) => {
-              const previous = page === 1 ? [] : old;
-              const existing = new Set(previous.map((item) => item.id));
-              return [
-                ...previous,
-                ...collected.filter((item) => {
-                  if (existing.has(item.id)) return false;
-                  existing.add(item.id);
-                  return true;
-                }),
-              ];
-            });
-        } catch (cause) {
+      const params = new URLSearchParams({ kind: tab, category, search });
+      void loadBrowsePage(
+        params,
+        page,
+        browseSnapshot.current,
+        controller.signal,
+        (result) => {
+          if (!isCurrent()) return;
+          setBrowseError("");
+          browseSnapshot.current = result;
+          setBrowseItems(result.items);
+          setBrowsePage(result.page);
+          setHasMore(result.hasMore);
+        },
+        refreshRange,
+      )
+        .catch((cause) => {
           if (isCurrent()) setBrowseError(message(cause));
-        } finally {
+        })
+        .finally(() => {
           if (isCurrent()) setBrowseLoading(false);
-        }
-      })();
+        });
     },
     [tab, category, search, discoveryContext, searchContext, settingsOpen],
   );
   useEffect(() => {
     browseGeneration.current++;
     browseAbort.current?.abort();
+    browseSnapshot.current = null;
     setBrowseItems([]);
     setBrowsePage(0);
     setHasMore(false);
@@ -610,10 +600,21 @@ function App() {
     category,
     search,
     status?.configured,
-    status?.libraryUpdatedAt,
     fetchPage,
     status?.preferencesUpdatedAt,
   ]);
+
+  const browseRevision = useRef(status?.libraryUpdatedAt);
+  useEffect(() => {
+    const previous = browseRevision.current;
+    browseRevision.current = status?.libraryUpdatedAt;
+    if (
+      previous &&
+      previous !== status?.libraryUpdatedAt &&
+      browseSnapshot.current
+    )
+      fetchPage(1, browseGeneration.current, true);
+  }, [status?.libraryUpdatedAt, fetchPage]);
 
   useEffect(() => {
     if (!catalogGrid) return;
@@ -1170,7 +1171,10 @@ function App() {
           saved && !saved.completed ? saved.position : 0,
         );
       } catch (cause) {
-        if (!controller.signal.aborted) setPlayerError(message(cause));
+        if (!controller.signal.aborted) {
+          setPlayerError(message(cause));
+          setPlayerRetrying(false);
+        }
       }
     })();
     return () => controller.abort();
@@ -1240,49 +1244,6 @@ function App() {
     () => categories.filter((value) => value.kind === tab),
     [categories, tab],
   );
-  useEffect(() => {
-    const target = loadSentinel;
-    if (
-      !target ||
-      discoveryContext ||
-      searchContext ||
-      settingsOpen ||
-      browseLoading ||
-      browseError
-    )
-      return;
-    const hasNext = tab === "live" ? items.length > visibleCount : hasMore;
-    if (!hasNext) return;
-    let active = true;
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (!active || !entry.isIntersecting) return;
-        if (tab === "live")
-          setVisibleCount((count) => Math.min(count + 72, items.length));
-        else fetchPage(browsePage + 1, browseGeneration.current, 2);
-      },
-      { rootMargin: "900px 0px" },
-    );
-    observer.observe(target);
-    return () => {
-      active = false;
-      observer.disconnect();
-    };
-  }, [
-    loadSentinel,
-    browseError,
-    browseLoading,
-    browsePage,
-    discoveryContext,
-    searchContext,
-    settingsOpen,
-    fetchPage,
-    hasMore,
-    items.length,
-    selectedId,
-    tab,
-    visibleCount,
-  ]);
   const openTitle = (item: Item, element?: HTMLButtonElement) => {
     cancelPlaybackIntent();
     if (playerOpen && item.id === playback?.title.id) {
@@ -1398,14 +1359,16 @@ function App() {
                 onPlay={requestPlayback}
               />
             ) : detailError ? (
-              <div className="inline-detail-state" role="alert">
-                <h2>Couldn’t open this title</h2>
-                <p>{detailError}</p>
-              </div>
+              <AnimatedAlert title="Couldn’t open this title">
+                {detailError}
+              </AnimatedAlert>
             ) : (
-              <div className="inline-detail-state inline-loading" role="status">
+              <div
+                className="inline-detail-state inline-loading"
+                role="status"
+                aria-label="Opening title"
+              >
                 <Spinner size="medium" className="app-spinner" />
-                Opening title…
               </div>
             )}
           </motion.section>
@@ -1516,22 +1479,34 @@ function App() {
               {playerOpen && !playback && (
                 <div
                   className="player-page-state"
-                  role={playerError || detailError ? "alert" : "status"}
+                  role={
+                    playerError || detailError || playerRetrying
+                      ? undefined
+                      : "status"
+                  }
                 >
-                  {playerError || detailError ? (
-                    <>
-                      <h2>Couldn’t open the player</h2>
-                      <p>{playerError || detailError}</p>
-                      <Button
+                  {playerError || detailError || playerRetrying ? (
+                    <AnimatedAlert title="Couldn’t open the player">
+                      <p>
+                        {playerError ||
+                          detailError ||
+                          playerRetryMessage.current}
+                      </p>
+                      <LoadingButton
+                        loading={playerRetrying}
+                        loadingLabel="Retrying…"
                         onClick={() => {
+                          playerRetryMessage.current =
+                            playerError || detailError;
+                          setPlayerRetrying(true);
                           setPlayerError("");
                           setDetailError("");
                           setPlayerRetry((value) => value + 1);
                         }}
                       >
                         Try again
-                      </Button>
-                    </>
+                      </LoadingButton>
+                    </AnimatedAlert>
                   ) : status?.configured === false || !selectedId ? (
                     <>
                       <h2>
@@ -1555,15 +1530,33 @@ function App() {
                   ) : (
                     <>
                       <Spinner size="medium" className="app-spinner" />
-                      <p>Opening player…</p>
+                      <span className="sr-only">Opening player…</span>
                     </>
                   )}
                 </div>
               )}
             </section>
+            {discoveryContext &&
+              status?.configured === false &&
+              !playerOpen && (
+                <div className="mb-6">
+                  <AnimatedAlert variant="info">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <span>Connect your provider to start watching.</span>
+                      <Button
+                        size="sm"
+                        onClick={() => navigateSection("settings")}
+                      >
+                        Connect provider
+                      </Button>
+                    </div>
+                  </AnimatedAlert>
+                </div>
+              )}
             {discoveryContext && (
               <Dashboard
                 key={status?.preferencesUpdatedAt || "default"}
+                refreshRevision={status?.libraryUpdatedAt}
                 playbackActive={playerOpen}
                 entries={visibleHistory}
                 persistent={watchHistory.persistent}
@@ -1586,11 +1579,22 @@ function App() {
               />
             )}
             {settingsOpen && (
-              <Suspense fallback={<Skeleton className="h-48 w-full" />}>
+              <Suspense
+                fallback={
+                  <div role="status" aria-label="Loading settings">
+                    <Skeleton className="h-48 w-full" />
+                  </div>
+                }
+              >
                 <SettingsPage
                   status={status}
                   statusError={statusError}
                   onRefresh={forceRefresh}
+                  onSaved={() => {
+                    void request<Status>("/api/status")
+                      .then(setStatus)
+                      .catch(() => {});
+                  }}
                 />
               </Suspense>
             )}
@@ -1667,22 +1671,16 @@ function App() {
                       <h2>Provider not configured</h2>
                     </div>
                   ) : error ? (
-                    <div className="state-card state-block" role="alert">
-                      <h2>Couldn’t load the library</h2>
+                    <AnimatedAlert title="Couldn’t load the library">
                       <p>{error}</p>
-                      <Button
-                        className="button-primary"
-                        onClick={() => window.location.reload()}
-                      >
+                      <LoadingButton onClick={() => window.location.reload()}>
                         Try again
-                      </Button>
-                    </div>
+                      </LoadingButton>
+                    </AnimatedAlert>
                   ) : (
                     <>
                       {status?.error && (
-                        <div className="notice" role="alert">
-                          {status.error}
-                        </div>
+                        <AnimatedAlert>{status.error}</AnimatedAlert>
                       )}
                       <div className="listing-summary">
                         <h2 className="current-listing-heading">
@@ -1831,36 +1829,39 @@ function App() {
                           </div>
                         )
                       )}
-                      {!browseLoading && !browseError && items.length === 0 && (
-                        <div className="empty-state" role="status">
-                          <h3>
-                            {tab !== "live" && hasMore
-                              ? `No ${tab === "movie" ? "movies" : "shows"} loaded`
-                              : search
+                      {!browseLoading &&
+                        !browseError &&
+                        !hasMore &&
+                        items.length === 0 && (
+                          <div className="empty-state" role="status">
+                            <h3>
+                              {search
                                 ? "No matches found"
                                 : tab === "live"
                                   ? "No channels yet"
                                   : "No titles in this category"}
-                          </h3>
-                          {(search.trim() || category !== "*") && (
-                            <Button
-                              variant="secondary"
-                              onClick={() =>
-                                selectCategory(tab, "*", {
-                                  retainPlayback: true,
-                                  searchView: searchContext,
-                                })
-                              }
-                            >
-                              Clear filters
-                            </Button>
-                          )}
-                        </div>
-                      )}
+                            </h3>
+                            {(search.trim() || category !== "*") && (
+                              <Button
+                                variant="secondary"
+                                onClick={() =>
+                                  selectCategory(tab, "*", {
+                                    retainPlayback: true,
+                                    searchView: searchContext,
+                                  })
+                                }
+                              >
+                                Clear filters
+                              </Button>
+                            )}
+                          </div>
+                        )}
                       {browseError && (
-                        <div className="page-error" role="alert">
+                        <AnimatedAlert>
                           <span>{browseError}</span>
-                          <Button
+                          <LoadingButton
+                            loading={browseLoading}
+                            loadingLabel="Retrying…"
                             onClick={() =>
                               fetchPage(
                                 browsePage + 1,
@@ -1869,19 +1870,43 @@ function App() {
                             }
                           >
                             Retry page
-                          </Button>
-                        </div>
+                          </LoadingButton>
+                        </AnimatedAlert>
                       )}
                       {(browseLoading ||
                         (tab === "live" && items.length > visibleCount) ||
                         (tab !== "live" && hasMore && !browseError)) && (
-                        <div ref={setLoadSentinel} className="auto-loader">
-                          {browseLoading && (
-                            <span role="status" aria-label="Loading">
-                              <Spinner size="small" className="app-spinner" />
-                            </span>
-                          )}
-                        </div>
+                        <InfiniteScroll
+                          isLoading={browseLoading}
+                          hasMore={
+                            !discoveryContext &&
+                            !searchContext &&
+                            !settingsOpen &&
+                            !browseError &&
+                            (tab === "live"
+                              ? items.length > visibleCount
+                              : hasMore)
+                          }
+                          next={() => {
+                            if (tab === "live")
+                              setVisibleCount((count) =>
+                                Math.min(count + 72, items.length),
+                              );
+                            else
+                              fetchPage(
+                                browsePage + 1,
+                                browseGeneration.current,
+                              );
+                          }}
+                        >
+                          <div className="auto-loader">
+                            {browseLoading && (
+                              <span role="status" aria-label="Loading">
+                                <Spinner size="small" className="app-spinner" />
+                              </span>
+                            )}
+                          </div>
+                        </InfiniteScroll>
                       )}
                     </>
                   )}
@@ -1889,6 +1914,16 @@ function App() {
               </div>
             )}
           </main>
+        </div>
+        <div className="discovery-history-undo">
+          <UndoPill
+            resetKey={watchHistory.pendingUndo?.id}
+            open={watchHistory.pendingUndo !== null}
+            label={watchHistory.pendingUndo?.label}
+            duration={8}
+            onUndo={watchHistory.undoRemoval}
+            onExpire={watchHistory.dismissUndo}
+          />
         </div>
       </div>
     </MotionConfig>
@@ -1935,10 +1970,7 @@ function PlayerPage({
   );
   const [seasonOptions, setSeasonOptions] = useState<number[]>([]);
   const episodeCache = useRef(
-    new Map<
-      string,
-      { items: Item[]; seasons?: number[]; season?: number; at: number }
-    >(),
+    new Map<string, { items: Item[]; seasons?: number[]; season?: number }>(),
   );
   const episodeSelection = useRef({ season, episode });
   episodeSelection.current = { season, episode };
@@ -1948,9 +1980,7 @@ function PlayerPage({
   useEffect(() => {
     if (item.kind !== "series") return;
     const controller = new AbortController();
-    setEpisodesError("");
     setEpisodesLoading(true);
-    setEpisode(null);
     const key = `${item.id}:${refreshRevision}:${requestedSeason ?? "first"}`;
     const apply = (result: {
       items: Item[];
@@ -1958,6 +1988,7 @@ function PlayerPage({
       season?: number;
     }) => {
       if (!controller.signal.aborted) {
+        setEpisodesError("");
         setEpisodes(result.items);
         setSeasonOptions(
           result.seasons ??
@@ -1978,30 +2009,36 @@ function PlayerPage({
       }
     };
     const cached = episodeCache.current.get(key);
-    if (cached && Date.now() - cached.at < 60000) {
-      apply(cached);
-      return () => controller.abort();
-    }
-    void request<{ items: Item[]; seasons?: number[]; season?: number }>(
-      `/api/series/${encodeURIComponent(item.id)}/episodes?season=${requestedSeason ?? "first"}`,
-      { signal: controller.signal },
-    )
-      .then((result) => {
+    if (cached) apply(cached);
+    void (async () => {
+      const deadline = Date.now() + 180000;
+      for (;;) {
+        const result = await request<{
+          items: Item[];
+          seasons?: number[];
+          season?: number;
+          refreshing?: boolean;
+        }>(
+          `/api/series/${encodeURIComponent(item.id)}/episodes?season=${requestedSeason ?? "first"}`,
+          { signal: controller.signal },
+        );
         if (controller.signal.aborted) return;
-        episodeCache.current.set(key, { ...result, at: Date.now() });
+        episodeCache.current.set(key, result);
         if (result.season !== undefined)
           episodeCache.current.set(
             `${item.id}:${refreshRevision}:${result.season}`,
-            { ...result, at: Date.now() },
+            result,
           );
         apply(result);
-      })
-      .catch((cause) => {
-        if (!controller.signal.aborted) {
-          setEpisodesError(message(cause));
-          setEpisodesLoading(false);
-        }
-      });
+        if (!result.refreshing || Date.now() >= deadline) return;
+        await waitForRefresh(controller.signal);
+      }
+    })().catch((cause) => {
+      if (!controller.signal.aborted) {
+        setEpisodesError(message(cause));
+        setEpisodesLoading(false);
+      }
+    });
     return () => {
       controller.abort();
     };
@@ -2089,7 +2126,8 @@ function PlayerPage({
                     .filter(Boolean)
                     .join(" · ")}
               <Button
-                variant="ghost"
+                variant="link"
+                size="xs"
                 className="watch-details-link"
                 onClick={onDetails}
               >
@@ -2107,17 +2145,17 @@ function PlayerPage({
             </p>
           )}
           {!compact && (
-            <Button
+            <PlayButton
               className="hero-play"
+              size="lg"
               disabled={item.kind === "series" && !episode}
               onClick={() => {
                 const target = item.kind === "series" ? episode : item;
                 if (target) onPlay(target, item);
               }}
             >
-              <Play size={17} fill="currentColor" />{" "}
-              {item.kind === "series" ? "Play episode" : "Play"}
-            </Button>
+              Play
+            </PlayButton>
           )}
         </div>
         {item.kind === "live" && (
@@ -2211,18 +2249,27 @@ function PlayerPage({
               </Select>
             )}
           </div>
-          {episodesLoading ? (
-            <p role="status" className="inline-loading">
-              <Spinner size="small" className="app-spinner" />
-              Loading episodes…
-            </p>
-          ) : episodesError ? (
-            <div role="alert" className="inline-error episode-error">
-              <span>{episodesError}</span>
-              <Button onClick={() => setEpisodeRetry((value) => value + 1)}>
-                Retry episodes
-              </Button>
+          {episodesLoading && !shownEpisodes.length && !episodesError ? (
+            <div
+              className="episode-list"
+              role="status"
+              aria-label="Loading episodes"
+            >
+              {Array.from({ length: 3 }, (_, index) => (
+                <Skeleton key={index} className="h-19 w-full" />
+              ))}
             </div>
+          ) : episodesError && !shownEpisodes.length ? (
+            <AnimatedAlert>
+              <span>{episodesError}</span>
+              <LoadingButton
+                loading={episodesLoading}
+                loadingLabel="Retrying…"
+                onClick={() => setEpisodeRetry((value) => value + 1)}
+              >
+                Retry episodes
+              </LoadingButton>
+            </AnimatedAlert>
           ) : shownEpisodes.length ? (
             <div className="episode-list">
               {shownEpisodes.map((value) => (
@@ -2357,6 +2404,8 @@ function PlaybackPlayer({
   saveProgressRef.current = saveProgress;
   const [playbackUrl, setPlaybackUrl] = useState("");
   const [error, setError] = useState("");
+  const [retrying, setRetrying] = useState(false);
+  const retryMessage = useRef("");
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
   const [position, setPosition] = useState(0);
@@ -2468,6 +2517,7 @@ function PlaybackPlayer({
             return;
           }
           currentId = value.id;
+          setRetrying(false);
           sessionId.current = value.id;
           setSession(value);
           pendingPlayUrlRef.current = value.url;
@@ -2540,14 +2590,15 @@ function PlaybackPlayer({
         })
         .catch((cause) => {
           postDone = true;
-          if (alive)
+          if (alive) {
+            setRetrying(false);
             setError(
               cause instanceof ApiError &&
                 (cause.status === 409 || cause.code === "capacity")
                 ? noRoom
                 : message(cause),
             );
-          else finishTransition();
+          } else finishTransition();
         });
     });
     const onPageHide = () => stop(true);
@@ -2995,14 +3046,14 @@ function PlaybackPlayer({
             <div className="video-overlay" role="status">
               <div className="playback-ended">
                 <p>Playback ended</p>
-                <Button
+                <PlayButton
                   onClick={() => {
                     playbackStart.current = 0;
                     setPlayAttempt((value) => value + 1);
                   }}
                 >
-                  <Play size={17} fill="currentColor" /> Play again
-                </Button>
+                  Play again
+                </PlayButton>
               </div>
             </div>
           )}
@@ -3026,13 +3077,21 @@ function PlaybackPlayer({
             onFullscreen={() => void enterFullscreen()}
           />
         </div>
-        {error && (
-          <div className="player-error" role="alert">
-            <span>{error}</span>
-            <Button onClick={() => setPlayAttempt((value) => value + 1)}>
+        {(error || retrying) && (
+          <AnimatedAlert className="mt-3">
+            <span>{error || retryMessage.current}</span>
+            <LoadingButton
+              loading={retrying}
+              loadingLabel="Retrying…"
+              onClick={() => {
+                retryMessage.current = error;
+                setRetrying(true);
+                setPlayAttempt((value) => value + 1);
+              }}
+            >
               Try again
-            </Button>
-          </div>
+            </LoadingButton>
+          </AnimatedAlert>
         )}
       </div>
     </motion.section>

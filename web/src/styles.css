@@ -63,19 +63,16 @@ body {
   min-height: 100vh;
   background: #0c0d10;
 }
-button,
-input,
-select {
-  font: inherit;
-}
 button {
   cursor: pointer;
 }
 button:disabled {
   cursor: not-allowed;
 }
-button:focus-visible,
-input:focus-visible,
+button:not([data-slot="button"]):not(
+    [data-slot="accordion-trigger"]
+  ):focus-visible,
+input:not([data-slot="input"]):focus-visible,
 select:focus-visible,
 [role="option"]:focus-visible {
   outline: 2px solid var(--ring);
@@ -164,17 +161,14 @@ p {
   min-width: 0;
   overflow-x: auto;
 }
-.section-tabs .section-tab::after {
+.section-tab-indicator {
   position: absolute;
   right: 14px;
   bottom: 0;
   left: 14px;
   height: 2px;
-  content: "";
-  background: transparent;
-}
-.section-tabs .section-tab.active::after {
   background: var(--primary);
+  pointer-events: none;
 }
 .library-vod {
   margin-top: -12px;
@@ -216,36 +210,25 @@ p {
 }
 .vod-type-tabs {
   flex: none;
-  gap: 4px;
-  padding: 5px;
-  border: 1px solid #ffffff0d;
-  border-radius: 18px;
-  background: #17191e;
+  gap: 28px;
 }
 .vod-type-tabs .section-tab {
-  min-width: 128px;
   min-height: 44px;
-  padding: 0 24px;
-  border: 1px solid transparent;
-  border-radius: 12px;
-  background: transparent;
+  padding: 0;
   color: #92949f;
   font-size: 21px;
   font-weight: 550;
   letter-spacing: -0.035em;
-  transition:
-    color 160ms ease,
-    background 160ms ease,
-    border-color 160ms ease;
 }
 .vod-type-tabs .section-tab:hover {
   color: #f5f5f7;
 }
 .vod-type-tabs .section-tab[data-state="active"] {
-  border-color: #ffffff12;
-  background: #2d3038;
   color: #fff;
-  box-shadow: 0 2px 5px #0003;
+}
+.vod-type-tabs .section-tab-indicator {
+  right: 0;
+  left: 0;
 }
 .vod-type-tabs .section-tab:focus-visible {
   outline-color: #ffffffa6;
@@ -634,13 +617,6 @@ p {
   place-items: center;
   min-height: 86px;
 }
-.page-error button,
-.inline-error button,
-.player-error button {
-  border: 1px solid #4a4a52;
-  background: #24252c;
-  color: #fff;
-}
 .app-spinner {
   color: #d9383f;
 }
@@ -724,18 +700,7 @@ p {
   line-height: 1.7;
 }
 .hero-play {
-  min-width: 132px;
-  height: 44px;
   margin-top: 19px;
-  border-radius: 10px;
-  background: #fff;
-  color: #111;
-  font-weight: 700;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
-}
-.hero-play:hover {
-  background: var(--primary);
-  color: var(--primary-foreground);
 }
 .selected-episode {
   margin: 16px 0 0;
@@ -953,10 +918,6 @@ p {
 }
 .playback-ended {
   text-align: center;
-}
-.playback-ended button {
-  background: #fff;
-  color: #111;
 }
 .playback-loading {
   position: absolute;
@@ -1333,14 +1294,10 @@ p {
     margin-left: auto;
   }
   .vod-type-tabs {
-    border-radius: 16px;
+    gap: 24px;
   }
   .vod-type-tabs .section-tab {
-    min-width: 108px;
-    min-height: 40px;
-    padding-inline: 20px;
     font-size: 20px;
-    border-radius: 10px;
   }
   .title-hero {
     grid-template-columns: 130px minmax(0, 1fr);
@@ -1410,8 +1367,6 @@ p {
   }
   .hero-play {
     width: 100%;
-    min-width: 0;
-    height: 38px;
     margin-top: 10px;
   }
   .episode-browser {
@@ -1491,11 +1446,6 @@ p {
   margin-top: 6px;
   color: #b5b5bf;
   font-size: 15px;
-}
-.settings-page button {
-  gap: 8px;
-  border-radius: 5px;
-  min-height: 40px;
 }
 .settings-connection {
   display: flex;
@@ -1864,16 +1814,7 @@ p {
   -webkit-box-orient: vertical;
 }
 .watch-details-link {
-  height: auto;
-  min-height: 24px;
-  margin: 0 0 0 10px;
-  padding-inline: 0;
-  color: #a99fbf;
-  font-size: 12px;
-}
-.watch-details-link:hover {
-  color: #ece4ff;
-  background: transparent;
+  margin-left: 10px;
 }
 .watch-sidebar .episode-browser {
   margin-top: 22px;
@@ -2131,11 +2072,11 @@ p {
   min-height: 40dvh;
   text-align: center;
 }
-.player-page-state h2,
-.player-page-state p {
+.player-page-state > h2,
+.player-page-state > p {
   margin: 0;
 }
-.player-page-state p {
+.player-page-state > p {
   color: #b3b3be;
 }
 @media (max-width: 1100px) and (min-width: 821px) {
@@ -2199,4 +2140,26 @@ p {
   align-items: center;
   flex-wrap: wrap;
   gap: 2px 0;
+}
+
+/* Radix measures the content height for shadcn/ui's accordion reveal. */
+@theme {
+  --animate-accordion-down: accordion-down 0.2s ease-out;
+  --animate-accordion-up: accordion-up 0.2s ease-out;
+  @keyframes accordion-down {
+    from {
+      height: 0;
+    }
+    to {
+      height: var(--radix-accordion-content-height);
+    }
+  }
+  @keyframes accordion-up {
+    from {
+      height: var(--radix-accordion-content-height);
+    }
+    to {
+      height: 0;
+    }
+  }
 }

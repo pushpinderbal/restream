@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { motion, useReducedMotion } from "motion/react";
 import {
   ArrowRight,
   ChevronLeft,
   ChevronRight,
   Clapperboard,
   Film,
-  Info,
   MonitorPlay,
   Play,
   X,
@@ -14,13 +14,18 @@ import {
   ApiError,
   request,
   type Discovery,
+  type DiscoveryTitle,
   type Item,
   type Program,
 } from "../api";
 import { isContinueWatching, type WatchHistoryEntry } from "../watch-history";
 import { Artwork } from "./artwork";
 import { Button } from "./ui/button";
+import { Skeleton } from "./ui/skeleton";
 import { SectionTabs } from "./ui/section-tabs";
+import { Spinner } from "./spectrumui/spinner-dependencies";
+import { AnimatedAlert } from "./spectrumui/animated-alert";
+import { DiscoveryHero } from "./discovery-hero";
 import "./discovery-dashboard.css";
 
 type LibraryKind = "live" | "movie" | "series";
@@ -48,16 +53,37 @@ function byEpisode(a: Item, b: Item) {
   );
 }
 
+function releaseLabel(title: DiscoveryTitle) {
+  if (
+    title.releaseDate &&
+    /^\d{4}-(0[1-9]|1[0-2])(?:-|$)/.test(title.releaseDate)
+  ) {
+    return new Date(
+      `${title.releaseDate.slice(0, 7)}-01T00:00:00Z`,
+    ).toLocaleDateString(undefined, {
+      month: "short",
+      year: "numeric",
+      timeZone: "UTC",
+    });
+  }
+  return title.year ? String(title.year) : "";
+}
+
 function ContentRail({
   label,
   className,
+  contentKey,
+  overlay = false,
   children,
 }: {
   label: string;
   className: string;
+  contentKey?: string;
+  overlay?: boolean;
   children: ReactNode;
 }) {
   const rail = useRef<HTMLDivElement>(null);
+  const reducedMotion = useReducedMotion();
   const [scrollable, setScrollable] = useState({
     previous: false,
     next: false,
@@ -95,52 +121,60 @@ function ContentRail({
       });
   };
   return (
-    <div className="discovery-rail-shell">
-      <div
+    <div
+      className={`discovery-rail-shell${overlay ? " discovery-rail-overlay" : ""}`}
+    >
+      <motion.div
+        key={contentKey}
         ref={rail}
         className={className}
         role="group"
         aria-label={label}
         tabIndex={0}
+        initial={contentKey && !reducedMotion ? { opacity: 0 } : false}
+        animate={{ opacity: 1 }}
+        transition={{ duration: reducedMotion ? 0 : 0.18 }}
       >
         {children}
-      </div>
+      </motion.div>
       {(scrollable.previous || scrollable.next) && (
         <div
           className="discovery-rail-controls"
           role="group"
           aria-label={`${label} scrolling`}
         >
-          <Button
-            variant="ghost"
-            size="icon"
-            className="discovery-rail-control discovery-rail-previous"
-            aria-label={`Scroll ${label.toLowerCase()} left`}
-            disabled={!scrollable.previous}
-            onClick={() => scroll(-1)}
-          >
-            <ChevronLeft
-              className="size-7"
-              size={26}
-              strokeWidth={1.5}
-              aria-hidden="true"
-            />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="discovery-rail-control discovery-rail-next"
-            aria-label={`Scroll ${label.toLowerCase()} right`}
-            disabled={!scrollable.next}
-            onClick={() => scroll(1)}
-          >
-            <ChevronRight
-              className="size-7"
-              size={26}
-              strokeWidth={1.5}
-              aria-hidden="true"
-            />
-          </Button>
+          {scrollable.previous && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="discovery-rail-control discovery-rail-previous"
+              aria-label={`Scroll ${label.toLowerCase()} left`}
+              onClick={() => scroll(-1)}
+            >
+              <ChevronLeft
+                className="size-7"
+                size={26}
+                strokeWidth={1.5}
+                aria-hidden="true"
+              />
+            </Button>
+          )}
+          {scrollable.next && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="discovery-rail-control discovery-rail-next"
+              aria-label={`Scroll ${label.toLowerCase()} right`}
+              onClick={() => scroll(1)}
+            >
+              <ChevronRight
+                className="size-7"
+                size={26}
+                strokeWidth={1.5}
+                aria-hidden="true"
+              />
+            </Button>
+          )}
         </div>
       )}
     </div>
@@ -151,6 +185,7 @@ export function Dashboard({
   entries,
   persistent,
   configured,
+  refreshRevision,
   playbackActive = false,
   liveItems,
   programs,
@@ -168,6 +203,7 @@ export function Dashboard({
   entries: WatchHistoryEntry[];
   persistent: boolean;
   configured: boolean;
+  refreshRevision?: string;
   playbackActive?: boolean;
   liveItems: Item[];
   programs: Program[];
@@ -188,9 +224,6 @@ export function Dashboard({
   const [upNext, setUpNext] = useState<NextEpisode[]>([]);
   const [opening, setOpening] = useState("");
   const [error, setError] = useState("");
-  const [discoveryKind, setDiscoveryKind] = useState<"movie" | "series">(
-    "movie",
-  );
   const [recentKind, setRecentKind] = useState<LibraryKind | "all">("all");
   const pending = useRef<AbortController | null>(null);
   const operation = useRef(0);
@@ -217,8 +250,13 @@ export function Dashboard({
     }
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let polls = 0;
+    let loading = false;
+    // Allow a final poll after the server's three-minute refresh window.
+    const deadline = Date.now() + 185_000;
     const load = async () => {
+      if (loading || document.hidden || controller.signal.aborted) return;
+      clearTimeout(timer);
+      loading = true;
       try {
         const result = await request<Discovery>("/api/discovery", {
           signal: controller.signal,
@@ -226,20 +264,32 @@ export function Dashboard({
         if (controller.signal.aborted) return;
         setDiscovery(result);
         setDiscoveryFailed(false);
-        if (result.refreshing && polls++ < 36)
-          timer = setTimeout(() => void load(), 5000);
+        if (result.refreshing && Date.now() < deadline && !document.hidden) {
+          const hasTitles =
+            result.trendingMovies.length + result.trendingSeries.length > 0;
+          timer = setTimeout(() => void load(), hasTitles ? 5000 : 2000);
+        }
       } catch {
         if (!controller.signal.aborted) setDiscoveryFailed(true);
       } finally {
+        loading = false;
         if (!controller.signal.aborted) setDiscoveryLoading(false);
       }
     };
+    const resume = () => {
+      clearTimeout(timer);
+      if (!document.hidden) void load();
+    };
     void load();
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("focus", resume);
     return () => {
       controller.abort();
       clearTimeout(timer);
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("focus", resume);
     };
-  }, [configured]);
+  }, [configured, refreshRevision]);
 
   const completedSeries = entries
     .filter((entry) => entry.title.kind === "series" && entry.completed)
@@ -357,17 +407,11 @@ export function Dashboard({
   );
   const movies = hasTrending ? trendingMovies : exploreMovies;
   const series = hasTrending ? trendingSeries : exploreSeries;
-  const displayedKind =
-    discoveryKind === "movie" && !movies.length && series.length
-      ? "series"
-      : discoveryKind === "series" && !series.length && movies.length
-        ? "movie"
-        : discoveryKind;
-  const titles = (displayedKind === "movie" ? movies : series).slice(0, 12);
-
-  useEffect(() => {
-    if (displayedKind !== discoveryKind) setDiscoveryKind(displayedKind);
-  }, [displayedKind, discoveryKind]);
+  const titles: DiscoveryTitle[] = [];
+  for (let index = 0; index < Math.max(movies.length, series.length); index++) {
+    if (movies[index]) titles.push(movies[index]);
+    if (series[index]) titles.push(series[index]);
+  }
 
   const featureCandidates = [
     ...trendingMovies,
@@ -375,12 +419,6 @@ export function Dashboard({
     ...exploreMovies,
     ...exploreSeries,
   ];
-  const feature =
-    featureCandidates.find((title) => title.backdrop) || featureCandidates[0];
-  const featureArtwork =
-    feature?.backdrop || feature?.poster || feature?.item.image;
-  const hasTMDB = featureCandidates.some((title) => title.tmdbId !== undefined);
-
   const run = async (key: string, action: () => Promise<void>) => {
     const id = ++operation.current;
     setOpening(key);
@@ -472,116 +510,43 @@ export function Dashboard({
       {!playbackActive && (
         <>
           {!configured && (
-            <div className="notice" role="status">
+            <AnimatedAlert variant="info">
               Provider not configured
-            </div>
+            </AnimatedAlert>
           )}
-          {error && (
-            <div className="notice" role="alert">
-              {error}
-            </div>
-          )}
+          {error && <AnimatedAlert variant="error">{error}</AnimatedAlert>}
           {discoveryFailed && (
-            <p className="discovery-fetch-note" role="status">
+            <AnimatedAlert variant="warning" className="discovery-fetch-note">
               Discovery unavailable
-            </p>
+            </AnimatedAlert>
           )}
 
-          <div className="discovery-lead">
-            {featureArtwork && (
-              <div className="discovery-lead-art" aria-hidden="true">
-                <img
-                  key={featureArtwork}
-                  src={featureArtwork}
-                  alt=""
-                  decoding="async"
-                  onError={(event) => {
-                    event.currentTarget.style.visibility = "hidden";
-                  }}
-                />
-              </div>
-            )}
-            {feature ? (
-              <section
-                className={`discovery-feature${feature.backdrop ? " has-backdrop" : ""}`}
-                aria-label={`Featured ${feature.name}`}
-              >
-                <div className="discovery-feature-copy">
-                  <span className="discovery-eyebrow">
-                    Featured in your library
-                  </span>
-                  <h2>{feature.name}</h2>
-                  <div className="discovery-feature-meta">
-                    <span>
-                      {feature.item.kind === "series" ? "Show" : "Movie"}
-                    </span>
-                    {!!feature.year && <span>{feature.year}</span>}
-                    {!!feature.rating && (
-                      <span>{feature.rating.toFixed(1)} / 10</span>
-                    )}
-                    {!!feature.genres?.length && (
-                      <span>{feature.genres.slice(0, 2).join(" · ")}</span>
-                    )}
-                  </div>
-                  {(feature.overview || feature.item.description) && (
-                    <p>{feature.overview || feature.item.description}</p>
-                  )}
-                  <div className="discovery-feature-actions">
-                    <Button
-                      size="lg"
-                      aria-label={
-                        feature.item.kind === "series"
-                          ? `View episodes of ${feature.name}`
-                          : `Play ${feature.name}`
-                      }
-                      disabled={!configured || opening === feature.item.id}
-                      onClick={() =>
-                        void run(feature.item.id, () =>
-                          feature.item.kind === "series"
-                            ? onOpenTitle(feature.item)
-                            : onPlay(feature.item),
-                        )
-                      }
-                    >
-                      {feature.item.kind === "series" ? (
-                        <Clapperboard size={17} aria-hidden="true" />
-                      ) : (
-                        <Play
-                          size={17}
-                          fill="currentColor"
-                          aria-hidden="true"
-                        />
-                      )}
-                      {opening === feature.item.id
-                        ? "Opening…"
-                        : feature.item.kind === "series"
-                          ? "View episodes"
-                          : "Play movie"}
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      size="lg"
-                      aria-label={`Open ${feature.name}`}
-                      onClick={() =>
-                        void run(feature.item.id, () =>
-                          onOpenTitle(feature.item),
-                        )
-                      }
-                      disabled={!configured || opening === feature.item.id}
-                    >
-                      <Info size={17} aria-hidden="true" /> Details
-                    </Button>
-                  </div>
-                </div>
-              </section>
-            ) : discoveryLoading ? (
+          <DiscoveryHero
+            titles={titles}
+            history={entries}
+            configured={configured}
+            opening={opening}
+            onPlay={(item) => void run(item.id, () => onPlay(item))}
+            onResume={(entry) =>
+              void run(entry.title.id, () => onResume(entry))
+            }
+          >
+            {discoveryLoading ? (
               <div
                 className="discovery-feature discovery-feature-loading"
                 role="status"
                 aria-label="Loading discovery"
               >
-                <span className="artwork-skeleton" />
-                <p>Loading…</p>
+                <div className="discovery-feature-copy" aria-hidden="true">
+                  <Skeleton className="mb-5 h-3 w-44" />
+                  <Skeleton className="mb-5 h-12 w-4/5 md:h-16" />
+                  <Skeleton className="mb-6 h-4 w-40" />
+                  <Skeleton className="mb-2 h-4 w-full" />
+                  <Skeleton className="h-4 w-3/4" />
+                  <div className="discovery-feature-actions">
+                    <Skeleton className="h-12 w-32" />
+                  </div>
+                </div>
               </div>
             ) : (
               <section className="discovery-feature discovery-feature-welcome">
@@ -603,7 +568,7 @@ export function Dashboard({
                 </div>
               </section>
             )}
-          </div>
+          </DiscoveryHero>
 
           {upNext.length > 0 && (
             <section className="discovery-section" aria-label="Up next">
@@ -747,52 +712,32 @@ export function Dashboard({
                     : "Explore"}
               </h2>
             </div>
-            <SectionTabs
-              label="Discovery type"
-              value={displayedKind}
-              className="discovery-type-tabs"
-              onValueChange={(value) => {
-                if (value === "movie" || value === "series")
-                  setDiscoveryKind(value);
-              }}
-              items={[
-                {
-                  value: "movie",
-                  label: "Movies",
-                  icon: Film,
-                  disabled: !movies.length,
-                },
-                {
-                  value: "series",
-                  label: "Shows",
-                  icon: Clapperboard,
-                  disabled: !series.length,
-                },
-              ]}
-            />
           </div>
           {playbackActive && (
             <>
               {!configured && (
-                <div className="notice" role="status">
+                <AnimatedAlert variant="info">
                   Provider not configured
-                </div>
+                </AnimatedAlert>
               )}
-              {error && (
-                <div className="notice" role="alert">
-                  {error}
-                </div>
-              )}
+              {error && <AnimatedAlert variant="error">{error}</AnimatedAlert>}
               {discoveryFailed && (
-                <p className="discovery-fetch-note" role="status">
+                <AnimatedAlert
+                  variant="warning"
+                  className="discovery-fetch-note"
+                >
                   Discovery unavailable
-                </p>
+                </AnimatedAlert>
               )}
             </>
           )}
           {titles.length > 0 ? (
-            <ContentRail label="Titles" className="discovery-poster-grid">
-              {titles.map((title, index) => (
+            <ContentRail
+              label="Titles"
+              className="discovery-poster-grid"
+              overlay
+            >
+              {titles.map((title) => (
                 <button
                   key={title.item.id}
                   type="button"
@@ -812,27 +757,15 @@ export function Dashboard({
                           : title.poster || title.item.image,
                       }}
                     />
-                    {hasTrending && (
-                      <span className="discovery-rank">
-                        {String(index + 1).padStart(2, "0")}
-                      </span>
-                    )}
-                    <span className="discovery-poster-action">
-                      <Info size={16} aria-hidden="true" />
-                    </span>
                   </div>
-                  <h3>{title.name}</h3>
-                  {(!playbackActive || title.year) && (
-                    <p>
-                      {[
-                        title.year,
-                        !playbackActive &&
-                          (title.item.kind === "series" ? "Show" : "Movie"),
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    </p>
-                  )}
+                  <p>
+                    {[
+                      releaseLabel(title),
+                      title.item.kind === "series" ? "Show" : "Movie",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </p>
                 </button>
               ))}
             </ContentRail>
@@ -843,8 +776,11 @@ export function Dashboard({
               aria-label="Loading available titles"
             >
               {Array.from({ length: 6 }, (_, index) => (
-                <div key={index} className="discovery-poster-art">
-                  <span className="artwork-skeleton" />
+                <div key={index} aria-hidden="true">
+                  <div className="discovery-poster-art">
+                    <Skeleton className="h-full w-full" />
+                  </div>
+                  <Skeleton className="mt-2.5 h-3 w-3/4" />
                 </div>
               ))}
             </div>
@@ -853,15 +789,6 @@ export function Dashboard({
               {configured ? "No titles" : "Provider not configured"}
             </p>
           )}
-          <button
-            type="button"
-            className="discovery-text-link"
-            onClick={() => onBrowse(displayedKind)}
-            disabled={!configured}
-          >
-            All {displayedKind === "movie" ? "movies" : "shows"}{" "}
-            <ArrowRight size={15} aria-hidden="true" />
-          </button>
         </section>
       )}
 
@@ -919,9 +846,12 @@ export function Dashboard({
                 </Button>
               </div>
               {!persistent && (
-                <p className="discovery-history-note" role="status">
+                <AnimatedAlert
+                  variant="warning"
+                  className="discovery-history-note"
+                >
                   History isn’t saved.
-                </p>
+                </AnimatedAlert>
               )}
               <SectionTabs
                 label="History type"
@@ -948,6 +878,7 @@ export function Dashboard({
               <ContentRail
                 label="Recently played"
                 className="discovery-recent-grid"
+                contentKey={recentKind}
               >
                 {recent.map((entry) => (
                   <div
@@ -985,8 +916,12 @@ export function Dashboard({
                           )}
                         </time>
                         {opening === entry.title.id && (
-                          <span className="discovery-opening" role="status">
-                            Opening…
+                          <span
+                            className="discovery-opening"
+                            role="status"
+                            aria-label="Opening title"
+                          >
+                            <Spinner size="small" className="app-spinner" />
                           </span>
                         )}
                       </div>
@@ -1017,22 +952,6 @@ export function Dashboard({
             </section>
           )}
         </div>
-      )}
-      {hasTMDB && (
-        <footer className="discovery-attribution">
-          <a
-            href="https://www.themoviedb.org/"
-            target="_blank"
-            rel="noreferrer"
-          >
-            <img src="/tmdb-logo.svg" alt="TMDB" width={55} height={24} />
-            <span>Metadata and images by TMDB</span>
-          </a>
-          <span>
-            This product uses the TMDB API but is not endorsed or certified by
-            TMDB.
-          </span>
-        </footer>
       )}
     </div>
   );
