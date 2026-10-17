@@ -58,11 +58,12 @@ type probeResult struct {
 }
 
 type entry struct {
-	session   Session
-	item      model.Item
-	gen       *generation
-	heartbeat time.Time
-	probe     *probeResult
+	session       Session
+	item          model.Item
+	transcodeMode string
+	gen           *generation
+	heartbeat     time.Time
+	probe         *probeResult
 }
 
 type Manager struct {
@@ -137,6 +138,29 @@ func New(cfg Config, resolve Resolver) (*Manager, error) {
 	return m, nil
 }
 
+// Configure applies playback choices to future sessions without interrupting
+// existing streams. Lowering capacity prevents new sessions until space frees up.
+func (m *Manager) Configure(maxStreams int, transcodeMode string) error {
+	if maxStreams < 1 {
+		return fmt.Errorf("%w: positive stream limit required", ErrInvalid)
+	}
+	switch transcodeMode {
+	case "auto", "copy", "transcode":
+	default:
+		return fmt.Errorf("%w: transcode mode", ErrInvalid)
+	}
+	if transcodeMode != "copy" && m.encoder == "" {
+		return fmt.Errorf("ffmpeg has no supported H.264 encoder")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrNotFound
+	}
+	m.cfg.MaxStreams, m.cfg.TranscodeMode = maxStreams, transcodeMode
+	return nil
+}
+
 func (m *Manager) Start(ctx context.Context, item model.Item, start float64) (Session, error) {
 	if err := ctx.Err(); err != nil {
 		return Session{}, err
@@ -154,7 +178,7 @@ func (m *Manager) Start(ctx context.Context, item model.Item, start float64) (Se
 	}
 	m.next++
 	id := strconv.FormatUint(uint64(time.Now().UnixNano()), 36) + "-" + strconv.FormatUint(m.next, 36)
-	e := &entry{item: item, heartbeat: time.Now()}
+	e := &entry{item: item, transcodeMode: m.cfg.TranscodeMode, heartbeat: time.Now()}
 	e.session = Session{ID: id, Duration: validDuration(item.Duration)}
 	m.sessions[id] = e
 	m.launchLocked(e, start, nil)
@@ -385,8 +409,8 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 		}
 	}
 	m.update(e, g, func(s *Session) { s.Duration = duration })
-	if m.cfg.TranscodeMode != "auto" {
-		mode = m.cfg.TranscodeMode
+	if e.transcodeMode == "copy" || e.transcodeMode == "transcode" {
+		mode = e.transcodeMode
 	}
 	live := source.Live || e.item.Kind == "live"
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-readrate", "1"}

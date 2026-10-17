@@ -3,7 +3,12 @@ module github.com/pushpinderbal/restream
 go 1.27.0
 
 require (
+	github.com/alexedwards/scs/sqlite3store v0.0.0-20251002162104-209de6e426de
+	github.com/alexedwards/scs/v2 v2.9.0
+	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/dgraph-io/ristretto/v2 v2.4.2
+	github.com/go-jose/go-jose/v4 v4.1.4
+	golang.org/x/oauth2 v0.37.0
 	golang.org/x/sync v0.23.0
 	modernc.org/sqlite v1.60.0
 )

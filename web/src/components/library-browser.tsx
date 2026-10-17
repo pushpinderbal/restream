@@ -1,7 +1,9 @@
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
+import { motion, useReducedMotion } from "motion/react";
 import type { Category } from "../api";
 import { CategorySelect } from "./category-select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
+import { TabIndicator } from "./ui/tab-indicator";
 
 type LibraryTab = "movie" | "series" | "live";
 const labels = { movie: "Movies", series: "Shows", live: "Live TV" };
@@ -25,6 +27,8 @@ export function LibraryBrowser({
   onCategoryChange: (category: string) => void;
   children: ReactNode;
 }) {
+  const indicatorId = useId();
+  const reducedMotion = useReducedMotion();
   const categoryMenu = (
     <CategorySelect
       categories={categories}
@@ -59,6 +63,7 @@ export function LibraryBrowser({
             {(["movie", "series"] as const).map((value) => (
               <TabsTrigger className="section-tab" key={value} value={value}>
                 {labels[value]}
+                {tab === value && <TabIndicator id={indicatorId} />}
               </TabsTrigger>
             ))}
           </TabsList>
@@ -66,7 +71,14 @@ export function LibraryBrowser({
         </div>
       </div>
       <TabsContent value={tab} className="catalog-tab-panel">
-        {children}
+        <motion.div
+          key={tab}
+          initial={reducedMotion ? false : { opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: reducedMotion ? 0 : 0.18, ease: "easeOut" }}
+        >
+          {children}
+        </motion.div>
       </TabsContent>
     </Tabs>
   );

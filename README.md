@@ -1,14 +1,20 @@
 # Restream
 
-Restream is a web proxy for your Stalker/MAG IPTV provider. Multiple users can watch live TV, movies, and series from the same provider account in a web browser.
+Restream brings your IPTV subscription to the browser. Host it on your own computer or server to watch live TV, movies, and shows from a Stalker/MAG provider, with a programme guide, search, watch progress, and a shared library cache. Use it on desktop or mobile, with optional OIDC sign-in through your own identity provider.
 
-Each active player uses an upstream stream. Simultaneous viewing is limited by your provider's stream allocation and Restream's `MAX_STREAMS` setting. Paused players still count toward that limit.
+## Features
 
-You need your provider's portal URL and registered MAC address, plus any serial number or device IDs your provider requires.
+- 📺 **Live TV and programme guide**: browse channels and see what's on now and next.
+- 🎬 **Movies and shows**: explore searchable categories or search across your whole library.
+- ▶️ **Pick up where you left off**: Continue watching, Up next, and Recently played, with progress saved in your browser and kept separate for each signed-in account.
+- 🧭 **Discovery**: explore your library on Home, with optional TMDB Trending recommendations matched to titles your provider carries.
+- ⚡ **Shared library cache**: cached listings stay available while the server refreshes them in the background, reducing repeated requests to your provider.
+- 🔐 **Optional OIDC sign-in**: use your identity provider with viewer and administrator roles, or run without a login on your private network.
+- 📱 **Desktop and mobile**: responsive browsing, touch controls, and fullscreen playback.
 
-## Run with Docker
+## Get started
 
-Replace the example portal URL and MAC address with your provider's details:
+You'll need Docker and a Stalker/MAG IPTV subscription, including your provider's portal URL and registered MAC address. The Docker image includes everything needed to run Restream.
 
 ```sh
 docker run -d \
@@ -17,84 +23,39 @@ docker run -d \
   --stop-timeout 20 \
   -p 8080:8080 \
   -v restream-data:/data \
-  -e STALKER_PORTAL_URL='http://your-provider.example' \
-  -e STALKER_MAC='00:11:22:33:44:55' \
-  -e MAX_STREAMS=1 \
   ghcr.io/pushpinderbal/restream:latest
 ```
 
-## Or use Docker Compose
+Open [http://localhost:8080](http://localhost:8080), or `http://<server-address>:8080` from another device on your network. Choose **Account → Settings**, enter your provider's portal URL and MAC address, and select **Save changes**. If your provider requires a serial number or device IDs, add them under **Device identity**.
 
-Save this as `compose.yaml` and enter your provider's details in `environment`:
+### Docker Compose
 
-```yaml
-services:
-  restream:
-    image: ghcr.io/pushpinderbal/restream:latest
-    ports:
-      - "8080:8080"
-    environment:
-      STALKER_PORTAL_URL: "http://your-provider.example"
-      STALKER_MAC: "00:11:22:33:44:55"
-      STALKER_TIMEZONE: "UTC"
-      MAX_STREAMS: "1"
-    volumes:
-      - restream-data:/data
-    restart: unless-stopped
-    stop_grace_period: 20s
-
-volumes:
-  restream-data:
-```
-
-Start it with:
+From a clone of this repository, use the included [Compose file](compose.yaml):
 
 ```sh
 docker compose up -d
 ```
 
-Open `http://localhost:8080`, or `http://<server-address>:8080` from another device. Open a title and press **Play**. **Settings** shows server configuration and refresh status. Configure refresh timing and category rules through environment variables, then restart. Leaving playback saves progress and releases the stream.
+Connect your provider in **Account → Settings** as above. No environment file is required.
 
-**Home** opens with a featured title, discovery rows, Continue watching, Up next and Recently played. Use the icon sidebar to open **Search**, **VOD**, **Live TV**, or **Settings** through the profile icon. Search opens blank. Enter at least two characters; after a 350 ms pause, it searches Live TV, movies, and shows together and groups the results by type. Stop or browser Back restores your query and results after playback. VOD has Movies and Shows tabs that update the catalog while the controls stay in place. On mobile, the same navigation sits at the bottom. The category menu includes search to quickly find a category. Content rows have arrow controls and support swiping. History and progress stay in this browser; use **Clear history** to reset them.
+## Configuration
 
-**Trending** shows only provider-available titles. Set `TMDB_API_READ_ACCESS_TOKEN` or `TMDB_API_KEY` from your [TMDB account settings](https://www.themoviedb.org/settings/api), then restart Restream to enable it. Without a key, the dashboard shows **Explore**.
+Restream supports configuration through the UI and environment variables. Environment variables override corresponding saved settings and make those fields read-only in **Account → Settings**.
 
-Restream has no sign-in screen. Keep access private or protect it with authentication before making it available outside your network.
+See [.env.example](.env.example) for the full list and required values. Copy and adapt it to `.env` for Compose or Docker's `--env-file .env`, or set the variables directly in your environment.
 
-## Environment variables
+## Local development
 
-Pass these with Docker's `-e` option or add them to the Compose `environment` section. Defaults below are for the Docker image and apply when a setting is omitted or empty. Duration values use units such as `250ms`, `45s`, `1m`, and `24h`.
+Install [mise](https://mise.jdx.dev/getting-started.html), then run:
 
-`-` means no default is supplied.
+```sh
+mise install
+mise run dev
+```
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `STALKER_PORTAL_URL` | - | (required) Your provider's portal URL, such as `http://your-provider.example`. |
-| `STALKER_MAC` | - | (required) The MAC address registered with your provider. |
-| `STALKER_TIMEZONE` | `UTC` | Timezone used with the provider, such as `America/Toronto`. |
-| `STALKER_SERIAL_NUMBER` | - | Registered device serial number. Required only if your provider asks for it. |
-| `STALKER_DEVICE_ID` | - | Registered device ID. Required only if your provider asks for it. |
-| `STALKER_DEVICE_ID2` | - | Second registered device ID. Required only if your provider asks for it. |
-| `STALKER_USER_AGENT` | Built-in MAG user agent | Override the device identification only if your provider requires a specific value. |
-| `MAX_STREAMS` | `1` | Maximum simultaneous players. Increase only within your provider's allowance. Must be at least 1. |
-| `REFRESH_INTERVAL` | `6h` | Refresh cadence; guide and episode freshness adapt automatically. Range: `1m`–`168h`. |
-| `DASHBOARD_CATEGORIES` | - | Comma-separated category allowlist for all Dashboard sections. Empty includes all categories. |
-| `BLOCKED_CATEGORIES` | - | Comma-separated categories to hide from browsing and history and prevent playback. |
-| `STALKER_EPG_HOURS` | `6` | Hours of programme guide information to request. Range: 1–168. |
-| `STALKER_REQUEST_TIMEOUT` | `1m` | Maximum wait for a provider request. Minimum `1s`. |
-| `STALKER_REQUEST_INTERVAL` | `250ms` | Minimum delay between provider requests. Minimum `100ms`. |
-| `STALKER_MAX_RESPONSE_MB` | `64` | Maximum size of a provider response in MB. Range: 1–512. |
-| `SESSION_TTL` | `45s` | Release a stream after its browser stops checking in. Minimum `30s`. |
-| `TRANSCODE_MODE` | `auto` | `auto`: convert video when needed; `copy`: pass it through without conversion; `transcode`: always convert it. |
-| `LISTEN_ADDR` | `:8080` | Address and port inside the container. Match the container port in your Docker port mapping if changed. |
-| `DATA_DIR` | `/data` | Storage for saved library information and temporary playback files. Match your volume mount if changed. |
-| `WEB_DIR` | `/app/web` | Location of the browser interface files. Change only if you provide those files at a different location. |
-| `TMDB_API_READ_ACCESS_TOKEN` | - | Optional TMDB read token for Trending. |
-| `TMDB_API_KEY` | - | Optional TMDB v3 API key; used when no read token is set. |
+Open [http://localhost:5173](http://localhost:5173) and connect your provider in Settings. Go and UI changes reload automatically; press Ctrl+C to stop.
 
-Category lists match exact names or IDs, ignoring case; `*` matches all. Prefix with `live:`, `movie:` or `series:` to limit a rule to that section. Quote a CSV entry containing a comma. Dashboard rules affect Dashboard visibility without removing history records or changing ordinary library visibility. Configuration is environment-only; restart after changes. Previously saved UI preferences are ignored.
-
-FFmpeg and FFprobe are included in the Docker image and used automatically.
+Run `mise run test` for Go tests, `mise run test:browser` for browser workflows, or `mise run test:container` to check the packaged app using temporary containers and storage.
 
 ## License
 

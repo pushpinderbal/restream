@@ -3,7 +3,9 @@ services:
     image: ghcr.io/pushpinderbal/restream:latest
     ports:
       - "8080:8080"
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - restream-data:/data
     restart: unless-stopped

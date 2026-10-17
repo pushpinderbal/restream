@@ -7,6 +7,7 @@ import {
 } from "react";
 import { motion } from "motion/react";
 import * as Slider from "@radix-ui/react-slider";
+import { Button } from "./ui/button";
 import {
   Maximize2,
   Minimize2,
@@ -242,7 +243,9 @@ export function PlayerControls(props: Props) {
         </div>
       )}
       <div className="controls-row">
-        <button
+        <Button
+          variant="ghost"
+          size="icon"
           className="control-button primary-control"
           onClick={onPlay}
           aria-label={playing ? "Pause" : "Play"}
@@ -250,49 +253,57 @@ export function PlayerControls(props: Props) {
           disabled={busy || finished}
         >
           {playing ? (
-            <Pause size={25} strokeWidth={1.5} />
+            <Pause className="size-[25px]" size={25} strokeWidth={1.5} />
           ) : (
-            <Play size={25} strokeWidth={1.5} />
+            <Play className="size-[25px]" size={25} strokeWidth={1.5} />
           )}
-        </button>
+        </Button>
         {!live && (
           <>
-            <button
+            <Button
+              variant="ghost"
+              size="icon"
               className="control-button seek-control"
               aria-label="Back 10 seconds"
               title="Back 10 seconds (←)"
               disabled={!canSeek}
               onClick={() => onSeek(position - 10)}
             >
-              <RotateCcw size={29} strokeWidth={1.5} />
+              <RotateCcw className="size-[29px]" size={29} strokeWidth={1.5} />
               <span>10</span>
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
               className="control-button seek-control"
               aria-label="Forward 10 seconds"
               title="Forward 10 seconds (→)"
               disabled={!canSeek}
               onClick={() => onSeek(position + 10)}
             >
-              <RotateCw size={29} strokeWidth={1.5} />
+              <RotateCw className="size-[29px]" size={29} strokeWidth={1.5} />
               <span>10</span>
-            </button>
+            </Button>
           </>
         )}
-        <button
+        <Button
+          variant="ghost"
+          size="icon"
           className="control-button"
           onClick={onMute}
           aria-label={props.muted ? "Unmute" : "Mute"}
           title="Mute (M)"
         >
           {props.muted ? (
-            <VolumeX size={23} strokeWidth={1.5} />
+            <VolumeX className="size-[23px]" size={23} strokeWidth={1.5} />
           ) : (
-            <Volume2 size={23} strokeWidth={1.5} />
+            <Volume2 className="size-[23px]" size={23} strokeWidth={1.5} />
           )}
-        </button>
+        </Button>
         {live ? (
-          <button
+          <Button
+            variant="ghost"
+            size="sm"
             type="button"
             className="live-badge"
             data-behind={props.liveDelay !== null && props.liveDelay > 15}
@@ -306,24 +317,26 @@ export function PlayerControls(props: Props) {
             }
           >
             <span aria-hidden="true">●</span> LIVE
-          </button>
+          </Button>
         ) : (
           <span className="time-readout">
             {time(value)} <span>/ {time(duration)}</span>
           </span>
         )}
-        <button
+        <Button
+          variant="ghost"
+          size="icon"
           className="control-button fullscreen"
           onClick={onFullscreen}
           aria-label={fullscreen ? "Exit full screen" : "Full screen"}
           title="Full screen (F)"
         >
           {fullscreen ? (
-            <Minimize2 size={23} strokeWidth={1.5} />
+            <Minimize2 className="size-[23px]" size={23} strokeWidth={1.5} />
           ) : (
-            <Maximize2 size={23} strokeWidth={1.5} />
+            <Maximize2 className="size-[23px]" size={23} strokeWidth={1.5} />
           )}
-        </button>
+        </Button>
       </div>
     </motion.div>
   );

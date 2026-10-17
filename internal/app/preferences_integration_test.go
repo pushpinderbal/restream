@@ -160,7 +160,7 @@ func policyFixtureWithConfig(t *testing.T, cfg Config) (*Server, *httptest.Serve
 				items = append(items, item)
 			}
 		}
-		if err := s.cache.setBrowseAtRevision(model.BrowseQuery{Kind: kind, Category: "*", Page: 1}, model.BrowsePage{Items: items, Page: 1, Total: len(items)}, 24*time.Hour, s.cache.libraryRevision()); err != nil {
+		if err := seedBrowsePage(s.cache, model.BrowseQuery{Kind: kind, Category: "*", Page: 1}, model.BrowsePage{Items: items, Page: 1, Total: len(items)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -172,14 +172,14 @@ func policyFixtureWithConfig(t *testing.T, cfg Config) (*Server, *httptest.Serve
 	}
 	// An unparented legacy row must not masquerade as an allowed child when
 	// any series category has been blocked.
-	if err := s.cache.setBrowseAtRevision(model.BrowseQuery{Kind: "series", Category: "orphan", Page: 1}, model.BrowsePage{Items: []model.Item{{ID: "orphan-episode", Kind: "episode", Name: "Orphan", CategoryID: "2"}}, Page: 1}, time.Hour, s.cache.libraryRevision()); err != nil {
+	if err := seedBrowsePage(s.cache, model.BrowseQuery{Kind: "series", Category: "orphan", Page: 1}, model.BrowsePage{Items: []model.Item{{ID: "orphan-episode", Kind: "episode", Name: "Orphan", CategoryID: "2"}}, Page: 1}); err != nil {
 		t.Fatal(err)
 	}
 	return s, ts, p, streams
 }
 
-// A deployment fixture changes the immutable environment snapshot directly;
-// there is deliberately no HTTP API that can edit this configuration.
+// Policy fixtures replace the effective snapshot directly. Runtime settings
+// updates are covered by the application settings integration tests.
 func deployTestConfiguration(t *testing.T, s *Server, seconds int64, categories ...CategoryPreference) {
 	t.Helper()
 	environment := categoryEnvironment{}
@@ -206,11 +206,10 @@ func deployTestConfiguration(t *testing.T, s *Server, seconds int64, categories 
 	s.preferencesService.mu.Lock()
 	s.preferencesService.snapshot = &preferenceSnapshot{
 		value:     Preferences{RefreshIntervalSeconds: seconds, Categories: []CategoryPreference{}},
-		updatedAt: time.Now().UTC(), unified: true, environment: environment, blocked: len(environment.blocked) > 0,
+		updatedAt: time.Now().UTC(), environment: environment, blocked: len(environment.blocked) > 0,
 	}
 	s.preferencesService.mu.Unlock()
-	// Retained session guards must enforce the new deployment too. Actual
-	// process restarts already release streams through manager shutdown.
+	// Retained session guards must enforce the updated policy too.
 	s.stopBlockedSessions()
 }
 
@@ -225,10 +224,10 @@ func startPolicySession(t *testing.T, ts *httptest.Server, id string) stream.Ses
 	return value
 }
 
-func TestRefreshEnvironmentDrivesOneCadenceAndHasReadOnlyDefaults(t *testing.T) {
-	t.Setenv("REFRESH_INTERVAL", "24h")
-	t.Setenv("DASHBOARD_CATEGORIES", "")
-	t.Setenv("BLOCKED_CATEGORIES", "")
+func TestDefaultRefreshCadenceAndLegacyPreferenceView(t *testing.T) {
+	for _, name := range []string{"REFRESH_INTERVAL", "CATALOG_REFRESH_INTERVAL", "EPG_REFRESH_INTERVAL", "EPISODE_CACHE_TTL"} {
+		t.Setenv(name, "invalid-removed-setting")
+	}
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -240,22 +239,23 @@ func TestRefreshEnvironmentDrivesOneCadenceAndHasReadOnlyDefaults(t *testing.T) 
 	if code != 200 || json.Unmarshal([]byte(body), &value) != nil || value.RefreshIntervalSeconds != 86400 || len(value.Categories) != 0 || value.Configuration.DashboardCategories == nil || value.Configuration.BlockedCategories == nil {
 		t.Fatal(code, body)
 	}
-	if s.refreshInterval(true) != 24*time.Hour || s.refreshInterval(false) != 6*time.Hour || s.episodeTTL() != time.Hour || s.discoveryRefreshInterval() != 24*time.Hour {
-		t.Fatal("environment cadence did not drive derived freshness")
+	if s.refreshInterval(true) != 24*time.Hour || s.refreshInterval(false) != time.Hour || s.episodeTTL() != 30*time.Minute || s.discoveryRefreshInterval() != 24*time.Hour {
+		t.Fatal("configured cadence did not drive derived freshness")
 	}
 	for _, data := range []string{`{"refreshIntervalSeconds":60,"categories":[]}`, `not valid JSON`} {
 		if code, body := request(t, ts.URL, "PUT", "/api/preferences", data); code != 405 || !strings.Contains(body, `"code":"read_only"`) {
-			t.Fatal("configuration accepted an HTTP edit", code, body)
+			t.Fatal("legacy preferences endpoint accepted an HTTP edit", code, body)
 		}
 	}
 	_, after := request(t, ts.URL, "GET", "/api/preferences", "")
 	if after != body {
-		t.Fatal("rejected HTTP edits changed environment configuration", after)
+		t.Fatal("rejected HTTP edits changed effective configuration", after)
 	}
 	_, status := request(t, ts.URL, "GET", "/api/status", "")
 	if !strings.Contains(status, `"preferencesUpdatedAt"`) {
 		t.Fatal("configuration revision missing", status)
 	}
+
 }
 
 func TestBlockedCategoriesFilterListsAndDenyDirectPlayback(t *testing.T) {
@@ -429,8 +429,8 @@ func TestDiscoveryCategoryPolicyWarmsOnlyEligibleCategoriesAndRefiltersCache(t *
 	}
 }
 
-func TestEnvironmentCadenceSchedulesWithoutExtraProviderRequests(t *testing.T) {
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), RefreshInterval: time.Hour, CatalogRefresh: 24 * time.Hour, EPGRefresh: 6 * time.Hour}
+func TestConfiguredCadenceSchedulesWithoutExtraProviderRequests(t *testing.T) {
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), RefreshInterval: time.Hour}
 	p := &fixtureProvider{}
 	s, err := New(cfg, p, nil)
 	if err != nil {
@@ -449,14 +449,14 @@ func TestEnvironmentCadenceSchedulesWithoutExtraProviderRequests(t *testing.T) {
 	waitFor(t, func() bool {
 		s.stateMu.RLock()
 		defer s.stateMu.RUnlock()
-		return s.catalogSync.NextRefreshAt != nil && s.epgSync.NextRefreshAt != nil && time.Until(*s.catalogSync.NextRefreshAt) < 61*time.Minute && time.Until(*s.epgSync.NextRefreshAt) < 16*time.Minute
+		return s.catalogSync.NextRefreshAt != nil && s.epgSync.NextRefreshAt != nil && time.Until(*s.catalogSync.NextRefreshAt) < 61*time.Minute && time.Until(*s.epgSync.NextRefreshAt) < 61*time.Minute
 	})
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.catalogs != catalogs || p.epgs != epgs {
 		t.Fatal("saving cadence forced provider requests", p.catalogs, p.epgs)
 	}
-	if s.episodeTTL() != 10*time.Minute || s.discoveryRefreshInterval() != time.Hour {
+	if s.episodeTTL() != 30*time.Minute || s.discoveryRefreshInterval() != time.Hour {
 		t.Fatal("adaptive caches did not follow saved cadence")
 	}
 	// Successful requests can still return expired provider data. That must

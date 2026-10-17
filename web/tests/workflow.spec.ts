@@ -1,4 +1,8 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Locator } from "@playwright/test";
+
+// Tailwind's shadow-none can serialize as several transparent, zero-size shadows.
+const noVisibleShadow =
+  /^(?:none|(?:rgba\(0, 0, 0, 0\) 0px 0px 0px 0px,? ?)+)$/;
 
 const live = {
   id: "live-1",
@@ -105,6 +109,62 @@ async function navigateLibrary(
       })
       .click();
   }
+}
+
+async function reviewInteraction(page: Page, target: Locator, label: string) {
+  if (!process.env.INTERACTION_REVIEW) return;
+  await target.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: `../output/interaction-review/${label}.png` });
+}
+
+async function focusUnderline(target: Locator, pseudo = "::before") {
+  return target.evaluate((element, selector) => {
+    const style = getComputedStyle(element, selector);
+    return (
+      style.content !== "none" &&
+      style.content !== "normal" &&
+      style.display !== "none" &&
+      Number(style.opacity) > 0 &&
+      parseFloat(style.width) > 0 &&
+      parseFloat(style.height) > 0
+    );
+  }, pseudo);
+}
+
+async function expectPointerFocus(page: Page, target: Locator) {
+  await expect(page.locator("html")).toHaveAttribute(
+    "data-input-modality",
+    "pointer",
+  );
+  await expect(target).toHaveCSS("outline-style", "none");
+  await expect(target).toHaveCSS("box-shadow", noVisibleShadow);
+  await expect(target).not.toHaveCSS("text-decoration-line", /underline/);
+  if (
+    await target.evaluate((element) => element.classList.contains("focus-icon"))
+  )
+    await expect.poll(() => focusUnderline(target)).toBe(false);
+}
+
+async function expectKeyboardIcon(page: Page, target: Locator) {
+  await expect(page.locator("html")).toHaveAttribute(
+    "data-input-modality",
+    "keyboard",
+  );
+  await expect(target).toBeFocused();
+  await expect(target).toHaveCSS("outline-style", "none");
+  await expect(target).toHaveCSS("box-shadow", noVisibleShadow);
+  await expect.poll(() => focusUnderline(target)).toBe(true);
+}
+
+async function openSettings(page: Page) {
+  await page
+    .getByRole("button", { name: "Account", exact: true })
+    .filter({ visible: true })
+    .click();
+  await page
+    .getByRole("menu", { name: "Account", exact: true })
+    .getByRole("menuitem", { name: "Settings", exact: true })
+    .click();
 }
 
 async function openSearch(page: Page) {
@@ -223,6 +283,7 @@ async function mockApi(
     releaseDelayMs?: number;
     episodesFailureOnce?: boolean;
     episodeItems?: () => Record<string, unknown>[];
+    episodesResponse?: (params: URLSearchParams) => Record<string, unknown>;
     catalogItems?: Record<string, unknown>[];
     categories?: { id: string; name: string; kind: string }[];
     guidePrograms?: Array<(typeof programs)[number] & { description?: string }>;
@@ -230,11 +291,25 @@ async function mockApi(
     preferences?: BrowserPreferences;
     preferencesGate?: Promise<void>;
     preferencesFailure?: boolean | (() => boolean);
+    settingsSaveFailure?: boolean | (() => boolean);
+    settingsSaveGate?: Promise<void>;
+    guideHours?: number;
+    providerEnvironment?: Array<
+      | "portalUrl"
+      | "mac"
+      | "timezone"
+      | "serialNumber"
+      | "deviceId"
+      | "deviceId2"
+    >;
     browseResponse?: (params: URLSearchParams) => Promise<{
       items?: Record<string, unknown>[];
       page?: number;
       total?: number;
       hasMore?: boolean;
+      revision?: number;
+      stale?: boolean;
+      refreshing?: boolean;
       error?: string;
       status?: number;
     }>;
@@ -302,6 +377,67 @@ async function mockApi(
   );
   const mutations: { method: string; path: string }[] = [];
   let preferencesUpdatedAt: string | undefined;
+  let providerConfigured = !options.unconfigured;
+  const providerPatches: Record<string, unknown>[] = [];
+  const settingsPatches: Record<string, unknown>[] = [];
+  const settings = {
+    providerEnvironment: options.providerEnvironment ?? [],
+    provider: {
+      portalUrl: providerConfigured ? "http://provider.example" : "",
+      mac: providerConfigured ? "00:11:22:33:44:55" : "",
+      timezone: "America/Toronto",
+      serialNumber: "",
+      deviceId: "",
+      deviceId2: "",
+    },
+    library: {
+      refreshIntervalSeconds: preferences.refreshIntervalSeconds,
+      dashboardCategories: [...preferences.configuration.dashboardCategories],
+      blockedCategories: [...preferences.configuration.blockedCategories],
+      guideHours: options.guideHours ?? 48,
+    },
+    discovery: { tmdbTokenConfigured: false },
+    playback: { maxStreams: 1, transcodeMode: "auto" },
+    updatedAt: "2026-09-28T12:00:00Z",
+  };
+  for (const key of settings.providerEnvironment) settings.provider[key] = "";
+  const applySettingsPolicy = () => {
+    preferences.refreshIntervalSeconds =
+      settings.library.refreshIntervalSeconds;
+    preferences.configuration = {
+      dashboardCategories: [...settings.library.dashboardCategories],
+      blockedCategories: [...settings.library.blockedCategories],
+    };
+    const matches = (
+      rule: string,
+      category: { id: string; name: string; kind: string },
+    ) => {
+      const colon = rule.indexOf(":");
+      const scope = colon < 0 ? "" : rule.slice(0, colon).toLowerCase();
+      const value = (colon < 0 ? rule : rule.slice(colon + 1)).toLowerCase();
+      return (
+        (!scope || scope === category.kind) &&
+        (value === "*" ||
+          value === category.id.toLowerCase() ||
+          value === category.name.toLowerCase())
+      );
+    };
+    preferences.categories = allCategories.map((category) => ({
+      kind: category.kind as "live" | "movie" | "series",
+      id: category.id,
+      visibility: settings.library.blockedCategories.some((rule) =>
+        matches(rule, category),
+      )
+        ? ("block" as const)
+        : ("show" as const),
+      dashboard:
+        !settings.library.dashboardCategories.length ||
+        settings.library.dashboardCategories.some((rule) =>
+          matches(rule, category),
+        ),
+    }));
+    preferencesUpdatedAt = settings.updatedAt;
+  };
   const allItems: Record<string, unknown>[] = options.catalogItems ?? [
     live,
     movie,
@@ -345,6 +481,61 @@ async function mockApi(
         contentType: "application/json",
         body: JSON.stringify(body),
       });
+    if (path === "/api/auth") {
+      return json({ mode: "none", user: null });
+    }
+    if (path === "/api/settings") {
+      if (options.preferencesGate) await options.preferencesGate;
+      if (
+        typeof options.preferencesFailure === "function"
+          ? options.preferencesFailure()
+          : options.preferencesFailure
+      )
+        return json({ error: "Configuration is temporarily unavailable" }, 503);
+      if (method === "PATCH") {
+        settingsPatches.push(structuredClone(route.request().postDataJSON()));
+        if (options.settingsSaveGate) await options.settingsSaveGate;
+        if (
+          typeof options.settingsSaveFailure === "function"
+            ? options.settingsSaveFailure()
+            : options.settingsSaveFailure
+        )
+          return json({ error: "Settings could not be saved" }, 503);
+        const patch = route.request().postDataJSON();
+        if (patch.provider) {
+          providerPatches.push(structuredClone(patch.provider));
+          if (
+            settings.providerEnvironment.some((key) =>
+              Object.hasOwn(patch.provider, key),
+            )
+          )
+            return json(
+              {
+                code: "environment_managed",
+                error:
+                  "Provider settings managed by the environment cannot be changed here.",
+              },
+              403,
+            );
+        }
+        for (const key of ["provider", "library", "playback"] as const)
+          if (patch[key]) Object.assign(settings[key], patch[key]);
+        if (
+          patch.discovery &&
+          Object.hasOwn(patch.discovery, "tmdbReadAccessToken")
+        )
+          settings.discovery.tmdbTokenConfigured =
+            !!patch.discovery.tmdbReadAccessToken;
+        providerConfigured =
+          (!!settings.provider.portalUrl ||
+            settings.providerEnvironment.includes("portalUrl")) &&
+          (!!settings.provider.mac ||
+            settings.providerEnvironment.includes("mac"));
+        settings.updatedAt = new Date().toISOString();
+        applySettingsPolicy();
+      }
+      return json(settings);
+    }
     if (path === "/api/preferences") {
       if (method !== "GET")
         return json(
@@ -363,7 +554,7 @@ async function mockApi(
     }
     if (path === "/api/status") {
       return json({
-        configured: !options.unconfigured,
+        configured: providerConfigured,
         refreshing:
           options.refreshing || refreshRunning.catalog || refreshRunning.epg,
         catalogUpdatedAt: catalogReady ? refreshUpdated.catalog : undefined,
@@ -371,10 +562,13 @@ async function mockApi(
         epgUpdatedAt: refreshUpdated.epg,
         preferencesUpdatedAt,
         activeStreams: active ? 1 : 0,
-        maxStreams: 1,
-        timezone: "America/Toronto",
-        guideHours: 48,
-        playback: { transcodeMode: "auto", sessionTimeoutSeconds: 45 },
+        maxStreams: settings.playback.maxStreams,
+        timezone: settings.provider.timezone,
+        guideHours: settings.library.guideHours,
+        playback: {
+          transcodeMode: settings.playback.transcodeMode,
+          sessionTimeoutSeconds: 45,
+        },
         portalCooldownUntil: options.cooldown
           ? new Date(Date.now() + 60000).toISOString()
           : undefined,
@@ -532,7 +726,11 @@ async function mockApi(
       events.push("EPISODES");
       if (options.episodesFailureOnce && episodeAttempts === 1)
         return json({ error: "Episodes are temporarily unavailable" }, 503);
-      return json({ items: options.episodeItems?.() ?? episodes });
+      return json(
+        options.episodesResponse?.(url.searchParams) ?? {
+          items: options.episodeItems?.() ?? episodes,
+        },
+      );
     }
     if (path === "/api/sessions" && method === "POST") {
       events.push("POST");
@@ -630,12 +828,24 @@ async function mockApi(
     sessionStarts,
     mutations,
     effectivePreferences: () => structuredClone(preferences),
+    effectiveSettings: () => structuredClone(settings),
+    providerPatches,
+    settingsPatches,
     deployConfiguration: (next: BrowserPreferences) => {
       preferences = structuredClone(next);
       preferencesUpdatedAt = new Date().toISOString();
+      settings.library.refreshIntervalSeconds = next.refreshIntervalSeconds;
+      settings.library.dashboardCategories = [
+        ...next.configuration.dashboardCategories,
+      ];
+      settings.library.blockedCategories = [
+        ...next.configuration.blockedCategories,
+      ];
+      settings.updatedAt = preferencesUpdatedAt;
     },
     publishSnapshot: () => {
       catalogReady = true;
+      refreshUpdated.catalog = new Date().toISOString();
     },
   };
 }
@@ -712,12 +922,17 @@ test("LIVE greys behind the stream and jumps to the latest seek point while resu
     );
     await page.locator(".primary-control").focus();
     await expect(page.locator(".primary-control")).toBeFocused();
+    await expectKeyboardIcon(page, page.locator(".primary-control"));
     await expect(page.locator(".video-controls :focus-visible")).toHaveCount(1);
   };
   await revealControls();
   await expect(page.locator("#inline-title-details")).toHaveCount(0);
   await expect(page.locator(".primary-control")).toBeFocused();
   await expect(page.locator(".video-controls :focus-visible")).toHaveCount(1);
+  await page.locator(".primary-control").click();
+  await expectPointerFocus(page, page.locator(".primary-control"));
+  await page.locator(".primary-control").click();
+  await revealControls();
   await expect(liveButton).toHaveAttribute("data-behind", "true");
   await expect(liveButton).toHaveCSS("color", "rgb(146, 152, 165)");
   await page.getByRole("button", { name: "Pause", exact: true }).press("Enter");
@@ -864,18 +1079,54 @@ for (const viewport of [
     await page.getByRole("button", { name: "Open Night Shift" }).click();
     await page.getByRole("combobox", { name: "Season" }).click();
     await page.getByRole("option", { name: "Season 2" }).click();
-    await page
-      .getByRole("button", { name: "Play episode", exact: true })
-      .click();
+    await page.getByRole("button", { name: "Play", exact: true }).click();
     await expect(page).toHaveURL(/view=player/);
     await expect(page).toHaveURL(/season=2/);
     await expect(page).toHaveURL(/episode=episode-3/);
     await expect(page.locator(".primary-control")).toBeEnabled();
     await playableVideo(page);
-    await page
+    const season = page.getByRole("combobox", { name: "Season", exact: true });
+    await page.keyboard.press("Tab");
+    await season.focus();
+    await expect(season).toHaveCSS("text-decoration-line", "underline");
+    await expect(season).toHaveCSS("border-top-width", "0px");
+    await expect(season).toHaveCSS("outline-style", "none");
+    await expect(season).toHaveCSS("box-shadow", noVisibleShadow);
+    await reviewInteraction(page, season, `season-${viewport.width}-keyboard`);
+    const details = page
       .getByRole("complementary", { name: "Watch context", exact: true })
-      .getByRole("button", { name: "Title details", exact: true })
-      .click();
+      .getByRole("button", { name: "Title details", exact: true });
+    await page.keyboard.press("Tab");
+    await details.focus();
+    await expect(details).toHaveCSS("text-decoration-line", "underline");
+    await expect(details).toHaveCSS("outline-style", "none");
+    const stop = page.getByRole("button", {
+      name: "Stop playback",
+      exact: true,
+    });
+    await page.keyboard.press("Tab");
+    await stop.focus();
+    await expectKeyboardIcon(page, stop);
+    await reviewInteraction(page, stop, `player-${viewport.width}-keyboard`);
+    await season.click();
+    await page.getByRole("option", { name: "Season 2", exact: true }).click();
+    await expect(season).toHaveText("Season 2");
+    await expect(season).toBeFocused();
+    await expectPointerFocus(page, season);
+    await expect(season).toHaveCSS("border-top-width", "0px");
+    await reviewInteraction(
+      page,
+      season,
+      `season-${viewport.width}-pointer-selection`,
+    );
+    await stop.focus();
+    await expectPointerFocus(page, stop);
+    await reviewInteraction(
+      page,
+      stop,
+      `player-${viewport.width}-pointer-restored`,
+    );
+    await details.click();
     await expect(page).toHaveURL(/section=series/);
     await expect(page).toHaveURL(/season=2/);
     await expect(page.getByRole("combobox", { name: "Season" })).toHaveText(
@@ -961,7 +1212,7 @@ for (const item of [live, movie, series]) {
     await page.getByRole("button", { name: `Open ${item.name}` }).click();
     await page
       .getByRole("button", {
-        name: item.kind === "series" ? "Play episode" : "Play",
+        name: "Play",
         exact: true,
       })
       .click();
@@ -1016,8 +1267,13 @@ for (const viewport of [
     const rows = page.locator(".episode-row");
     await expect(rows).toHaveCount(2);
     await expect(rows.first()).toBeVisible();
-    const first = await rows.nth(0).boundingBox();
-    const second = await rows.nth(1).boundingBox();
+    // Read both positions in one frame while the expansion scrolls into view.
+    const [first, second] = await rows.evaluateAll((elements) =>
+      elements.map((element) => {
+        const { x, y, width } = element.getBoundingClientRect();
+        return { x, y, width };
+      }),
+    );
     expect(first!.width).toBeLessThanOrEqual(341);
     if (viewport.width > 820) {
       expect(Math.abs(first!.y - second!.y)).toBeLessThan(2);
@@ -1282,41 +1538,112 @@ test("capacity error is announced", async ({ page }) => {
   ).toBeVisible();
 });
 
-test("category dropdown opens independently of VOD tabs and Escape restores focus", async ({
-  page,
-}) => {
-  await mockApi(page);
-  await page.goto("/?section=live");
-  await navigateLibrary(page, "movie");
-  const movies = page
-    .getByRole("tablist", { name: "VOD type" })
-    .getByRole("tab", { name: "Movies", exact: true });
-  await expect(movies).toHaveAttribute("aria-selected", "true");
-  const category = page.getByRole("combobox", {
-    name: "Category",
-    exact: true,
-  });
-  await expect(category).toContainText("All categories");
-  expect(await category.evaluate((element) => element.tagName)).toBe("BUTTON");
-  await category.click();
-  await expect(
-    page.getByRole("combobox", {
+for (const width of [1280, 390, 320]) {
+  test(`category dropdown opens independently of VOD tabs and Escape restores focus at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 844 });
+    await mockApi(page);
+    await page.goto("/?section=live");
+    await navigateLibrary(page, "movie");
+    const movies = page
+      .getByRole("tablist", { name: "VOD type" })
+      .getByRole("tab", { name: "Movies", exact: true });
+    await expect(movies).toHaveAttribute("aria-selected", "true");
+    const category = page.getByRole("combobox", {
       name: "Category",
       exact: true,
-      includeHidden: true,
-    }),
-  ).toHaveAttribute("aria-expanded", "true");
-  await expect(
-    page.getByRole("option", { name: "Drama", exact: true }),
-  ).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(page.getByRole("listbox")).toHaveCount(0);
-  await expect(category).toHaveAttribute("aria-expanded", "false");
-  await expect(category).toBeFocused();
-  await expect(movies).toHaveAttribute("aria-selected", "true");
-});
+    });
+    await expect(category).toContainText("All categories");
+    expect(await category.evaluate((element) => element.tagName)).toBe(
+      "BUTTON",
+    );
+    await category.click();
+    await expect(
+      page.getByRole("combobox", {
+        name: "Category",
+        exact: true,
+        includeHidden: true,
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    await expect(
+      page.getByRole("option", { name: "Drama", exact: true }),
+    ).toBeVisible();
+    const search = page.getByPlaceholder("Find category…", { exact: true });
+    await expect(search).toBeFocused();
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `../output/category-focus/category-search-${width}.png`,
+      });
+    await expect(search).toHaveCSS("outline-style", "none");
+    await expect(search).toHaveCSS("box-shadow", "none");
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("listbox")).toHaveCount(0);
+    await expect(category).toHaveAttribute("aria-expanded", "false");
+    await expect(category).toBeFocused();
+    await expect(page.locator("html")).toHaveAttribute(
+      "data-input-modality",
+      "keyboard",
+    );
+    await expect.poll(() => focusUnderline(category, "::after")).toBe(true);
+    await expect(category).toHaveCSS("outline-style", "none");
+    await expect(category).toHaveCSS("box-shadow", "none");
+    await reviewInteraction(
+      page,
+      category,
+      `category-${width}-keyboard-escape`,
+    );
+    {
+      await category.click();
+      await search.fill("Drama");
+      await page.getByRole("option", { name: "Drama", exact: true }).click();
+      await expect(category).toBeFocused();
+      await expectPointerFocus(page, category);
+      await expect.poll(() => focusUnderline(category, "::after")).toBe(false);
+      await reviewInteraction(
+        page,
+        category,
+        `category-${width}-pointer-selection`,
+      );
+      await category.click();
+      await search.fill("Drama");
+      await page.keyboard.press("Escape");
+      await expect(category).toBeFocused();
+      await expect(page.locator("html")).toHaveAttribute(
+        "data-input-modality",
+        "keyboard",
+      );
+      await expect.poll(() => focusUnderline(category, "::after")).toBe(true);
+      await expect(category).toHaveCSS("outline-style", "none");
+      await expect(category).toHaveCSS("box-shadow", "none");
+      await reviewInteraction(
+        page,
+        category,
+        `category-${width}-searched-escape`,
+      );
+      await category.click();
+      await page.mouse.click(width - 8, 100);
+      await expect(page.getByRole("listbox")).toHaveCount(0);
+      await expectPointerFocus(page, category);
+      await expect.poll(() => focusUnderline(category, "::after")).toBe(false);
+      await reviewInteraction(
+        page,
+        category,
+        `category-${width}-pointer-outside`,
+      );
+      await movies.click();
+      await expectPointerFocus(page, movies);
+      await expect.poll(() => focusUnderline(movies, "::after")).toBe(false);
+      await reviewInteraction(page, movies, `tab-${width}-pointer-selection`);
+      await page.keyboard.press("Tab");
+      await movies.focus();
+      await expect.poll(() => focusUnderline(movies, "::after")).toBe(true);
+    }
+    await expect(movies).toHaveAttribute("aria-selected", "true");
+  });
+}
 
-test("empty mixed-kind pages advance in bounded groups and preserve the cursor", async ({
+test("All movies automatically passes empty provider pages and preserves the cursor", async ({
   page,
 }) => {
   const api = await mockApi(page, {
@@ -1394,7 +1721,7 @@ test("season selection chooses its episode before opening the watch workspace", 
   await page.getByRole("option", { name: "Season 2" }).click();
   await expect(page.getByText("Selected · S2 E1 · Fresh Start")).toBeVisible();
   expect(api.sessionItemIds).toHaveLength(0);
-  await page.getByRole("button", { name: "Play episode", exact: true }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect.poll(() => api.sessionItemIds).toEqual(["episode-3"]);
   await expect(page).toHaveURL(/view=player/);
   await expect(page).toHaveURL(/episode=episode-3/);
@@ -1658,24 +1985,30 @@ for (const width of [1440, 390, 320]) {
         };
       },
     });
+    const clockStart = Date.now();
+    await page.clock.install({ time: clockStart });
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/?section=live");
     const search = await openSearch(page);
+    // Pause after navigation settles so action scheduling cannot consume the debounce.
+    await page.clock.pauseAt(clockStart + 60_000);
     const requests = () =>
       api.events.filter((event) => event.startsWith("BROWSE:"));
     try {
       await expect(search).toHaveValue("");
       await expect(page.getByRole("button", { name: /^Open / })).toHaveCount(0);
       await search.fill(" N ");
-      await page.waitForTimeout(450);
+      await page.clock.runFor(450);
       expect(requests()).toEqual([]);
       await expect(
         page.getByRole("region", { name: "Movies results", exact: true }),
       ).toHaveCount(0);
       await search.fill("discarded");
-      await page.waitForTimeout(100);
+      await page.clock.runFor(100);
       await search.fill("  North  ");
+      await page.clock.runFor(349);
       expect(requests()).toEqual([]);
+      await page.clock.runFor(1);
       await expect.poll(() => requests().length).toBe(2);
       expect(
         requests()
@@ -1693,6 +2026,7 @@ for (const width of [1440, 390, 320]) {
         { kind: "movie", category: "*", page: "1", search: "North" },
         { kind: "series", category: "*", page: "1", search: "North" },
       ]);
+      await page.clock.resume();
       await expect(
         page
           .getByRole("region", { name: "Live TV results", exact: true })
@@ -1769,18 +2103,24 @@ for (const width of [1440, 390, 320]) {
   });
 }
 
-test("global Search retries one failed group and loads another page independently", async ({
+test("global Search retries one failed group and scrolls through remaining pages", async ({
   page,
 }) => {
   let movieAttempts = 0;
+  let releaseRetry!: () => void;
+  const retryGate = new Promise<void>((resolve) => {
+    releaseRetry = resolve;
+  });
   const api = await mockApi(page, {
     browseResponse: async (params) => {
       const kind = params.get("kind");
       const pageNumber = Number(params.get("page"));
       if (kind === "movie" && ++movieAttempts === 1)
         return { error: "Movie provider is busy", status: 503 };
-      if (kind === "movie" && pageNumber === 1)
+      if (kind === "movie" && pageNumber === 1) {
+        await retryGate;
         return { items: [], page: 1, total: 2, hasMore: true };
+      }
       const base = kind === "movie" ? movie : series;
       return {
         items: [
@@ -1816,30 +2156,29 @@ test("global Search retries one failed group and loads another page independentl
       .getByRole("region", { name: "Live TV results", exact: true })
       .getByRole("button", { name: "Open North News", exact: true }),
   ).toBeVisible();
-  await movies
-    .getByRole("button", { name: "Retry movies", exact: true })
-    .click();
-  await expect(
-    movies.getByText("No matches found.", { exact: true }),
-  ).toBeVisible();
-  await shows
-    .getByRole("button", { name: "Load more shows", exact: true })
-    .click();
+  const retry = movies.getByRole("button", {
+    name: "Retry movies",
+    exact: true,
+  });
+  try {
+    await retry.click();
+    await expect(retry).toHaveAttribute("aria-busy", "true");
+    await expect(retry).toHaveText("Retrying…");
+    await expect(retry).toBeFocused();
+    await expect(movies.getByRole("alert")).toContainText(
+      "Movie provider is busy",
+    );
+    await retry.evaluate((button) => button.click());
+    expect(movieAttempts).toBe(2);
+  } finally {
+    releaseRetry();
+  }
   await expect(
     shows.getByRole("button", { name: "Open Night Shift 2", exact: true }),
   ).toBeVisible();
   await expect(
     shows.getByRole("button", { name: "Open Night Shift 1", exact: true }),
   ).toBeVisible();
-  await expect(
-    shows.getByRole("button", { name: "Load more shows", exact: true }),
-  ).toHaveCount(0);
-  await expect(
-    movies.getByRole("button", { name: "Load more movies", exact: true }),
-  ).toBeVisible();
-  await movies
-    .getByRole("button", { name: "Load more movies", exact: true })
-    .click();
   await expect(
     movies.getByRole("button", { name: "Open The Quiet Coast 2", exact: true }),
   ).toBeVisible();
@@ -2325,7 +2664,7 @@ for (const item of [live, movie, series]) {
     );
     await page
       .getByRole("button", {
-        name: item.kind === "series" ? "Play episode" : "Play",
+        name: "Play",
         exact: true,
       })
       .click();
@@ -2530,19 +2869,19 @@ test("library refresh discovers new series and episodes after leaving playback f
   await page.getByRole("button", { name: "Open Night Shift" }).click();
   await page.getByRole("combobox", { name: "Season" }).click();
   await page.getByRole("option", { name: "Season 2" }).click();
-  await page.getByRole("button", { name: "Play episode", exact: true }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect(page.locator(".primary-control")).toBeEnabled();
   await playableVideo(page);
   published = true;
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await openSettings(page);
   await expect(page.locator("video")).toHaveCount(0);
   await expect
     .poll(() => api.events.filter((event) => event === "DELETE").length)
     .toBe(1);
   await page.getByRole("button", { name: "Refresh now", exact: true }).click();
   await expect(
-    page.getByRole("button", { name: "Refresh now", exact: true }),
-  ).toBeEnabled({ timeout: 8000 });
+    page.getByRole("button", { name: "Refreshed", exact: true }),
+  ).toBeDisabled({ timeout: 8000 });
   expect(api.events).toContain("REFRESH:all");
   await navigateLibrary(page, "series");
   await expect(
@@ -2566,58 +2905,829 @@ test("library refresh discovers new series and episodes after leaving playback f
   await expect(page.locator("video")).toHaveCount(0);
 });
 
-function settingValue(page: Page, label: string) {
-  return page
-    .getByRole("region", { name: "Settings", exact: true })
-    .locator("dt")
-    .filter({ hasText: new RegExp(`^${label}$`) })
-    .locator("xpath=following-sibling::dd");
-}
-
-test("Settings displays effective environment configuration without editable controls or writes", async ({
+test("Settings accordions support keyboard controls and retain independent drafts", async ({
   page,
 }) => {
+  await page.setViewportSize({ width: 1487, height: 1058 });
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  const api = await mockApi(page, {
+    providerEnvironment: ["portalUrl", "mac", "timezone", "deviceId"],
+  });
+  await page.goto("/?view=settings");
+  const device = page.getByRole("button", {
+    name: "Device identity",
+    exact: true,
+  });
+  const playback = page.getByRole("button", {
+    name: "Advanced playback",
+    exact: true,
+  });
+  await expect(device).toHaveAttribute("aria-expanded", "false");
+  await expect(playback).toHaveAttribute("aria-expanded", "false");
+  await expect(
+    device.getByText("Serial number and device IDs", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    playback.getByText("Video conversion settings", { exact: true }),
+  ).toBeVisible();
+  await page.evaluate(() => document.fonts.ready);
+  if (process.env.CAPTURE_SCREENSHOTS)
+    await page.screenshot({
+      path: "../output/settings-design/settings-inputs-accordion-desktop-closed.png",
+    });
+  const restingDeviceBackground = await device.evaluate(
+    (element) => getComputedStyle(element).backgroundColor,
+  );
+  await page.keyboard.press("Tab");
+  await device.focus();
+  await expect(device).not.toHaveCSS(
+    "background-color",
+    restingDeviceBackground,
+  );
+  await expect(device.locator('[data-slot="accordion-title"]')).toHaveCSS(
+    "text-decoration-line",
+    "underline",
+  );
+  await expect(device).toHaveCSS("outline-style", "none");
+  await expect(device).toHaveCSS("box-shadow", "none");
+  await page.keyboard.press("Enter");
+  await expect(device).toBeFocused();
+  await expect(device).toHaveAttribute("aria-expanded", "true");
+  const panelId = await device.getAttribute("aria-controls");
+  expect(panelId).toBeTruthy();
+  const devicePanel = page.locator(`[id="${panelId}"]`);
+  await expect(devicePanel).toBeVisible();
+  await expect
+    .poll(() =>
+      devicePanel.evaluate(
+        (element) => getComputedStyle(element).animationName,
+      ),
+    )
+    .not.toBe("none");
+  const serial = page.getByLabel("Serial number", { exact: true });
+  const restingSerialShadow = await serial.evaluate(
+    (element) => getComputedStyle(element).boxShadow,
+  );
+  await serial.click();
+  await expect(serial).toHaveCSS("outline-style", "none");
+  await expect(serial).toHaveCSS("box-shadow", restingSerialShadow);
+  await serial.fill("accordion-draft-serial");
+  await expect(page.getByLabel("Device ID", { exact: true })).toBeDisabled();
+  await expect(page.getByLabel("Device ID", { exact: true })).toHaveValue("");
+  await device.focus();
+  await page.keyboard.press("Space");
+  await expect(device).toHaveAttribute("aria-expanded", "false");
+  await expect(serial).not.toBeVisible();
+  await expect(device).toBeFocused();
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.keyboard.press("Enter");
+  await expect
+    .poll(() =>
+      devicePanel.evaluate(
+        (element) => getComputedStyle(element).animationName,
+      ),
+    )
+    .toBe("none");
+  await expect(serial).toHaveValue("accordion-draft-serial");
+  if (process.env.CAPTURE_SCREENSHOTS)
+    await page.screenshot({
+      path: "../output/settings-design/settings-inputs-accordion-desktop-open.png",
+    });
+  await playback.focus();
+  await page.keyboard.press("Space");
+  await expect(playback).toHaveAttribute("aria-expanded", "true");
+  await expect(playback).toBeFocused();
+  const processing = page.getByRole("combobox", {
+    name: "Playback processing",
+    exact: true,
+  });
+  const restingProcessingShadow = await processing.evaluate(
+    (element) => getComputedStyle(element).boxShadow,
+  );
+  await processing.click();
+  await page.getByRole("option", { name: "Copy", exact: true }).click();
+  await expect(processing).toBeFocused();
+  await expect(processing).toHaveCSS("outline-style", "none");
+  await expect(processing).toHaveCSS("box-shadow", restingProcessingShadow);
+  await page.keyboard.press("Tab");
+  await playback.focus();
+  await page.keyboard.press("Enter");
+  await expect(playback).toHaveAttribute("aria-expanded", "false");
+  await page.keyboard.press("Space");
+  await expect(processing).toContainText("Copy");
+  expect(api.mutations).toEqual([]);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await device.click();
+  await device.evaluate((element) =>
+    window.scrollTo({
+      top: window.scrollY + element.getBoundingClientRect().top - 110,
+      behavior: "instant",
+    }),
+  );
+  if (process.env.CAPTURE_SCREENSHOTS)
+    await page.screenshot({
+      path: "../output/settings-design/settings-inputs-accordion-390-closed.png",
+    });
+  await device.click();
+  await expect(serial).toHaveValue("accordion-draft-serial");
+  await expect(page.getByLabel("Device ID", { exact: true })).toBeDisabled();
+  await device.evaluate((element) =>
+    window.scrollTo({
+      top: window.scrollY + element.getBoundingClientRect().top - 110,
+      behavior: "instant",
+    }),
+  );
+  if (process.env.CAPTURE_SCREENSHOTS)
+    await page.screenshot({
+      path: "../output/settings-design/settings-inputs-accordion-390-open.png",
+    });
+  for (const width of [1487, 390, 320]) {
+    await page.setViewportSize({ width, height: 844 });
+    await playback.click();
+    await expectPointerFocus(page, playback);
+    await expect(playback.locator('[data-slot="accordion-title"]')).toHaveCSS(
+      "text-decoration-line",
+      "none",
+    );
+    await expect(playback).toHaveAttribute("aria-expanded", "false");
+    await expect(
+      playback.getByText("Video conversion settings", { exact: true }),
+    ).toBeVisible();
+    await expect(processing).not.toBeVisible();
+    if (process.env.CAPTURE_SCREENSHOTS) {
+      await playback.evaluate((element) =>
+        window.scrollTo({
+          top: window.scrollY + element.getBoundingClientRect().top - 110,
+          behavior: "instant",
+        }),
+      );
+      await page.screenshot({
+        path: `../output/settings-design/settings-advanced-playback-${width}-closed.png`,
+      });
+    }
+    await playback.click();
+    await expect(processing).toContainText("Copy");
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `../output/settings-design/settings-advanced-playback-${width}-open.png`,
+      });
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+  }
+  expect(api.mutations).toEqual([]);
+});
+
+test("Settings scroll navigation preserves drafts across sections and responsive layouts", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1487, height: 1058 });
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(message.text());
+  });
+  const api = await mockApi(page, {
+    providerEnvironment: ["portalUrl", "mac", "timezone"],
+    guideHours: 6,
+    preferences: {
+      refreshIntervalSeconds: 86400,
+      categories: [],
+      configuration: { dashboardCategories: [], blockedCategories: [] },
+    },
+  });
+  await page.goto("/?view=settings");
+  await expect(
+    page.getByLabel("Guide coverage in hours", { exact: true }),
+  ).toHaveValue("6");
+  await page.evaluate(() => document.fonts.ready);
+  const navigation = page.getByRole("navigation", {
+    name: "Settings sections",
+    exact: true,
+  });
+  const active = (name: string) =>
+    navigation.getByRole("link", { name, exact: true });
+  await expect(active("Provider")).toHaveAttribute("aria-current", "location");
+  const sectionChanges = await navigation.evaluateHandle((element) => {
+    const visited: string[] = [];
+    const observer = new MutationObserver(() => {
+      const current = element
+        .querySelector('[aria-current="location"]')
+        ?.textContent?.trim();
+      if (current && current !== visited.at(-1)) visited.push(current);
+    });
+    observer.observe(element, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-current"],
+    });
+    return { visited, disconnect: () => observer.disconnect() };
+  });
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await active("About").click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          Math.ceil(window.scrollY + window.innerHeight) >=
+          document.documentElement.scrollHeight - 2,
+      ),
+    )
+    .toBe(true);
+  await expect(active("About")).toHaveAttribute("aria-current", "location");
+  expect(
+    await sectionChanges.evaluate((trace) => {
+      trace.disconnect();
+      return trace.visited;
+    }),
+  ).toEqual(["About"]);
+  await sectionChanges.dispose();
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
+  await page.mouse.wheel(0, -1);
+  await expect(active("Provider")).toHaveAttribute("aria-current", "location");
+  const settingsURL = page.url();
+  if (process.env.CAPTURE_SCREENSHOTS)
+    await page.screenshot({
+      path: "../output/settings-design/settings-scroll-implemented-desktop.png",
+    });
+  await page.getByText("Device identity", { exact: true }).click();
+  const serial = page.getByLabel("Serial number", { exact: true });
+  await serial.fill("unsaved-provider-draft");
+  const originalInput = await serial.elementHandle();
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await active("Playback").click();
+  await expectPointerFocus(page, active("Playback"));
+  await page.keyboard.press("Tab");
+  await active("Playback").focus();
+  await expect(active("Playback")).toHaveCSS(
+    "text-decoration-line",
+    "underline",
+  );
+  await expect(active("Playback")).toHaveAttribute("aria-current", "location");
+  await expect(page.locator("#settings-playback")).toBeInViewport();
+  await page
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .click();
+  await expect(active("Playback")).toHaveAttribute("aria-current", "location");
+  await page.keyboard.press("ArrowUp");
+  await expect(active("Playback")).toHaveAttribute("aria-current", "location");
+  await active("Status").click();
+  await expect(active("Status")).toHaveAttribute("aria-current", "location");
+  await expect(page.locator("#settings-status")).toBeInViewport();
+  await page.mouse.wheel(0, 10000);
+  await expect(active("About")).toHaveAttribute("aria-current", "location");
+  await page
+    .locator("#settings-library")
+    .evaluate((element) =>
+      element.scrollIntoView({ block: "start", behavior: "instant" }),
+    );
+  await expect(active("Library & guide")).toHaveAttribute(
+    "aria-current",
+    "location",
+  );
+  await page.mouse.wheel(0, -10000);
+  await expect(active("Provider")).toHaveAttribute("aria-current", "location");
+  await expect(serial).toHaveValue("unsaved-provider-draft");
+  expect(await originalInput!.evaluate((element) => element.isConnected)).toBe(
+    true,
+  );
+  for (const section of [
+    "provider",
+    "library",
+    "discovery",
+    "playback",
+    "status",
+    "about",
+  ])
+    await expect(page.locator(`#settings-${section}`)).toBeAttached();
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 390, height: 844 });
+  const jump = page.getByRole("combobox", {
+    name: "Jump to section",
+    exact: true,
+  });
+  await expect(jump).toBeVisible();
+  await jump.click();
+  await page.getByRole("option", { name: "Status", exact: true }).click();
+  await expect(jump).toContainText("Status");
+  await expect(page.locator("#settings-status")).toBeInViewport();
+  await jump.click();
+  await page.getByRole("option", { name: "About", exact: true }).click();
+  await expect(jump).toContainText("About");
+  await expect(page.locator("#settings-about")).toBeInViewport();
+  await jump.focus();
+  await page.keyboard.press("Enter");
+  await page
+    .getByRole("option", { name: "Library & guide", exact: true })
+    .focus();
+  await page.keyboard.press("Enter");
+  await expect(jump).toContainText("Library & guide");
+  await expect(page.locator("#settings-library")).toBeInViewport();
+  await page.mouse.wheel(0, 10000);
+  await expect(jump).toContainText("About");
+  await page.mouse.wheel(0, -10000);
+  await expect(jump).toContainText("Provider");
+  await expect(serial).toHaveValue("unsaved-provider-draft");
+  expect(page.url()).toBe(settingsURL);
+  expect(await originalInput!.evaluate((element) => element.isConnected)).toBe(
+    true,
+  );
+  await page.getByText("Device identity", { exact: true }).click();
+  for (const width of [390, 320]) {
+    await page.setViewportSize({ width, height: 844 });
+    await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
+    await expect(jump).toContainText("Provider");
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `../output/settings-design/settings-scroll-implemented-${width}.png`,
+      });
+  }
+  const tokenLink = page.locator(".settings-inline-link");
+  await page.keyboard.press("Tab");
+  await tokenLink.focus();
+  await expect(tokenLink).toHaveCSS("text-decoration-line", "underline");
+  await expect(tokenLink).toHaveCSS("outline-style", "none");
+  expect(api.mutations).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+test("Settings actions support keyboard submission and prevent duplicate pending requests", async ({
+  page,
+}) => {
+  let releaseSave!: () => void;
+  const settingsSaveGate = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  const api = await mockApi(page, { settingsSaveGate, refreshDelayMs: 1000 });
+  await page.goto("/?view=settings");
+  const save = page.getByRole("button", { name: "Save changes", exact: true });
+  await page
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .fill("2");
+  await save.focus();
+  await expect(save).toBeFocused();
+  await page.keyboard.press("Enter");
+  try {
+    await expect(save).toHaveAttribute("aria-busy", "true");
+    await expect(save).toHaveAttribute("aria-disabled", "true");
+    await expect(save).toContainText("Saving");
+    await expect(
+      page.getByRole("button", { name: "Discard changes", exact: true }),
+    ).toBeDisabled();
+    for (const label of [
+      "Portal URL",
+      "Guide coverage in hours",
+      "Maximum simultaneous streams",
+      "TMDB read access token",
+    ]) {
+      await expect(page.getByLabel(label, { exact: true })).toBeDisabled();
+    }
+    await expect(page.locator("#settings-form > fieldset")).toHaveAttribute(
+      "inert",
+      "",
+    );
+    await page.keyboard.press("Enter");
+    await expect
+      .poll(
+        () =>
+          api.mutations.filter((request) => request.path === "/api/settings")
+            .length,
+      )
+      .toBe(1);
+  } finally {
+    releaseSave();
+  }
+  await expect(
+    page.getByText("All changes saved.", { exact: true }),
+  ).toBeVisible();
+  await expect(save).not.toHaveAttribute("aria-busy", "true");
+  expect(api.effectiveSettings().playback.maxStreams).toBe(2);
+  const refresh = page.getByRole("button", {
+    name: /^(Refresh now|Refreshing…|Refreshed)$/,
+  });
+  await refresh.focus();
+  await expect(refresh).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(refresh).toHaveAccessibleName("Refreshing…");
+  await expect(refresh).toBeDisabled();
+  await expect(refresh).toHaveAttribute("aria-busy", "true");
+  await expect(refresh).toHaveAccessibleName("Refreshed", { timeout: 8000 });
+  expect(api.events.filter((event) => event === "REFRESH:all")).toHaveLength(1);
+});
+
+test("Settings saves modified sections together and restores saved values", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  await page.goto("/?view=settings");
+  const save = page.getByRole("button", { name: "Save changes", exact: true });
+  const discard = page.getByRole("button", {
+    name: "Discard changes",
+    exact: true,
+  });
+  await expect(save).toHaveCount(1);
+  await expect(save).toBeDisabled();
+  await expect(discard).toBeDisabled();
+  await expect(
+    page.getByText("No unsaved changes", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .fill("2");
+  await expect(save).toBeEnabled();
+  await page
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .fill("1");
+  await expect(save).toBeDisabled();
+  await page
+    .getByRole("combobox", { name: "Refresh every", exact: true })
+    .click();
+  await page.getByRole("option", { name: "1 day", exact: true }).click();
+  await page.getByLabel("Guide coverage in hours", { exact: true }).fill("24");
+  await page
+    .locator('[data-slot="label"]')
+    .filter({ hasText: /^Home categories$/ })
+    .click();
+  await expect(
+    page.getByRole("combobox", { name: "Home categories", exact: true }),
+  ).toBeFocused();
+  await page
+    .getByRole("option", { name: "Drama", exact: true })
+    .first()
+    .click();
+  await page.keyboard.press("Escape");
+  await page
+    .getByRole("combobox", { name: "Blocked categories", exact: true })
+    .click();
+  await page.getByRole("option", { name: "Documentary", exact: true }).click();
+  await page.keyboard.press("Escape");
+  await page
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .fill("3");
+  await page.getByText("Advanced playback", { exact: true }).click();
+  await page
+    .getByRole("combobox", { name: "Playback processing", exact: true })
+    .click();
+  await page.getByRole("option", { name: "Copy", exact: true }).click();
+  await expect(
+    page.getByText("Unsaved changes", { exact: true }),
+  ).toBeVisible();
+  await save.click();
+  await expect(
+    page.getByText("All changes saved.", { exact: true }),
+  ).toBeVisible();
+  expect(api.settingsPatches).toEqual([
+    {
+      library: {
+        refreshIntervalSeconds: 86400,
+        guideHours: 24,
+        dashboardCategories: ["movie:drama-movie"],
+        blockedCategories: ["live:documentary"],
+      },
+      playback: { maxStreams: 3, transcodeMode: "copy" },
+    },
+  ]);
+  expect(api.providerPatches).toEqual([]);
+  await expect(save).toBeDisabled();
+  await expect(discard).toBeDisabled();
+  await page.reload();
+  await expect(
+    page.getByLabel("Maximum simultaneous streams", { exact: true }),
+  ).toHaveValue("3");
+  await expect(
+    page.getByLabel("Guide coverage in hours", { exact: true }),
+  ).toHaveValue("24");
+  await page.getByText("Advanced playback", { exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "Playback processing", exact: true }),
+  ).toContainText("Copy");
+  await expect(
+    page.getByRole("button", {
+      name: "Remove Drama from Home categories",
+      exact: true,
+    }),
+  ).toBeVisible();
+  expect(api.mutations).toEqual([{ method: "PATCH", path: "/api/settings" }]);
+});
+
+for (const width of [1440, 390]) {
+  test(`Settings discards all drafts without saving and preserves drafts during refresh at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    const api = await mockApi(page, { refreshDelayMs: 500 });
+    await page.goto("/?view=settings");
+    await page.getByLabel("Timezone", { exact: true }).fill("Europe/London");
+    await page
+      .getByLabel("Guide coverage in hours", { exact: true })
+      .fill("24");
+    await page
+      .getByLabel("Maximum simultaneous streams", { exact: true })
+      .fill("3");
+    await page
+      .getByLabel("TMDB read access token", { exact: true })
+      .fill("discarded-token");
+    const refresh = page
+      .locator("#settings-status")
+      .getByRole("button", { name: /^(Refresh now|Refreshing…|Refreshed)$/ });
+    await refresh.click();
+    await expect(refresh).toHaveAccessibleName("Refreshed", { timeout: 8000 });
+    await expect(page.getByLabel("Timezone", { exact: true })).toHaveValue(
+      "Europe/London",
+    );
+    await expect(
+      page.getByLabel("Guide coverage in hours", { exact: true }),
+    ).toHaveValue("24");
+    await expect(
+      page.getByLabel("Maximum simultaneous streams", { exact: true }),
+    ).toHaveValue("3");
+    await expect(
+      page.getByLabel("TMDB read access token", { exact: true }),
+    ).toHaveValue("discarded-token");
+    await page
+      .getByRole("button", { name: "Discard changes", exact: true })
+      .click();
+    await expect(page.getByLabel("Timezone", { exact: true })).toHaveValue(
+      "America/Toronto",
+    );
+    await expect(
+      page.getByLabel("Guide coverage in hours", { exact: true }),
+    ).toHaveValue("48");
+    await expect(
+      page.getByLabel("Maximum simultaneous streams", { exact: true }),
+    ).toHaveValue("1");
+    await expect(
+      page.getByLabel("TMDB read access token", { exact: true }),
+    ).toHaveValue("");
+    await expect(
+      page.getByRole("button", { name: "Save changes", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      page.getByRole("button", { name: "Discard changes", exact: true }),
+    ).toBeDisabled();
+    expect(api.settingsPatches).toEqual([]);
+    expect(api.mutations).toEqual([{ method: "POST", path: "/api/refresh" }]);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+  });
+}
+
+test("Settings preserves and removes unavailable category rules on mobile", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
   const api = await mockApi(page, {
     preferences: {
-      refreshIntervalSeconds: 43200,
+      refreshIntervalSeconds: 86400,
       categories: [],
       configuration: {
-        dashboardCategories: ["movie:71", "Drama, Classics"],
-        blockedCategories: ["live:documentary", "series:drama-series"],
+        dashboardCategories: ["movie:Archived category with a long name"],
+        blockedCategories: [],
       },
     },
   });
   await page.goto("/?view=settings");
-  const settings = page.getByRole("region", { name: "Settings", exact: true });
-  await expect(settings.locator(".settings-category-rules dt")).toHaveText([
-    "Dashboard",
-    "Blocked",
-  ]);
-  await expect(settingValue(page, "Refresh interval")).toHaveText("12 hours");
-  await expect(settingValue(page, "Dashboard")).toContainText("movie:71");
-  await expect(settingValue(page, "Dashboard")).toContainText(
-    "Drama, Classics",
-  );
-  await expect(settingValue(page, "Blocked")).toContainText("live:documentary");
-  await expect(settingValue(page, "Blocked")).toContainText(
-    "series:drama-series",
-  );
-  for (const role of ["combobox", "checkbox", "textbox", "searchbox"] as const)
-    await expect(settings.getByRole(role)).toHaveCount(0);
-  await expect(settings.getByRole("button")).toHaveCount(1);
+  await page
+    .getByRole("button", {
+      name: "Remove movie:Archived category with a long name from Home categories",
+      exact: true,
+    })
+    .click();
+  await page
+    .getByRole("combobox", { name: "Blocked categories", exact: true })
+    .fill("Documentary");
   await expect(
-    settings.getByRole("button", { name: "Refresh now", exact: true }),
-  ).toBeEnabled();
-  await expect(settings.getByRole("button", { name: /Save/ })).toHaveCount(0);
-  await page.reload();
-  await expect(settingValue(page, "Refresh interval")).toHaveText("12 hours");
-  await expect(settingValue(page, "Dashboard")).toContainText(
-    "Drama, Classics",
-  );
-  expect(api.mutations).toEqual([]);
+    page.getByRole("option", { name: "Documentary", exact: true }),
+  ).toBeVisible();
+  if (process.env.CAPTURE_SCREENSHOTS)
+    await page.screenshot({
+      path: "/tmp/restream-settings-categories-390.png",
+      fullPage: true,
+    });
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect
+    .poll(() => api.effectiveSettings().library.dashboardCategories)
+    .toEqual([]);
+  expect(api.effectiveSettings().library.blockedCategories).toEqual([
+    "live:documentary",
+  ]);
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(390);
 });
 
-test("Settings releases playback and refreshes metadata without changing environment configuration", async ({
+for (const width of [1440, 390]) {
+  test(`Settings edits remaining provider fields with environment overrides at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    const managed = ["portalUrl", "mac", "timezone"] as const;
+    const api = await mockApi(page, { providerEnvironment: [...managed] });
+    await page.goto("/?view=settings");
+    for (const label of ["Portal URL", "MAC address", "Timezone"]) {
+      const input = page.getByLabel(label, { exact: true });
+      await expect(input).toBeDisabled();
+      await expect(input).toHaveValue("");
+      await expect(input).toHaveAccessibleDescription("Managed by environment");
+    }
+    await page.getByText("Device identity", { exact: true }).click();
+    await page
+      .getByLabel("Serial number", { exact: true })
+      .fill("app-managed-serial");
+    await page
+      .getByLabel("Device ID", { exact: true })
+      .fill("app-managed-device");
+    await page
+      .getByLabel("Secondary device ID", { exact: true })
+      .fill("app-managed-device-two");
+    await page
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect.poll(() => api.providerPatches.length).toBe(1);
+    expect(api.providerPatches[0]).toEqual({
+      serialNumber: "app-managed-serial",
+      deviceId: "app-managed-device",
+      deviceId2: "app-managed-device-two",
+    });
+    await expect(
+      page.getByText("All changes saved.", { exact: true }),
+    ).toBeVisible();
+    await page.reload();
+    await page.getByText("Device identity", { exact: true }).click();
+    await expect(page.getByLabel("Serial number", { exact: true })).toHaveValue(
+      "app-managed-serial",
+    );
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `/tmp/restream-settings-env-mixed-${width}.png`,
+        fullPage: true,
+      });
+  });
+
+  test(`Settings locks a fully environment-managed provider and still saves playback at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    const api = await mockApi(page, {
+      providerEnvironment: [
+        "portalUrl",
+        "mac",
+        "timezone",
+        "serialNumber",
+        "deviceId",
+        "deviceId2",
+      ],
+    });
+    await page.goto("/?view=settings");
+    await page.getByText("Device identity", { exact: true }).click();
+    for (const label of [
+      "Portal URL",
+      "MAC address",
+      "Timezone",
+      "Serial number",
+      "Device ID",
+      "Secondary device ID",
+    ]) {
+      await expect(page.getByLabel(label, { exact: true })).toBeDisabled();
+      await expect(page.getByLabel(label, { exact: true })).toHaveValue("");
+    }
+    await expect(
+      page.getByRole("button", { name: "Save changes", exact: true }),
+    ).toBeDisabled();
+    await page
+      .getByLabel("Maximum simultaneous streams", { exact: true })
+      .fill("2");
+    await page
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect
+      .poll(() => api.effectiveSettings().playback.maxStreams)
+      .toBe(2);
+    expect(api.providerPatches).toEqual([]);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `/tmp/restream-settings-env-full-${width}.png`,
+        fullPage: true,
+      });
+  });
+}
+
+test("Settings completes provider setup when only the portal URL is managed by environment", async ({
+  page,
+}) => {
+  const api = await mockApi(page, {
+    unconfigured: true,
+    providerEnvironment: ["portalUrl"],
+  });
+  await page.goto("/?view=settings");
+  await expect(page.getByLabel("Portal URL", { exact: true })).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Refresh now", exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByLabel("MAC address", { exact: true })
+    .fill("00:11:22:33:44:55");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect.poll(() => api.providerPatches.length).toBe(1);
+  expect(api.providerPatches[0]).not.toHaveProperty("portalUrl");
+  expect(api.providerPatches[0]).toHaveProperty("mac", "00:11:22:33:44:55");
+  await expect(
+    page.getByRole("button", { name: "Refresh now", exact: true }),
+  ).toBeEnabled();
+});
+
+test("Settings keeps failed drafts and masks, retains and clears the TMDB token", async ({
+  page,
+}) => {
+  let fail = true;
+  const api = await mockApi(page, { settingsSaveFailure: () => fail });
+  await page.goto("/?view=settings");
+  const token = page.getByLabel("TMDB read access token", { exact: true });
+  await expect(token).toHaveAttribute("type", "password");
+  await token.fill("example-browser-test-token");
+  await page.getByLabel("Timezone", { exact: true }).fill("Europe/London");
+  await page.getByLabel("Guide coverage in hours", { exact: true }).fill("24");
+  await page
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .fill("3");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(
+    page.getByRole("alert").filter({ hasText: "Settings could not be saved" }),
+  ).toBeVisible();
+  await expect(token).toHaveValue("example-browser-test-token");
+  await expect(page.getByLabel("Timezone", { exact: true })).toHaveValue(
+    "Europe/London",
+  );
+  await expect(
+    page.getByLabel("Guide coverage in hours", { exact: true }),
+  ).toHaveValue("24");
+  await expect(
+    page.getByLabel("Maximum simultaneous streams", { exact: true }),
+  ).toHaveValue("3");
+  expect(api.effectiveSettings().playback.maxStreams).toBe(1);
+  expect(api.effectiveSettings().discovery.tmdbTokenConfigured).toBe(false);
+  fail = false;
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect
+    .poll(() => api.effectiveSettings().discovery.tmdbTokenConfigured)
+    .toBe(true);
+  await expect(token).toHaveValue("");
+  expect(Object.keys(api.settingsPatches[1]).sort()).toEqual([
+    "discovery",
+    "library",
+    "playback",
+    "provider",
+  ]);
+  expect(api.settingsPatches[1]).toEqual(api.settingsPatches[0]);
+  await page.reload();
+  await expect(token).toHaveValue("");
+  expect(await page.locator("body").innerText()).not.toContain(
+    "example-browser-test-token",
+  );
+  await page.getByRole("button", { name: "Remove token", exact: true }).click();
+  await expect(
+    page.getByText("Token will be removed when you save.", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Discard changes", exact: true })
+    .click();
+  expect(api.effectiveSettings().discovery.tmdbTokenConfigured).toBe(true);
+  await expect(
+    page.getByRole("button", { name: "Save changes", exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .fill("2");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(
+    page.getByText("All changes saved.", { exact: true }),
+  ).toBeVisible();
+  expect(api.settingsPatches.at(-1)).toEqual({
+    playback: { maxStreams: 2, transcodeMode: "auto" },
+  });
+  expect(api.effectiveSettings().discovery.tmdbTokenConfigured).toBe(true);
+  await page.getByRole("button", { name: "Remove token", exact: true }).click();
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect
+    .poll(() => api.effectiveSettings().discovery.tmdbTokenConfigured)
+    .toBe(false);
+});
+
+test("Settings releases playback and refreshes metadata without changing saved configuration", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 1440, height: 1024 });
@@ -2628,7 +3738,7 @@ test("Settings releases playback and refreshes metadata without changing environ
   await expect(page.locator(".primary-control")).toBeEnabled();
   await playableVideo(page);
   const originalVideo = await page.locator("video").elementHandle();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await openSettings(page);
   await expect(
     page.getByRole("heading", { name: "Settings", exact: true }),
   ).toBeVisible();
@@ -2642,19 +3752,21 @@ test("Settings releases playback and refreshes metadata without changing environ
   await expect(page.locator(".site-header").getByRole("searchbox")).toHaveCount(
     0,
   );
-  await expect(settingValue(page, "Refresh interval")).toHaveText("6 hours");
-  await expect(settingValue(page, "Dashboard")).toHaveText("All");
-  await expect(settingValue(page, "Blocked")).toHaveText("None");
+  await expect(
+    page.getByRole("combobox", { name: "Refresh every", exact: true }),
+  ).toContainText("6 hours");
   const configuration = api.effectivePreferences();
   const refresh = page.getByRole("button", {
-    name: "Refresh now",
-    exact: true,
+    name: /^(Refresh now|Refreshing…|Refreshed)$/,
   });
   await refresh.click();
   await expect
     .poll(() => api.events.filter((event) => event.startsWith("REFRESH:")))
     .toEqual(["REFRESH:all"]);
   await expect(refresh).toBeDisabled();
+  await expect(refresh).toHaveAccessibleName("Refreshing…");
+  await expect(refresh).toHaveAttribute("aria-busy", "true");
+  await expect(refresh).toHaveAccessibleName("Refreshed", { timeout: 8000 });
   await expect(refresh).toBeEnabled({ timeout: 8000 });
   expect(api.effectivePreferences()).toEqual(configuration);
   expect(
@@ -2672,44 +3784,6 @@ test("Settings releases playback and refreshes metadata without changing environ
   await expect.poll(() => api.sessionItemIds).toEqual([live.id, live.id]);
 });
 
-test("a configuration deployment updates read-only Settings without browser mutations", async ({
-  page,
-}) => {
-  const api = await mockApi(page);
-  await page.goto("/?view=settings");
-  await expect(settingValue(page, "Refresh interval")).toHaveText("6 hours");
-  const next = api.effectivePreferences();
-  next.refreshIntervalSeconds = 86400;
-  next.configuration = {
-    dashboardCategories: ["movie:drama-movie"],
-    blockedCategories: ["live:documentary", "series:drama-series"],
-  };
-  next.categories = [
-    { kind: "live", id: "news", visibility: "show", dashboard: false },
-    { kind: "live", id: "documentary", visibility: "block", dashboard: false },
-    {
-      kind: "series",
-      id: "drama-series",
-      visibility: "block",
-      dashboard: false,
-    },
-  ];
-  api.deployConfiguration(next);
-  await expect(settingValue(page, "Refresh interval")).toHaveText("1 day", {
-    timeout: 12000,
-  });
-  await expect(settingValue(page, "Dashboard")).toContainText(
-    "movie:drama-movie",
-  );
-  await expect(settingValue(page, "Blocked")).toContainText("live:documentary");
-  await expect(settingValue(page, "Blocked")).toContainText(
-    "series:drama-series",
-  );
-  await page.reload();
-  await expect(settingValue(page, "Refresh interval")).toHaveText("1 day");
-  expect(api.mutations).toEqual([]);
-});
-
 test("Settings reports configuration and refresh failures and respects provider cooldowns", async ({
   page,
 }) => {
@@ -2720,13 +3794,15 @@ test("Settings reports configuration and refresh failures and respects provider 
   });
   await page.goto("/?view=settings");
   await expect(
-    page.getByRole("alert").filter({ hasText: "Configuration unavailable." }),
+    page.getByRole("alert").filter({ hasText: "Settings unavailable." }),
   ).toBeVisible();
   configurationUnavailable = false;
   await page
-    .getByRole("button", { name: "Retry configuration", exact: true })
+    .getByRole("button", { name: "Retry settings", exact: true })
     .click();
-  await expect(settingValue(page, "Dashboard")).toHaveText("All");
+  await expect(page.getByLabel("Portal URL", { exact: true })).toHaveValue(
+    "http://provider.example",
+  );
   await page.getByRole("button", { name: "Refresh now", exact: true }).click();
   await expect(
     page
@@ -2754,62 +3830,114 @@ test("Settings reports configuration and refresh failures and respects provider 
   ).toBeDisabled();
 });
 
-test("read-only Settings remains usable on mobile and handles an unconfigured provider", async ({
-  page,
-}) => {
-  await page.setViewportSize({ width: 390, height: 844 });
-  const api = await mockApi(page);
-  await page.goto("/?section=live");
-  await page
-    .getByRole("navigation", { name: "Primary navigation" })
-    .getByRole("button", { name: "Settings", exact: true })
-    .click();
-  await expect(
-    page.getByRole("heading", { name: "Settings", exact: true }),
-  ).toBeVisible();
-  expect(new URL(page.url()).searchParams.get("view")).toBe("settings");
-  await expect(settingValue(page, "Refresh interval")).toHaveText("6 hours");
-  await page.getByRole("button", { name: "Refresh now", exact: true }).click();
-  await expect(
-    page.getByRole("button", { name: "Refresh now", exact: true }),
-  ).toBeEnabled({ timeout: 8000 });
-  expect(api.mutations).toEqual([{ method: "POST", path: "/api/refresh" }]);
-  if (process.env.CAPTURE_SCREENSHOTS)
-    await page.screenshot({
-      path: "../output/environment-review/settings-mobile.png",
-      fullPage: false,
-    });
-  await page.setViewportSize({ width: 320, height: 844 });
-  const next = api.effectivePreferences();
-  next.configuration.dashboardCategories = [
-    "movie:Very long provider category name for classic movies with restored editions",
-  ];
-  api.deployConfiguration(next);
-  await page.reload();
-  await expect(settingValue(page, "Dashboard")).toContainText(
-    "Very long provider category name",
-  );
-  expect(
-    await page.evaluate(() => document.documentElement.scrollWidth),
-  ).toBeLessThanOrEqual(320);
-  for (const role of ["combobox", "checkbox", "textbox", "searchbox"] as const)
+for (const width of [1440, 390, 320]) {
+  test(`Settings supports first-run provider setup at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    const api = await mockApi(page, { unconfigured: true });
+    for (const [name, url] of [
+      ["home", "/"],
+      ["live", "/?section=live"],
+      ["movies", "/?section=movie"],
+      ["shows", "/?section=series"],
+      ["search", "/?view=search&search=North"],
+      ["player", "/?view=player&section=movie&item=movie-1"],
+    ]) {
+      await page.goto(url);
+      const notice = page.getByRole("status", {
+        name: "Provider setup",
+        exact: true,
+      });
+      await expect(notice).toHaveCount(1);
+      await expect(notice).toContainText(
+        "Connect your provider to start watching.",
+      );
+      await expect(
+        page.getByText("Provider not configured", { exact: true }),
+      ).toHaveCount(0);
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth),
+      ).toBeLessThanOrEqual(width);
+      if (process.env.CAPTURE_SCREENSHOTS)
+        await page.screenshot({
+          path: `../output/provider-setup/${name}-${width}.png`,
+        });
+      await notice
+        .getByRole("button", { name: "Open settings", exact: true })
+        .click();
+      await expect(
+        page.getByRole("heading", { name: "Settings", exact: true }),
+      ).toBeVisible();
+      await expect(notice).toHaveCount(0);
+    }
     await expect(
-      page
-        .getByRole("region", { name: "Settings", exact: true })
-        .getByRole(role),
-    ).toHaveCount(0);
-  if (process.env.CAPTURE_SCREENSHOTS)
-    await page.screenshot({
-      path: "../output/environment-review/settings-mobile-320.png",
-      fullPage: false,
+      page.getByRole("heading", { name: "Settings", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Refresh now", exact: true }),
+    ).toBeDisabled();
+    await page
+      .getByLabel("Portal URL", { exact: true })
+      .fill("http://new-provider.example");
+    await page
+      .getByLabel("MAC address", { exact: true })
+      .fill("00:11:22:33:44:55");
+    await page.getByLabel("Timezone", { exact: true }).fill("UTC");
+    await page.getByText("Device identity", { exact: true }).click();
+    await page
+      .getByLabel("Serial number", { exact: true })
+      .fill("registered-serial");
+    await page
+      .getByLabel("Device ID", { exact: true })
+      .fill("registered-device");
+    await page
+      .getByLabel("Secondary device ID", { exact: true })
+      .fill("registered-device-two");
+    await page
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect
+      .poll(() => api.effectiveSettings().provider.portalUrl)
+      .toBe("http://new-provider.example");
+    await expect(
+      page.getByRole("button", { name: "Refresh now", exact: true }),
+    ).toBeEnabled();
+    await page.reload();
+    await expect(page.getByLabel("Portal URL", { exact: true })).toHaveValue(
+      "http://new-provider.example",
+    );
+    await page.getByText("Device identity", { exact: true }).click();
+    await expect(page.getByLabel("Serial number", { exact: true })).toHaveValue(
+      "registered-serial",
+    );
+    await expect(page.getByLabel("Device ID", { exact: true })).toHaveValue(
+      "registered-device",
+    );
+    await expect(
+      page.getByLabel("Secondary device ID", { exact: true }),
+    ).toHaveValue("registered-device-two");
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `/tmp/restream-settings-editable-${width}.png`,
+        fullPage: true,
+      });
+    const navigation = page.getByRole("navigation", {
+      name: width <= 820 ? "Primary navigation" : "Library",
+      exact: true,
     });
-  await page.unrouteAll({ behavior: "wait" });
-  await mockApi(page, { unconfigured: true });
-  await page.reload();
-  await expect(
-    page.getByRole("button", { name: "Refresh now", exact: true }),
-  ).toBeDisabled();
-});
+    await navigation.getByRole("button", { name: "Home", exact: true }).click();
+    await expect(
+      page.getByRole("region", { name: "Home", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("status", { name: "Provider setup", exact: true }),
+    ).toHaveCount(0);
+  });
+}
 
 test("native HLS playback keeps the decoder and worker out of browser requests", async ({
   page,
@@ -3012,7 +4140,7 @@ test("a fatal HLS manifest failure clears media and remains retryable", async ({
   expect(errors).toEqual([]);
 });
 
-test("season episodes load on demand and returning to a season uses the browser cache", async ({
+test("season episodes load on demand and returning shows cached results while checking the backend", async ({
   page,
 }) => {
   const api = await mockApi(page);
@@ -3039,14 +4167,14 @@ test("season episodes load on demand and returning to a season uses the browser 
   await selector.click();
   await page.getByRole("option", { name: "Season 2" }).click();
   await expect(
-    page.getByRole("button", { name: "Play episode", exact: true }),
+    page.getByRole("button", { name: "Play", exact: true }),
   ).toBeDisabled();
   await expect(page.getByRole("button", { name: /Fresh Start/ })).toBeVisible();
   expect(requested).toEqual(["first", "2"]);
   await selector.click();
   await page.getByRole("option", { name: "Season 1" }).click();
   await expect(page.getByRole("button", { name: /First Light/ })).toBeVisible();
-  expect(requested).toEqual(["first", "2"]);
+  await expect.poll(() => requested).toEqual(["first", "2", "1"]);
   expect(api.events).not.toContain("POST");
 });
 
@@ -3161,6 +4289,31 @@ test("dashboard history records playing media, survives reloads, reopens a seaso
       .getByRole("region", { name: "Recently played" })
       .locator(".discovery-recent-card"),
   ).toHaveCount(3);
+  const combinedHistory = page.getByRole("region", {
+    name: "Recently played",
+    exact: true,
+  });
+  await expect(
+    combinedHistory.getByRole("group", { name: "History type", exact: true }),
+  ).toHaveCount(0);
+  expect(
+    await combinedHistory
+      .getByRole("button", { name: /^Open / })
+      .evaluateAll((buttons) =>
+        buttons.map((button) => button.getAttribute("aria-label")),
+      ),
+  ).toEqual(["Open Night Shift", "Open The Quiet Coast", "Open North News"]);
+  if (process.env.CAPTURE_SCREENSHOTS) {
+    const viewport = page.viewportSize()!;
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 900 });
+      await combinedHistory.screenshot({
+        path: `../output/cinema-review/${width}-recently-played-combined.png`,
+        animations: "disabled",
+      });
+    }
+    await page.setViewportSize(viewport);
+  }
   await expect(
     page.getByRole("region", { name: "Recently played" }),
   ).toContainText("S2 · E1");
@@ -3316,6 +4469,82 @@ test("dashboard remains usable when browser storage is blocked", async ({
   await expect(
     page.getByRole("region", { name: "Recently played" }),
   ).toHaveCount(0);
+  await page.getByRole("button", { name: "Undo", exact: true }).click();
+  await expect(
+    page
+      .getByRole("region", { name: "Recently played", exact: true })
+      .getByRole("button", { name: "Open North News", exact: true }),
+  ).toBeVisible();
+});
+
+test("Play animates on hover and keyboard focus, respects reduced motion and stays static while opening", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  const api = await mockApi(page);
+  let releaseVerify!: () => void;
+  const verification = new Promise<void>((resolve) => {
+    releaseVerify = resolve;
+  });
+  await page.route(`**/api/items/${movie.id}`, async (route) => {
+    await verification;
+    await route.fallback();
+  });
+  await page.goto("/?view=dashboard");
+  const play = page.getByRole("button", {
+    name: `Play ${movie.name}`,
+    exact: true,
+  });
+  const glyph = play.locator(".play-action-glyph");
+  const running = () =>
+    glyph.evaluate((element) =>
+      element
+        .getAnimations()
+        .some((animation) => animation.playState === "running"),
+    );
+  await play.hover();
+  await expect.poll(running).toBe(true);
+  if (process.env.CAPTURE_SCREENSHOTS) {
+    await glyph.evaluate((element) =>
+      element.getAnimations().forEach((animation) => {
+        animation.pause();
+        animation.currentTime = 90;
+      }),
+    );
+    await page.screenshot({
+      path: "../output/settings-design/play-hover-desktop.png",
+    });
+  }
+  await glyph.evaluate((element) =>
+    element.getAnimations().forEach((animation) => animation.finish()),
+  );
+  await page.mouse.move(0, 0);
+  await page.keyboard.press("Tab");
+  await play.focus();
+  await expect(play).toBeFocused();
+  await expect.poll(running).toBe(true);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect
+    .poll(() => glyph.evaluate((element) => element.getAnimations().length))
+    .toBe(0);
+  await play.hover();
+  await expect
+    .poll(() => glyph.evaluate((element) => element.getAnimations().length))
+    .toBe(0);
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  try {
+    await play.click();
+    await expect(play).toBeDisabled();
+    await expect(play).toHaveAttribute("aria-busy", "true");
+    await expect(play.locator(".play-action-glyph")).toHaveCount(0);
+  } finally {
+    releaseVerify();
+  }
+  await expect.poll(() => api.sessionItemIds).toEqual([movie.id]);
+  await expect(
+    page.getByRole("region", { name: "Player", exact: true }),
+  ).toBeVisible();
 });
 
 test("dashboard resumes the full source position and Play again starts at zero", async ({
@@ -3472,60 +4701,379 @@ test("another tab can clear dashboard history without ongoing player progress re
   await dashboardTab.close();
 });
 
-test("dashboard discovery has real title actions and keeps personal sections absent without history", async ({
-  page,
-}) => {
-  const api = await mockApi(page, {
-    discoveryResponse: {
+async function accelerateHeroRotation(page: Page) {
+  // Keep native crossfades running while shortening only the rotation delay.
+  await page.addInitScript(() => {
+    const schedule = window.setTimeout.bind(window);
+    window.setTimeout = ((handler, delay, ...args) =>
+      schedule(
+        handler,
+        delay === 8000 ? 1800 : delay,
+        ...args,
+      )) as typeof window.setTimeout;
+  });
+}
+
+for (const width of [1440, 390]) {
+  test(`hero rotates Trending and saved titles and resumes the right source at ${width}px`, async ({
+    page,
+  }) => {
+    test.setTimeout(60000);
+    await page.setViewportSize({ width, height: 900 });
+    await accelerateHeroRotation(page);
+    const savedMovie = {
+      ...movie,
+      id: "saved-movie",
+      name: "An Earlier Film",
+      image: "/artwork-title.svg",
+    };
+    await page.addInitScript(
+      ({ key, savedMovie, series, episode, watchedAt }) => {
+        localStorage.setItem(
+          key,
+          JSON.stringify({
+            version: 1,
+            entries: [
+              {
+                title: series,
+                item: episode,
+                watchedAt,
+                position: 240,
+                duration: 1800,
+                completed: false,
+              },
+              {
+                title: savedMovie,
+                item: savedMovie,
+                watchedAt: watchedAt - 1000,
+                position: 300,
+                duration: 3600,
+                completed: false,
+              },
+            ],
+          }),
+        );
+      },
+      {
+        key: historyKey,
+        savedMovie,
+        series,
+        episode: episodes[1],
+        watchedAt: now,
+      },
+    );
+    const api = await mockApi(page, {
+      catalogItems: [live, movie, series, savedMovie],
+      discoveryResponse: {
+        configured: true,
+        refreshing: false,
+        trendingMovies: [
+          { item: movie, name: movie.name, backdrop: "/artwork-title.svg" },
+        ],
+        trendingSeries: [
+          { item: series, name: series.name, backdrop: "/artwork-title.svg" },
+        ],
+        exploreMovies: [],
+        exploreSeries: [],
+      },
+    });
+    await page.goto("/?view=dashboard");
+    const hero = page.getByRole("region", {
+      name: "Featured titles",
+      exact: true,
+    });
+    const heading = hero.getByRole("heading");
+    const advance = async () => {
+      const before = await heading.textContent();
+      await page.getByRole("button", { name: "Home", exact: true }).focus();
+      await page.mouse.move(0, 0);
+      await expect(heading).not.toHaveText(before!, { timeout: 4500 });
+    };
+    const select = async (name: string) => {
+      for (let index = 0; index < 3; index++) {
+        if ((await heading.textContent()) === name) {
+          await hero.hover();
+          return;
+        }
+        await advance();
+      }
+      await expect(heading).toHaveText(name);
+    };
+    await expect(hero).toBeVisible();
+    await expect(hero.getByRole("button")).toHaveCount(1);
+    const initial = await heading.textContent();
+    const seen = new Set<string | null>();
+    for (let index = 0; index < 3; index++) {
+      seen.add(await heading.textContent());
+      await advance();
+    }
+    expect([...seen].sort()).toEqual(
+      [movie.name, series.name, savedMovie.name].sort(),
+    );
+    await expect(heading).toHaveText(initial!);
+    for (const entry of [
+      { title: series, item: episodes[1], position: 240, percent: 13 },
+      { title: savedMovie, item: savedMovie, position: 300, percent: 8 },
+    ]) {
+      await select(entry.title.name);
+      await expect(
+        hero.getByRole("progressbar", { name: "Watch progress" }),
+      ).toHaveAttribute("aria-valuenow", String(entry.percent));
+      const resume = hero.getByRole("button", {
+        name: `Continue watching ${entry.title.name}`,
+        exact: true,
+      });
+      await expect(resume).toHaveText("Continue watching");
+      if (entry.title.kind === "series")
+        await expect(hero).toContainText("S1 · E2");
+      if (process.env.CAPTURE_SCREENSHOTS)
+        await page.screenshot({
+          path: `/tmp/restream-hero-resume-${entry.title.kind}-${width}.png`,
+        });
+      await resume.click();
+      await expect.poll(() => api.sessionStarts.at(-1)).toBe(entry.position);
+      expect(api.sessionItemIds.at(-1)).toBe(entry.item.id);
+      await expect(
+        page.getByRole("region", { name: "Player", exact: true }),
+      ).toBeVisible();
+      await page
+        .getByRole("button", { name: "Stop playback", exact: true })
+        .click();
+      await expect(hero).toBeVisible();
+    }
+    await select(movie.name);
+    await expect(hero.getByRole("progressbar")).toHaveCount(0);
+    await hero
+      .getByRole("button", { name: `Play ${movie.name}`, exact: true })
+      .click();
+    await expect.poll(() => api.sessionItemIds.at(-1)).toBe(movie.id);
+    expect(api.sessionStarts.at(-1)).toBe(0);
+    await page
+      .getByRole("button", { name: "Stop playback", exact: true })
+      .click();
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+  });
+
+  test(`hero crossfades without repeating or jumping on refresh and pauses during interaction at ${width}px`, async ({
+    page,
+  }) => {
+    test.setTimeout(60000);
+    await page.setViewportSize({ width, height: 900 });
+    await accelerateHeroRotation(page);
+    const other = {
+      ...movie,
+      id: "another-trend",
+      name: "Another Trending Film",
+    };
+    const discovery = {
       configured: true,
       refreshing: false,
-      trendingMovies: [
-        {
-          tmdbId: 17,
-          item: movie,
-          name: movie.name,
-          overview: movie.description,
-          poster: "/artwork-title.svg",
-          backdrop: "/artwork-title.svg",
-          year: 2026,
-          rating: 7.8,
-        },
-      ],
+      trendingMovies: [movie, other].map((item) => ({
+        item,
+        name: item.name,
+        backdrop: `/artwork-title.svg?hero=${item.id}`,
+      })),
       trendingSeries: [
         {
-          tmdbId: 19,
           item: series,
           name: series.name,
-          poster: "/artwork-title.svg",
-          backdrop: "/artwork-title.svg",
+          backdrop: `/artwork-title.svg?hero=${series.id}`,
         },
       ],
       exploreMovies: [],
       exploreSeries: [],
-    },
+    };
+    await mockApi(page, { discoveryResponse: discovery });
+    await page.goto("/?view=dashboard");
+    const hero = page.getByRole("region", {
+      name: "Featured titles",
+      exact: true,
+    });
+    const heading = hero.getByRole("heading");
+    await expect(heading).toHaveText(movie.name);
+    const initialHeight = (await hero.boundingBox())!.height;
+    const tick = async (rotates = false) => {
+      if (rotates) {
+        const before = await heading.textContent();
+        await expect(heading).not.toHaveText(before!, { timeout: 4500 });
+      } else {
+        await page.waitForTimeout(2200);
+      }
+    };
+    const seen = new Set([await heading.textContent()]);
+    await tick(true);
+    await expect(heading).not.toHaveText(movie.name);
+    seen.add(await heading.textContent());
+    await tick(true);
+    seen.add(await heading.textContent());
+    expect(seen.size).toBe(3);
+    expect((await hero.boundingBox())!.height).toBe(initialHeight);
+    let current = (await heading.textContent())!;
+    await hero.hover();
+    await tick();
+    await expect(heading).toHaveText(current);
+    await page.mouse.move(0, 0);
+    await hero.getByRole("button", { name: /^Play / }).focus();
+    await tick();
+    await expect(heading).toHaveText(current);
+    await page.getByRole("button", { name: "Home", exact: true }).focus();
+    await page.mouse.move(0, 0);
+    await tick(true);
+    await expect(heading).not.toHaveText(current);
+    current = (await heading.textContent())!;
+    await hero.hover();
+    const response = page.waitForResponse("**/api/discovery");
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await response;
+    await page.waitForTimeout(700);
+    await expect(heading).toHaveText(current);
+    const remainingMovies = discovery.trendingMovies.filter(
+      (title) => title.name !== current,
+    );
+    const remainingSeries = discovery.trendingSeries.filter(
+      (title) => title.name !== current,
+    );
+    discovery.trendingMovies.splice(
+      0,
+      discovery.trendingMovies.length,
+      ...remainingMovies,
+    );
+    discovery.trendingSeries.splice(
+      0,
+      discovery.trendingSeries.length,
+      ...remainingSeries,
+    );
+    const updated = page.waitForResponse("**/api/discovery");
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await updated;
+    await expect(hero.locator(".discovery-feature")).not.toHaveAttribute(
+      "aria-label",
+      `Featured ${current}`,
+    );
+    await page.waitForTimeout(700);
+    await expect(heading).not.toHaveText(current);
+    current = (await heading.textContent())!;
+    await page.mouse.move(0, 0);
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hidden", {
+        configurable: true,
+        value: true,
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await tick();
+    await expect(heading).toHaveText(current);
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hidden", {
+        configurable: true,
+        value: false,
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await tick(true);
+    await expect(heading).not.toHaveText(current);
+    current = (await heading.textContent())!;
+    await page.setViewportSize({ width, height: 350 });
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await expect(hero).not.toBeInViewport();
+    await tick();
+    await expect(heading).toHaveText(current);
+    await page.setViewportSize({ width, height: 900 });
+    await hero.scrollIntoViewIfNeeded();
+    await tick(true);
+    await expect(heading).not.toHaveText(current);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
   });
+}
+
+test("hero keeps automatic rotation off for reduced motion without extra controls", async ({
+  page,
+}) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.clock.install();
+  await mockApi(page);
   await page.goto("/?view=dashboard");
-  await expectHome(page);
+  const hero = page.getByRole("region", {
+    name: "Featured titles",
+    exact: true,
+  });
+  const heading = hero.getByRole("heading");
+  await expect(heading).toHaveText(movie.name);
+  await page.clock.fastForward(20000);
+  await expect(heading).toHaveText(movie.name);
+  await expect(hero.getByRole("button")).toHaveCount(1);
   await expect(
-    page.getByRole("region", { name: "Continue watching" }),
-  ).toHaveCount(0);
-  await expect(
-    page.getByRole("region", { name: "Recently played" }),
-  ).toHaveCount(0);
-  await expect(
-    page.getByText("The Quiet Coast", { exact: true }).first(),
+    hero.getByRole("button", { name: `Play ${movie.name}`, exact: true }),
   ).toBeVisible();
-  expect(api.events).not.toContain("POST");
-  await page
-    .getByRole("button", { name: /Play The Quiet Coast/ })
-    .first()
-    .click();
-  await expect.poll(() => api.sessionItemIds).toEqual(["movie-1"]);
-  await expect(
-    page.getByRole("region", { name: "Player", exact: true }),
-  ).toBeVisible();
-  await page.getByRole("button", { name: "Stop playback" }).click();
 });
+
+for (const title of [movie, series]) {
+  for (const width of [1440, 390]) {
+    test(`dashboard ${title.kind} hero has one Play action at ${width}px`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width, height: 900 });
+      const feature = {
+        tmdbId: 17,
+        item: title,
+        name: title.name,
+        overview: "A title from your library.",
+        poster: "/artwork-title.svg",
+        backdrop: "/artwork-title.svg",
+        year: 2026,
+        rating: 7.8,
+      };
+      const api = await mockApi(page, {
+        discoveryResponse: {
+          configured: true,
+          refreshing: false,
+          trendingMovies: title.kind === "movie" ? [feature] : [],
+          trendingSeries: title.kind === "series" ? [feature] : [],
+          exploreMovies: [],
+          exploreSeries: [],
+        },
+      });
+      await page.goto("/?view=dashboard");
+      await expectHome(page);
+      await expect(
+        page.getByRole("region", { name: "Continue watching" }),
+      ).toHaveCount(0);
+      await expect(
+        page.getByRole("region", { name: "Recently played" }),
+      ).toHaveCount(0);
+      const hero = page.getByRole("region", {
+        name: `Featured ${title.name}`,
+        exact: true,
+      });
+      await expect(
+        hero.getByRole("heading", { name: title.name, exact: true }),
+      ).toBeVisible();
+      const play = hero.getByRole("button", {
+        name: `Play ${title.name}`,
+        exact: true,
+      });
+      await expect(hero.getByRole("button")).toHaveCount(1);
+      await expect(play).toHaveText("Play");
+      expect(api.events).not.toContain("POST");
+      if (process.env.CAPTURE_SCREENSHOTS)
+        await page.screenshot({
+          path: `/tmp/restream-play-${title.kind}-${width}.png`,
+        });
+      await play.click();
+      await expect
+        .poll(() => api.sessionItemIds)
+        .toEqual([title.kind === "series" ? "episode-1" : title.id]);
+      await expect(
+        page.getByRole("region", { name: "Player", exact: true }),
+      ).toBeVisible();
+      await page.getByRole("button", { name: "Stop playback" }).click();
+    });
+  }
+}
 
 test("a direct series player route resolves its episode and reload resumes progress without duplicate sessions", async ({
   page,
@@ -3665,7 +5213,7 @@ test("a pending Dashboard Play request cannot reopen the player after leaving", 
       .getByRole("button", { name: `Play ${movie.name}`, exact: true })
       .click();
     await requested;
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await openSettings(page);
     await expect(
       page.getByRole("heading", { name: "Settings", exact: true }),
     ).toBeVisible();
@@ -3929,7 +5477,7 @@ test("dashboard discovery preserves playback metadata and sidebar movies switch 
     .toBe(2);
 });
 
-test("environment category policy filters the whole Dashboard and blocks playback after deployment without deleting history", async ({
+test("saved category policy filters the whole Dashboard and blocks playback after updates without deleting history", async ({
   page,
 }) => {
   const allowed = { ...movie, categoryId: "drama-movie" };
@@ -4130,7 +5678,7 @@ test("environment category policy filters the whole Dashboard and blocks playbac
   ).toBe(4);
 });
 
-test("Dashboard applies raw environment rules to stale and mixed-case history without deleting records", async ({
+test("Dashboard applies saved category rules to stale and mixed-case history without deleting records", async ({
   page,
 }) => {
   const allowed = {
@@ -4295,7 +5843,7 @@ for (const base of [movie, series, live]) {
       .click();
     await page
       .getByRole("button", {
-        name: base.kind === "series" ? "Play episode" : "Play",
+        name: "Play",
         exact: true,
       })
       .click();
@@ -4393,7 +5941,7 @@ for (const base of [movie, series, live]) {
     }
     await page
       .getByRole("button", {
-        name: base.kind === "series" ? "Play episode" : "Play",
+        name: "Play",
         exact: true,
       })
       .click();
@@ -4447,6 +5995,7 @@ test("category dropdown supports keyboard selection and retains scoped VOD contr
     exact: true,
   });
   await expect(category).toHaveAttribute("aria-haspopup", "dialog");
+  await page.keyboard.press("Tab");
   await category.focus();
   await page.keyboard.press("Enter");
   await expect(page.getByRole("listbox")).toBeVisible();
@@ -4484,7 +6033,7 @@ test("category dropdown supports keyboard selection and retains scoped VOD contr
 });
 
 for (const width of [1440, 821, 390, 320]) {
-  test(`icon navigation reaches Home, Search, VOD, Live TV and Settings at ${width}px`, async ({
+  test(`icon navigation reaches Home, Search, VOD, Live TV and Account settings at ${width}px`, async ({
     page,
   }) => {
     const api = await mockApi(page);
@@ -4496,7 +6045,7 @@ for (const width of [1440, 821, 390, 320]) {
     });
     await expectHome(page);
     await expect(navigation.getByRole("button")).toHaveCount(5);
-    for (const name of ["Home", "Search", "VOD", "Live TV", "Settings"]) {
+    for (const name of ["Home", "Search", "VOD", "Live TV", "Account"]) {
       const button = navigation.getByRole("button", { name, exact: true });
       await expect(button).toBeVisible();
       await expect(button.locator("svg")).toHaveCount(1);
@@ -4542,9 +6091,7 @@ for (const width of [1440, 821, 390, 320]) {
         .getByRole("tablist", { name: "VOD type", exact: true })
         .getByRole("tab", { name: "Shows", exact: true }),
     ).toHaveAttribute("aria-selected", "true");
-    await navigation
-      .getByRole("button", { name: "Settings", exact: true })
-      .click();
+    await openSettings(page);
     await expect(
       page.getByRole("heading", { name: "Settings", exact: true }),
     ).toBeVisible();
@@ -4561,9 +6108,12 @@ for (const width of [1440, 390, 320]) {
   test(`long category dropdown scrolls and filters titles without page overflow at ${width}px`, async ({
     page,
   }) => {
+    const longCategory =
+      "Genre 23 — International independent cinema and award-winning documentaries";
     const categories = Array.from({ length: 60 }, (_, index) => ({
       id: `genre-${index}`,
-      name: `Genre ${String(index).padStart(2, "0")}`,
+      name:
+        index === 23 ? longCategory : `Genre ${String(index).padStart(2, "0")}`,
       kind: "movie",
     }));
     const titles = categories.map((category, index) => ({
@@ -4613,12 +6163,35 @@ for (const width of [1440, 390, 320]) {
       .getByRole("combobox", { name: "Find category", exact: true })
       .fill("Genre 23");
     await expect(
-      page.getByRole("option", { name: "Genre 23", exact: true }),
+      page.getByRole("option", { name: longCategory, exact: true }),
     ).toHaveAttribute("aria-selected", "true");
     await page.keyboard.press("Enter");
     await expect(
       page.getByRole("button", { name: "Open Film 23", exact: true }),
     ).toBeVisible();
+    await expect(category).toContainText(longCategory);
+    const selectedBounds = await category.boundingBox();
+    const tabsBounds = await page
+      .getByRole("tablist", { name: "VOD type", exact: true })
+      .boundingBox();
+    expect(selectedBounds).not.toBeNull();
+    expect(tabsBounds).not.toBeNull();
+    expect(selectedBounds!.x).toBeGreaterThanOrEqual(
+      tabsBounds!.x + tabsBounds!.width,
+    );
+    expect(
+      selectedBounds!.x - (tabsBounds!.x + tabsBounds!.width),
+    ).toBeLessThanOrEqual(32);
+    expect(
+      Math.abs(
+        selectedBounds!.y +
+          selectedBounds!.height / 2 -
+          (tabsBounds!.y + tabsBounds!.height / 2),
+      ),
+    ).toBeLessThanOrEqual(2);
+    expect(selectedBounds!.x + selectedBounds!.width).toBeLessThanOrEqual(
+      width,
+    );
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth),
     ).toBeLessThanOrEqual(width);
@@ -4650,7 +6223,7 @@ for (const title of [movie, series, live]) {
     }
     await page
       .getByRole("button", {
-        name: title.kind === "series" ? "Play episode" : "Play",
+        name: "Play",
         exact: true,
       })
       .click();
@@ -4684,7 +6257,7 @@ for (const title of [movie, series, live]) {
 }
 
 for (const reducedMotion of ["no-preference", "reduce"] as const) {
-  test(`play logo assembles once and respects ${reducedMotion} motion`, async ({
+  test(`dispersed play logo stays fragmented and respects ${reducedMotion} motion`, async ({
     page,
   }) => {
     await mockApi(page);
@@ -4700,7 +6273,16 @@ for (const reducedMotion of ["no-preference", "reduce"] as const) {
       "animation-name",
       reducedMotion === "reduce" ? "none" : "brand-assemble",
     );
-    await expect(brand.locator(".brand-resolved")).toHaveCSS("opacity", "1");
+    await expect(brand.locator(".brand-resolved")).toHaveCount(0);
+    await expect(brand.locator(".brand-fragment-top")).toHaveCSS(
+      "fill",
+      "rgb(245, 245, 247)",
+    );
+    for (const fragment of ["center", "tip"])
+      await expect(brand.locator(`.brand-fragment-${fragment}`)).toHaveCSS(
+        "fill",
+        "rgb(240, 138, 131)",
+      );
     for (const fragment of await fragments.all())
       await expect(fragment).toHaveCSS("opacity", "1");
     const before = await fragments
@@ -4839,9 +6421,7 @@ for (const width of [1440, 390, 320]) {
       .click();
     await expect(page).toHaveURL(origin);
     await expect(search).toHaveValue("North");
-    await navigation
-      .getByRole("button", { name: "Settings", exact: true })
-      .click();
+    await openSettings(page);
     await expect(
       page.getByRole("heading", { name: "Settings", exact: true }),
     ).toBeVisible();
@@ -4886,6 +6466,23 @@ for (const width of [1440, 390, 320]) {
       name: "Category",
       exact: true,
     });
+    const tabsBounds = await tabs.boundingBox();
+    const categoryBounds = await category.boundingBox();
+    expect(tabsBounds).not.toBeNull();
+    expect(categoryBounds).not.toBeNull();
+    const gap = categoryBounds!.x - (tabsBounds!.x + tabsBounds!.width);
+    expect(gap).toBeGreaterThanOrEqual(0);
+    expect(gap).toBeLessThanOrEqual(32);
+    expect(
+      Math.abs(
+        categoryBounds!.y +
+          categoryBounds!.height / 2 -
+          (tabsBounds!.y + tabsBounds!.height / 2),
+      ),
+    ).toBeLessThanOrEqual(2);
+    expect(categoryBounds!.x + categoryBounds!.width).toBeLessThanOrEqual(
+      width,
+    );
     const originalTabs = await tabs.elementHandle();
     const originalCategory = await category.elementHandle();
     const movies = tabs.getByRole("tab", { name: "Movies", exact: true });
@@ -4902,6 +6499,7 @@ for (const width of [1440, 390, 320]) {
       await shows.click();
       await expect(shows).toHaveAttribute("aria-selected", "true");
       await expect(shows).toBeFocused();
+      await expect(shows).toHaveCSS("outline-style", "none");
       const panel = page.getByRole("tabpanel", {
         name: "Shows",
         exact: true,
@@ -4941,7 +6539,13 @@ for (const width of [1440, 390, 320]) {
       await expect(shows).toBeFocused();
       await page.keyboard.press("ArrowLeft");
       await expect(movies).toBeFocused();
+      await expect(movies).toHaveCSS("outline-style", "none");
       await expect(shows).toHaveAttribute("aria-selected", "true");
+      if (process.env.CAPTURE_SCREENSHOTS)
+        await page.screenshot({
+          path: `../output/cinema-review/${width}-vod-keyboard-focus.png`,
+          animations: "disabled",
+        });
       await page.keyboard.press("Enter");
       await expect(movies).toHaveAttribute("aria-selected", "true");
       await expect(movies).toBeFocused();
@@ -4977,5 +6581,919 @@ for (const width of [1440, 390, 320]) {
     } finally {
       releaseShows();
     }
+  });
+}
+
+for (const width of [1440, 390]) {
+  test(`cached browse results update in place and stop polling at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    let ready = false;
+    let calls = 0;
+    await mockApi(page, {
+      browseResponse: async () => {
+        calls++;
+        return {
+          items: ready ? [{ ...movie, name: "New Coast" }] : [movie],
+          page: 1,
+          total: 1,
+          hasMore: false,
+          revision: ready ? 2 : 1,
+          stale: !ready,
+          refreshing: !ready,
+        };
+      },
+    });
+    await page.goto("/?section=movie");
+    await expect(
+      page.getByRole("button", { name: "Open The Quiet Coast" }),
+    ).toBeVisible();
+    const category = page.getByRole("combobox", {
+      name: "Category",
+      exact: true,
+    });
+    await category.focus();
+    ready = true;
+    await expect(
+      page.getByRole("button", { name: "Open New Coast" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Open The Quiet Coast" }),
+    ).toHaveCount(0);
+    await expect(category).toBeFocused();
+    const completed = calls;
+    await page.waitForTimeout(1200);
+    expect(calls).toBe(completed);
+  });
+
+  test(`search replaces shifted cached pages together at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    let ready = false;
+    let releaseThird!: () => void;
+    const thirdPage = new Promise<void>((resolve) => {
+      releaseThird = resolve;
+    });
+    const requests: string[] = [];
+    const a = { ...movie, id: "a", name: "Coast A" };
+    const b = { ...movie, id: "b", name: "Coast B" };
+    const x = { ...movie, id: "x", name: "Coast X" };
+    await mockApi(page, {
+      browseResponse: async (params) => {
+        if (params.get("kind") !== "movie")
+          return { items: [], page: 1, total: 0, hasMore: false };
+        requests.push(params.toString());
+        if (params.has("through"))
+          return {
+            items: ready ? [x, a, a] : [a, b],
+            page: 2,
+            total: 3,
+            hasMore: true,
+            revision: 2,
+            stale: !ready,
+            refreshing: !ready,
+          };
+        if (params.get("page") === "1")
+          return { items: [a], page: 1, total: 2, hasMore: true, revision: 1 };
+        if (params.get("page") === "2")
+          return {
+            items: [b],
+            page: 2,
+            total: 3,
+            hasMore: true,
+            revision: 2,
+            stale: true,
+            refreshing: true,
+          };
+        await thirdPage;
+        return { items: [b], page: 3, total: 3, hasMore: false, revision: 2 };
+      },
+    });
+    await page.goto("/?section=live");
+    const search = await openSearch(page);
+    await search.fill("Coast");
+    await expect(
+      page.getByRole("button", { name: "Open Coast A" }),
+    ).toBeVisible();
+    expect(new URLSearchParams(requests[0]).get("page")).toBe("1");
+    await expect
+      .poll(() => requests.some((query) => query.includes("through=2")))
+      .toBe(true);
+    await expect(
+      page.getByRole("button", { name: "Open Coast B" }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "Open Coast A" }),
+    ).toBeVisible();
+    ready = true;
+    await expect(
+      page.getByRole("button", { name: "Open Coast X" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Open Coast A" }),
+    ).toHaveCount(1);
+    await expect(
+      page.getByRole("button", { name: "Open Coast B" }),
+    ).toHaveCount(0);
+    await expect(search).toHaveValue("Coast");
+    await expect
+      .poll(() =>
+        requests.some(
+          (query) => new URLSearchParams(query).get("page") === "3",
+        ),
+      )
+      .toBe(true);
+    releaseThird();
+    await expect(
+      page.getByRole("button", { name: "Open Coast B" }),
+    ).toBeVisible();
+    expect(new URLSearchParams(requests.at(-1)).get("page")).toBe("3");
+    expect(new URLSearchParams(requests.at(-1)).has("through")).toBe(false);
+  });
+
+  test(`episode revalidation adds seasons while preserving selection at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    let ready = false;
+    let calls = 0;
+    const extra = {
+      ...episodes[2],
+      id: "episode-4",
+      episode: 2,
+      name: "New Arrival",
+    };
+    await mockApi(page, {
+      episodesResponse: (params) => {
+        calls++;
+        expect(params.get("season")).toBe("2");
+        return {
+          items: ready ? [episodes[2], extra] : [episodes[2]],
+          season: 2,
+          seasons: ready ? [1, 2, 3] : [1, 2],
+          refreshing: !ready,
+        };
+      },
+    });
+    await page.goto(
+      "/?section=series&item=series-1&season=2&episode=episode-3",
+    );
+    await expect(
+      page.getByRole("button", { name: "Play Fresh Start", exact: true }),
+    ).toBeVisible();
+    const season = page.getByRole("combobox", { name: "Season", exact: true });
+    await season.focus();
+    ready = true;
+    await expect(
+      page.getByRole("button", { name: "Play New Arrival", exact: true }),
+    ).toBeVisible();
+    await expect(season).toContainText("Season 2");
+    await expect(season).toBeFocused();
+    await expect(page.locator(".selected-episode")).toContainText(
+      "Fresh Start",
+    );
+    await season.click();
+    await expect(
+      page.getByRole("option", { name: "Season 3", exact: true }),
+    ).toBeVisible();
+    await page.keyboard.press("Escape");
+    const completed = calls;
+    await page.waitForTimeout(1200);
+    expect(calls).toBe(completed);
+  });
+}
+
+test("leaving a cached listing cancels its background revalidation", async ({
+  page,
+}) => {
+  let calls = 0;
+  await mockApi(page, {
+    browseResponse: async () => {
+      calls++;
+      return {
+        items: [movie],
+        page: 1,
+        total: 1,
+        hasMore: false,
+        revision: 1,
+        stale: true,
+        refreshing: true,
+      };
+    },
+  });
+  await page.goto("/?section=movie");
+  await expect(
+    page.getByRole("button", { name: "Open The Quiet Coast" }),
+  ).toBeVisible();
+  await navigateLibrary(page, "live");
+  await expect(
+    page.getByRole("button", { name: "Open North News" }),
+  ).toBeVisible();
+  const cancelled = calls;
+  await page.waitForTimeout(1200);
+  expect(calls).toBe(cancelled);
+  await expect(
+    page.getByRole("button", { name: "Open The Quiet Coast" }),
+  ).toHaveCount(0);
+});
+
+test("invalidated later pages stay hidden during provider backoff", async ({
+  page,
+}) => {
+  let ready = false;
+  let calls = 0;
+  const second = { ...movie, id: "second", name: "Second Coast" };
+  await mockApi(page, {
+    browseResponse: async (params) => {
+      if (params.get("kind") !== "movie")
+        return { items: [], page: 1, hasMore: false };
+      calls++;
+      if (params.has("through"))
+        return {
+          items: [movie, second],
+          page: 2,
+          total: 2,
+          hasMore: false,
+          revision: 2,
+          stale: true,
+          refreshing: false,
+        };
+      if (params.get("page") === "1")
+        return {
+          items: [movie],
+          page: 1,
+          total: 2,
+          hasMore: true,
+          revision: 2,
+        };
+      return {
+        items: [second],
+        page: 2,
+        total: 2,
+        hasMore: false,
+        revision: 2,
+        stale: !ready,
+        refreshing: false,
+      };
+    },
+  });
+  await page.goto("/?section=live");
+  await (await openSearch(page)).fill("Coast");
+  await expect(page.getByRole("alert")).toContainText(
+    "This listing could not be refreshed",
+  );
+  await expect(
+    page.getByRole("button", { name: "Open The Quiet Coast" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Open Second Coast" }),
+  ).toHaveCount(0);
+  const backedOff = calls;
+  await page.waitForTimeout(1200);
+  expect(calls).toBe(backedOff);
+  ready = true;
+  await page.getByRole("button", { name: "Retry movies", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Open Second Coast" }),
+  ).toBeVisible();
+});
+
+test("scheduled library updates retain the loaded search range until revalidation settles", async ({
+  page,
+}) => {
+  let settled = false;
+  const requests: string[] = [];
+  const second = { ...movie, id: "second", name: "Second Coast" };
+  const added = { ...movie, id: "added", name: "Added Coast" };
+  const api = await mockApi(page, {
+    browseResponse: async (params) => {
+      if (params.get("kind") !== "movie")
+        return { items: [], page: 1, hasMore: false };
+      requests.push(params.toString());
+      if (params.has("through"))
+        return {
+          items: settled ? [added, movie] : [movie, second],
+          page: 2,
+          total: 2,
+          hasMore: false,
+          revision: settled ? 2 : 1,
+          stale: !settled,
+          refreshing: !settled,
+        };
+      const pageNumber = Number(params.get("page"));
+      return {
+        items: pageNumber === 1 ? [movie] : [second],
+        page: pageNumber,
+        total: 2,
+        hasMore: pageNumber === 1,
+        revision: 1,
+      };
+    },
+  });
+  await page.goto("/?section=live");
+  const search = await openSearch(page);
+  await search.fill("Coast");
+  await expect(
+    page.getByRole("button", { name: "Open Second Coast" }),
+  ).toBeVisible();
+  await search.focus();
+  api.publishSnapshot();
+  await page.evaluate(() =>
+    document.dispatchEvent(new Event("visibilitychange")),
+  );
+  await expect
+    .poll(() => requests.some((query) => query.includes("through=2")))
+    .toBe(true);
+  await expect(
+    page.getByRole("button", { name: "Open Second Coast" }),
+  ).toBeVisible();
+  await expect(search).toHaveValue("Coast");
+  await expect(search).toBeFocused();
+  settled = true;
+  await expect(
+    page.getByRole("button", { name: "Open Added Coast" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Open Second Coast" }),
+  ).toHaveCount(0);
+  await expect(search).toBeFocused();
+});
+
+test("search waits for category policy then loads results without duplicate requests", async ({
+  page,
+}) => {
+  let release!: () => void;
+  const preferencesGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const api = await mockApi(page, { preferencesGate });
+  try {
+    await page.goto("/?view=search&search=Coast");
+    const requests = () =>
+      api.events.filter((event) => event.startsWith("BROWSE:"));
+    await expect(
+      page.getByRole("searchbox", { name: "Search library" }),
+    ).toBeVisible();
+    await page.waitForTimeout(450);
+    expect(requests()).toHaveLength(0);
+    release();
+    await expect.poll(() => requests().length).toBe(2);
+    await expect(
+      page.getByRole("button", { name: "Open The Quiet Coast" }),
+    ).toBeVisible();
+    expect(requests()).toHaveLength(2);
+  } finally {
+    release();
+  }
+});
+
+for (const width of [1440, 390]) {
+  test(`history undo preserves progress, newer entries and cross-tab clears at ${width}px`, async ({
+    page,
+    context,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await mockApi(page);
+    const saved = [
+      {
+        title: {
+          id: movie.id,
+          kind: movie.kind,
+          name: movie.name,
+          category: movie.category,
+        },
+        item: {
+          id: movie.id,
+          kind: movie.kind,
+          name: movie.name,
+          category: movie.category,
+        },
+        watchedAt: now,
+        updatedAt: now,
+        position: 300,
+        duration: 3600,
+        completed: false,
+      },
+      {
+        title: {
+          id: live.id,
+          kind: live.kind,
+          name: live.name,
+          category: live.category,
+        },
+        item: {
+          id: live.id,
+          kind: live.kind,
+          name: live.name,
+          category: live.category,
+        },
+        watchedAt: now - 1000,
+        updatedAt: now - 1000,
+        position: 0,
+        duration: 0,
+        completed: false,
+      },
+    ];
+    await page.goto("/?view=dashboard");
+    await page.evaluate(
+      ({ key, entries }) =>
+        localStorage.setItem(key, JSON.stringify({ version: 1, entries })),
+      { key: historyKey, entries: saved },
+    );
+    await page.reload();
+    const undo = page.getByRole("button", { name: "Undo", exact: true });
+    const read = () =>
+      page.evaluate(
+        (key) =>
+          JSON.parse(localStorage.getItem(key) || '{"entries":[]}').entries,
+        historyKey,
+      );
+    await page
+      .getByRole("button", {
+        name: `Remove ${movie.name} from history`,
+        exact: true,
+      })
+      .click();
+    await expect(undo).toBeVisible();
+    expect(
+      (await read()).map((entry: { title: { id: string } }) => entry.title.id),
+    ).toEqual([live.id]);
+    if (width <= 820) {
+      const pill = await undo.locator("..").boundingBox();
+      const nav = await page
+        .getByRole("navigation", { name: "Primary navigation" })
+        .boundingBox();
+      expect(pill!.y + pill!.height).toBeLessThan(nav!.y);
+    }
+    await undo.click();
+    expect(await read()).toEqual(saved);
+    await expect(undo).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "Clear history", exact: true })
+      .click();
+    expect(await read()).toEqual([]);
+    await undo.click();
+    expect(await read()).toEqual(saved);
+    await page
+      .getByRole("button", {
+        name: `Remove ${live.name} from history`,
+        exact: true,
+      })
+      .click();
+    await page
+      .getByRole("button", {
+        name: `Remove ${movie.name} from history`,
+        exact: true,
+      })
+      .click();
+    await undo.click();
+    expect(await read()).toEqual([saved[0]]);
+    await page
+      .getByRole("button", {
+        name: `Remove ${movie.name} from history`,
+        exact: true,
+      })
+      .click();
+    const other = await context.newPage();
+    await mockApi(other);
+    await other.goto("/?view=dashboard");
+    const newer = { ...saved[0], position: 900, updatedAt: now + 10000 };
+    await other.evaluate(
+      ({ key, entries }) =>
+        localStorage.setItem(key, JSON.stringify({ version: 1, entries })),
+      { key: historyKey, entries: [newer, saved[1]] },
+    );
+    await expect(
+      page.getByRole("button", {
+        name: `Remove ${movie.name} from history`,
+        exact: true,
+      }),
+    ).toBeVisible();
+    await undo.click();
+    expect(await read()).toEqual([newer, saved[1]]);
+    await page
+      .getByRole("button", {
+        name: `Remove ${movie.name} from history`,
+        exact: true,
+      })
+      .click();
+    await other.evaluate((key) => localStorage.removeItem(key), historyKey);
+    await expect(undo).toHaveCount(0);
+    await expect(
+      page.getByRole("region", { name: "Recently played", exact: true }),
+    ).toHaveCount(0);
+    expect(await read()).toEqual([]);
+    await other.close();
+  });
+
+  test(`history undo pauses for hover and focus and expires across navigation at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await mockApi(page);
+    await page.clock.install();
+    await page.goto("/?view=dashboard");
+    await page.evaluate(
+      ({ key, title, time }) =>
+        localStorage.setItem(
+          key,
+          JSON.stringify({
+            version: 1,
+            entries: [
+              {
+                title,
+                item: title,
+                watchedAt: time,
+                position: 300,
+                duration: 3600,
+                completed: false,
+              },
+            ],
+          }),
+        ),
+      { key: historyKey, title: movie, time: now },
+    );
+    await page.reload();
+    const undo = page.getByRole("button", { name: "Undo", exact: true });
+    await page
+      .getByRole("button", {
+        name: `Remove ${movie.name} from history`,
+        exact: true,
+      })
+      .click();
+    await undo.hover();
+    await page.clock.runFor(9000);
+    await expect(undo).toBeVisible();
+    await undo.focus();
+    await page.mouse.move(1, 1);
+    await page.clock.runFor(9000);
+    await expect(undo).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.clock.runFor(500);
+    await expect(undo).toHaveCount(0);
+    await page
+      .getByRole("button", {
+        name: `Remove ${movie.name} from history`,
+        exact: true,
+      })
+      .click();
+    await openSettings(page);
+    await expect(undo).toBeVisible();
+    await page.mouse.move(1, 1);
+    await page.clock.runFor(8500);
+    await expect(undo).toHaveCount(0);
+    await page.getByRole("button", { name: "Home", exact: true }).click();
+    await expect(undo).toHaveCount(0);
+    expect(
+      await page.evaluate((key) => localStorage.getItem(key), historyKey),
+    ).toBeNull();
+  });
+}
+
+for (const width of [1440, 390]) {
+  test(`direct player retries retain errors while resolving titles and episodes at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    const api = await mockApi(page, { episodesFailureOnce: true });
+    let itemAttempts = 0;
+    let releaseItem!: () => void;
+    const itemGate = new Promise<void>((resolve) => {
+      releaseItem = resolve;
+    });
+    await page.route("**/api/items/series-1", async (route) => {
+      if (++itemAttempts === 1)
+        return route.fulfill({
+          status: 503,
+          json: { error: "Title temporarily unavailable" },
+        });
+      await itemGate;
+      return route.fallback();
+    });
+    await page.goto(
+      "/?view=player&section=series&item=series-1&season=1&episode=episode-1",
+    );
+    const alert = page.getByRole("alert");
+    const retry = page.getByRole("button", { name: "Try again", exact: true });
+    await expect(alert).toContainText("Title temporarily unavailable");
+    try {
+      await retry.click();
+      await expect(retry).toHaveAttribute("aria-busy", "true");
+      await expect(retry).toBeFocused();
+      await expect(alert).toContainText("Title temporarily unavailable");
+    } finally {
+      releaseItem();
+    }
+    await expect(alert).toContainText("Episodes are temporarily unavailable");
+    await expect(retry).not.toHaveAttribute("aria-busy", "true");
+    let releaseEpisodes!: () => void;
+    const episodesGate = new Promise<void>((resolve) => {
+      releaseEpisodes = resolve;
+    });
+    await page.route("**/api/series/series-1/episodes?*", async (route) => {
+      await episodesGate;
+      return route.fallback();
+    });
+    try {
+      await retry.click();
+      await expect(retry).toHaveAttribute("aria-busy", "true");
+      await expect(retry).toHaveText("Retrying…");
+      await expect(retry).toBeFocused();
+      await expect(alert).toContainText("Episodes are temporarily unavailable");
+    } finally {
+      releaseEpisodes();
+    }
+    await expect(
+      page.getByRole("region", { name: "Player", exact: true }),
+    ).toBeVisible();
+    await expect(alert).toHaveCount(0);
+    expect(api.sessionItemIds).toEqual(["episode-1"]);
+  });
+}
+
+for (const width of [1440, 390]) {
+  test(`Trending retains its rail while refreshing and adds matches in place at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    const addedMovie = {
+      ...movie,
+      id: "movie-new-trend",
+      name: "A New Discovery",
+    };
+    const api = await mockApi(page, {
+      catalogItems: [live, movie, addedMovie, series],
+    });
+    let refreshing = false;
+    let expanded = false;
+    let requests = 0;
+    let release!: () => void;
+    let gate: Promise<void> | undefined;
+    await page.route("**/api/discovery", async (route) => {
+      requests++;
+      if (gate) await gate;
+      await route.fulfill({
+        json: {
+          configured: true,
+          refreshing,
+          trendingMovies: [movie, ...(expanded ? [addedMovie] : [])].map(
+            (item, index) => ({ tmdbId: index + 1, item, name: item.name }),
+          ),
+          trendingSeries: [{ tmdbId: 3, item: series, name: series.name }],
+          exploreMovies: [],
+          exploreSeries: [],
+        },
+      });
+    });
+    await page.goto("/?view=dashboard");
+    const rail = page.getByRole("region", {
+      name: "Trending now",
+      exact: true,
+    });
+    const first = rail.getByRole("button", {
+      name: `Open ${movie.name}`,
+      exact: true,
+    });
+    await expect(first).toBeVisible();
+    await rail.evaluate((node) => {
+      (node as HTMLElement).dataset.retained = "yes";
+    });
+    const feature = page.locator(".discovery-feature");
+    await feature.evaluate((node) => {
+      (node as HTMLElement).dataset.retained = "yes";
+    });
+    const before = requests;
+    refreshing = true;
+    gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    api.publishSnapshot();
+    try {
+      await page.evaluate(() =>
+        document.dispatchEvent(new Event("visibilitychange")),
+      );
+      await expect.poll(() => requests).toBeGreaterThan(before);
+      await expect(first).toBeVisible();
+      await expect(rail).toHaveAttribute("data-retained", "yes");
+      await expect(feature).toHaveAttribute("data-retained", "yes");
+      await expect(page.locator(".discovery-skeleton-grid")).toHaveCount(0);
+      if (process.env.CAPTURE_SCREENSHOTS)
+        await page.screenshot({
+          path: `/tmp/restream-trending-${width}-refreshing.png`,
+        });
+    } finally {
+      release();
+      gate = undefined;
+    }
+    await expect(
+      rail.getByRole("button", { name: `Open ${series.name}`, exact: true }),
+    ).toBeVisible();
+    expanded = true;
+    refreshing = false;
+    await page.waitForTimeout(5000);
+    await expect(rail).toHaveAttribute("data-retained", "yes");
+    await expect(
+      rail.getByRole("button", { name: `Open ${series.name}`, exact: true }),
+    ).toBeVisible();
+    const added = rail.getByRole("button", {
+      name: `Open ${addedMovie.name}`,
+      exact: true,
+    });
+    await expect(added).toBeVisible();
+    const settled = requests;
+    await page.waitForTimeout(5200);
+    expect(requests).toBe(settled);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `/tmp/restream-trending-${width}-settled.png`,
+      });
+  });
+
+  test(`Trending fills an empty rail progressively at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await mockApi(page);
+    let requests = 0;
+    let releaseProgress!: () => void;
+    const progress = new Promise<void>((resolve) => {
+      releaseProgress = resolve;
+    });
+    await page.route("**/api/discovery", async (route) => {
+      const requestNumber = ++requests;
+      const partial = requestNumber >= 2;
+      if (partial) await progress;
+      return route.fulfill({
+        json: {
+          configured: true,
+          refreshing: requestNumber < 3,
+          trendingMovies: partial
+            ? [{ tmdbId: 1, item: movie, name: movie.name }]
+            : [],
+          trendingSeries:
+            requestNumber >= 3
+              ? [{ tmdbId: 2, item: series, name: series.name }]
+              : [],
+          exploreMovies: [],
+          exploreSeries: [],
+        },
+      });
+    });
+    await page.goto("/?view=dashboard");
+    try {
+      await expect(page.locator(".discovery-skeleton-grid")).toBeVisible();
+    } finally {
+      releaseProgress();
+    }
+    const rail = page.getByRole("region", {
+      name: "Trending now",
+      exact: true,
+    });
+    await expect(
+      rail.getByRole("button", { name: `Open ${movie.name}`, exact: true }),
+    ).toBeVisible({ timeout: 4500 });
+    await expect.poll(() => requests, { timeout: 7000 }).toBe(3);
+    await expect(
+      rail.getByRole("button", { name: `Open ${series.name}`, exact: true }),
+    ).toBeVisible();
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+  });
+
+  test(`Trending mixes movies and shows with edge overlays and release captions at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const movies = Array.from({ length: 8 }, (_, index) => ({
+      item: index
+        ? { ...movie, id: `trending-movie-${index}`, name: `Film ${index}` }
+        : movie,
+      name: index ? `Film ${index}` : movie.name,
+      poster: "/artwork-title.svg",
+      releaseDate: index === 1 ? "2025" : "2026-10-01",
+      year: index === 1 ? 2025 : 2026,
+    }));
+    const shows = Array.from({ length: 8 }, (_, index) => ({
+      item: index
+        ? { ...series, id: `trending-show-${index}`, name: `Show ${index}` }
+        : series,
+      name: index ? `Show ${index}` : series.name,
+      poster: "/artwork-title.svg",
+      releaseDate: index === 1 ? undefined : "2024-02-29",
+      year: index === 1 ? undefined : 2024,
+    }));
+    const api = await mockApi(page, {
+      discoveryResponse: {
+        configured: true,
+        refreshing: false,
+        trendingMovies: movies,
+        trendingSeries: shows,
+        exploreMovies: [],
+        exploreSeries: [],
+      },
+    });
+    await page.goto("/?view=dashboard");
+    const section = page.getByRole("region", {
+      name: "Trending now",
+      exact: true,
+    });
+    const rail = section.getByRole("group", { name: "Titles", exact: true });
+    const cards = rail.locator(".discovery-poster-card");
+    await expect(cards).toHaveCount(16);
+    await expect(cards.nth(0)).toHaveAccessibleName(`Open ${movie.name}`);
+    await expect(cards.nth(1)).toHaveAccessibleName(`Open ${series.name}`);
+    await expect(cards.nth(0)).toHaveText("Oct 2026 · Movie");
+    await expect(cards.nth(1)).toHaveText("Feb 2024 · Show");
+    await expect(cards.nth(2)).toHaveText("2025 · Movie");
+    await expect(cards.nth(3)).toHaveText("Show");
+    await expect(
+      section.locator(".discovery-rank, .discovery-type-tabs, h3"),
+    ).toHaveCount(0);
+    await expect(page.locator(".discovery-attribution")).toHaveCount(0);
+
+    const left = section.getByRole("button", {
+      name: "Scroll titles left",
+      exact: true,
+    });
+    const right = section.getByRole("button", {
+      name: "Scroll titles right",
+      exact: true,
+    });
+    await expect(left).toHaveCount(0);
+    await expect(right).toBeVisible();
+    const poster = await cards
+      .first()
+      .locator(".discovery-poster-art")
+      .boundingBox();
+    const arrow = await right.boundingBox();
+    const bounds = await rail.boundingBox();
+    expect(arrow!.x + arrow!.width).toBeLessThanOrEqual(
+      bounds!.x + bounds!.width,
+    );
+    expect(arrow!.y + arrow!.height / 2).toBeGreaterThan(poster!.y);
+    expect(arrow!.y + arrow!.height / 2).toBeLessThan(
+      poster!.y + poster!.height,
+    );
+    await right.click();
+    await expectPointerFocus(page, right);
+    await page.keyboard.press("Tab");
+    await right.focus();
+    await expectKeyboardIcon(page, right);
+    await expect(left).toBeVisible();
+    await expect
+      .poll(() => rail.evaluate((node) => node.scrollLeft))
+      .toBeGreaterThan(0);
+    await rail.evaluate((node) =>
+      node.scrollTo({ left: node.scrollWidth, behavior: "instant" }),
+    );
+    await expect(right).toHaveCount(0);
+    await expect(left).toBeVisible();
+    await left.click();
+    await expect(right).toBeVisible();
+    await rail.evaluate((node) =>
+      node.scrollTo({ left: 0, behavior: "instant" }),
+    );
+    await expect(left).toHaveCount(0);
+    await page.keyboard.press("Tab");
+    await rail.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(left).toBeVisible();
+    await rail.evaluate((node) =>
+      node.scrollTo({ left: 0, behavior: "instant" }),
+    );
+    if (process.env.CAPTURE_SCREENSHOTS) {
+      await section.scrollIntoViewIfNeeded();
+      await page.screenshot({
+        path: `/tmp/restream-trending-mixed-${width}.png`,
+      });
+    }
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    await cards.first().click();
+    await expect(
+      page.getByRole("region", { name: "Expanded title", exact: true }),
+    ).toBeVisible();
+    expect(api.events).not.toContain("POST");
+
+    await openSettings(page);
+    const about = page.getByRole("region", { name: "About", exact: true });
+    await expect(
+      about.getByRole("img", { name: "TMDB", exact: true }),
+    ).toBeVisible();
+    await expect(about).toContainText(
+      "This product uses the TMDB API but is not endorsed or certified by TMDB.",
+    );
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `/tmp/restream-settings-about-${width}.png`,
+      });
   });
 }

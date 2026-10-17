@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,7 +24,6 @@ import (
 	"github.com/pushpinderbal/restream/internal/model"
 )
 
-const discoveryTTL = 6 * time.Hour
 const discoveryLimit = 18
 const discoveryTrendCandidates = 12
 const discoverySearchBudget = 18
@@ -30,15 +31,16 @@ const discoverySearchBudget = 18
 // DiscoveryTitle always refers to a confirmed listing in this provider. The
 // metadata identity is separate from its playback identity.
 type DiscoveryTitle struct {
-	TMDBID   int        `json:"tmdbId,omitempty"`
-	Item     model.Item `json:"item"`
-	Name     string     `json:"name"`
-	Overview string     `json:"overview,omitempty"`
-	Poster   string     `json:"poster,omitempty"`
-	Backdrop string     `json:"backdrop,omitempty"`
-	Year     int        `json:"year,omitempty"`
-	Rating   float64    `json:"rating,omitempty"`
-	Genres   []string   `json:"genres,omitempty"`
+	TMDBID      int        `json:"tmdbId,omitempty"`
+	Item        model.Item `json:"item"`
+	Name        string     `json:"name"`
+	Overview    string     `json:"overview,omitempty"`
+	Poster      string     `json:"poster,omitempty"`
+	Backdrop    string     `json:"backdrop,omitempty"`
+	ReleaseDate string     `json:"releaseDate,omitempty"`
+	Year        int        `json:"year,omitempty"`
+	Rating      float64    `json:"rating,omitempty"`
+	Genres      []string   `json:"genres,omitempty"`
 }
 
 type discoveryResponse struct {
@@ -58,18 +60,33 @@ type discoveryAsset struct {
 }
 
 type discoveryRecord struct {
-	Version              int                       `json:"version"`
-	Revision             time.Time                 `json:"revision"`
-	UpdatedAt            time.Time                 `json:"updatedAt"`
-	NextAttempt          time.Time                 `json:"nextAttempt"`
-	Error                string                    `json:"error,omitempty"`
-	HadMetadata          bool                      `json:"hadMetadata"`
-	Movies               []DiscoveryTitle          `json:"movies"`
-	Series               []DiscoveryTitle          `json:"series"`
-	ExploreMovies        []DiscoveryTitle          `json:"exploreMovies"`
-	ExploreSeries        []DiscoveryTitle          `json:"exploreSeries"`
-	Assets               map[string]discoveryAsset `json:"assets"`
-	PreferencesUpdatedAt time.Time                 `json:"preferencesUpdatedAt,omitempty"`
+	Version              int                          `json:"version"`
+	Revision             time.Time                    `json:"revision"`
+	UpdatedAt            time.Time                    `json:"updatedAt"`
+	NextAttempt          time.Time                    `json:"nextAttempt"`
+	Error                string                       `json:"error,omitempty"`
+	HadMetadata          bool                         `json:"hadMetadata"`
+	Movies               []DiscoveryTitle             `json:"movies"`
+	Series               []DiscoveryTitle             `json:"series"`
+	ExploreMovies        []DiscoveryTitle             `json:"exploreMovies"`
+	ExploreSeries        []DiscoveryTitle             `json:"exploreSeries"`
+	Assets               map[string]discoveryAsset    `json:"assets"`
+	PreferencesUpdatedAt time.Time                    `json:"preferencesUpdatedAt,omitempty"`
+	Metadata             map[string]discoveryMetadata `json:"metadata,omitempty"`
+	Matches              map[string]discoveryMatch    `json:"matches,omitempty"`
+}
+
+type discoveryMetadata struct {
+	Titles    []tmdbTitle `json:"titles"`
+	FetchedAt time.Time   `json:"fetchedAt"`
+}
+
+// Identity survives listing expiry. CheckedAt and Revision describe the last
+// availability check, including an unsuccessful search when ItemID is empty.
+type discoveryMatch struct {
+	ItemID, Name                string
+	Year, TMDBID                int
+	CheckedAt, Revision, Policy time.Time
 }
 
 type discoveryService struct {
@@ -115,20 +132,11 @@ func (s *Server) initDiscovery() error {
 }
 
 func (s *Server) tmdbConfigured() bool {
-	return s.cfg.TMDBReadAccessToken != "" || s.cfg.TMDBAPIKey != ""
+	return s.cfg.TMDBReadAccessToken != ""
 }
 
 func (s *Server) discover(w http.ResponseWriter, r *http.Request) {
 	revision := s.cache.libraryRevision()
-	items, err := s.discoveryCandidates()
-	if err != nil {
-		fail(w, 500, "cache", "Could not read saved discovery titles.")
-		return
-	}
-	available := make(map[string]model.Item, len(items))
-	for _, item := range items {
-		available[item.ID] = item
-	}
 	s.queueDiscovery(revision)
 	d := s.discoveryService
 	d.mu.Lock()
@@ -137,26 +145,38 @@ func (s *Server) discover(w http.ResponseWriter, r *http.Request) {
 	result := discoveryResponse{
 		Configured: s.tmdbConfigured(), Refreshing: refreshing,
 		TrendingMovies: []DiscoveryTitle{}, TrendingSeries: []DiscoveryTitle{},
-		ExploreMovies: providerDiscovery(items, "movie"), ExploreSeries: providerDiscovery(items, "series"),
+		ExploreMovies: []DiscoveryTitle{}, ExploreSeries: []DiscoveryTitle{},
 	}
-	if saved.Revision.Equal(revision) && saved.Version == 1 {
+	if saved.Version == 1 {
 		if !saved.UpdatedAt.IsZero() {
 			result.UpdatedAt = &saved.UpdatedAt
 		}
 		result.Error = saved.Error
-		result.TrendingMovies = availableDiscovery(saved.Movies, available)
-		result.TrendingSeries = availableDiscovery(saved.Series, available)
-		result.ExploreMovies = mergeDiscovery(availableDiscovery(saved.ExploreMovies, available), result.ExploreMovies)
-		result.ExploreSeries = mergeDiscovery(availableDiscovery(saved.ExploreSeries, available), result.ExploreSeries)
+		if result.Configured {
+			result.TrendingMovies = s.availableDiscovery(saved.Movies)
+			result.TrendingSeries = s.availableDiscovery(saved.Series)
+		}
+		result.ExploreMovies = s.availableDiscovery(saved.ExploreMovies)
+		result.ExploreSeries = s.availableDiscovery(saved.ExploreSeries)
 	}
 	respond(w, 200, result)
 }
 
-func availableDiscovery(values []DiscoveryTitle, available map[string]model.Item) []DiscoveryTitle {
+func (s *Server) availableDiscovery(values []DiscoveryTitle) []DiscoveryTitle {
+	policy := s.preferencesSnapshot()
+	s.cache.mu.RLock()
+	defer s.cache.mu.RUnlock()
 	result := make([]DiscoveryTitle, 0, len(values))
 	for _, v := range values {
-		item, exists := available[v.Item.ID]
+		item, exists := s.cache.byID[v.Item.ID]
 		if !exists || item.Kind != v.Item.Kind {
+			continue
+		}
+		category := s.itemPreferenceLocked(item, policy)
+		if category.Visibility != "show" || !category.Dashboard {
+			continue
+		}
+		if v.TMDBID != 0 && (!sameDiscoveryIdentity(v.Item, item) || item.TMDBID != 0 && item.TMDBID != v.TMDBID) {
 			continue
 		}
 		v.Item = publicItems([]model.Item{item})[0]
@@ -220,8 +240,8 @@ func providerDiscovery(items []model.Item, kind string) []DiscoveryTitle {
 	return values
 }
 
-// Items retained for playback after a refresh are deliberately not evidence
-// of current availability. Only current, unexpired browse pages count.
+// Fresh browse pages are evidence for new matches and availability checks.
+// Saved rail entries are served separately, even while these pages are stale.
 func (s *Server) discoveryCandidates() ([]model.Item, error) {
 	policy := s.preferencesSnapshot()
 	s.cache.mu.RLock()
@@ -264,6 +284,7 @@ func (s *Server) queueDiscovery(revision time.Time) {
 	if s.provider == nil {
 		return
 	}
+	policy := s.preferencesSnapshot().updatedAt
 	d := s.discoveryService
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -271,50 +292,74 @@ func (s *Server) queueDiscovery(revision time.Time) {
 		return
 	}
 	record := d.record
-	if record.Version == 1 && record.Revision.Equal(revision) && record.PreferencesUpdatedAt.Equal(s.preferencesSnapshot().updatedAt) && record.HadMetadata == s.tmdbConfigured() && time.Now().Before(record.NextAttempt) {
+	if record.Version == 1 && record.Revision.Equal(revision) && record.PreferencesUpdatedAt.Equal(policy) && record.HadMetadata == s.tmdbConfigured() && time.Now().Before(record.NextAttempt) {
 		return
 	}
 	d.refreshing = true
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
+		defer func() {
+			d.mu.Lock()
+			d.refreshing = false
+			d.mu.Unlock()
+		}()
 		ctx, cancel := context.WithTimeout(s.ctx, 3*time.Minute)
 		defer cancel()
 		loaded, err := s.buildDiscovery(ctx, revision)
 		if !s.cache.libraryRevision().Equal(revision) || !loaded.PreferencesUpdatedAt.Equal(s.preferencesSnapshot().updatedAt) || s.ctx.Err() != nil {
-			d.mu.Lock()
-			d.refreshing = false
-			d.mu.Unlock()
 			return
 		}
-		d.mu.Lock()
-		defer d.mu.Unlock()
 		if err != nil {
-			if record.Version == 1 && record.Revision.Equal(revision) {
-				loaded = record
-			}
-			loaded.Version, loaded.Revision, loaded.HadMetadata = 1, revision, s.tmdbConfigured()
-			loaded.PreferencesUpdatedAt = s.preferencesSnapshot().updatedAt
 			loaded.Error = "Discovery refresh could not finish. Showing saved available titles."
 			loaded.NextAttempt = time.Now().Add(5 * time.Minute)
 		} else {
+			loaded.UpdatedAt = time.Now().UTC()
 			loaded.NextAttempt = time.Now().Add(s.discoveryRefreshInterval())
-		}
-		// Coordinate the persisted snapshot with library invalidation. A refresh
-		// cannot publish an old availability mapping into a newer revision.
-		s.cache.mu.Lock()
-		if s.cache.libraryRefreshedAt.Equal(revision) {
-			data, marshalErr := json.Marshal(loaded)
-			if marshalErr == nil {
-				_, marshalErr = s.cache.db.Exec(`INSERT INTO discovery(id,data) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`, data)
-			}
-			if marshalErr == nil {
-				d.record = loaded
+			for kind, metadata := range loaded.Metadata {
+				if s.tmdbConfigured() && len(s.discoveryCategories(kind)) > 0 {
+					loaded.NextAttempt = minTime(loaded.NextAttempt, metadata.FetchedAt.Add(s.discoveryRefreshInterval()))
+				}
 			}
 		}
-		s.cache.mu.Unlock()
-		d.refreshing = false
+		_ = s.publishDiscovery(loaded)
 	}()
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+// Published records are immutable. Persist partial results too, so a slow
+// provider or a restart cannot erase matches already found by this refresh.
+func (s *Server) publishDiscovery(record discoveryRecord) error {
+	record.Movies, record.Series = slices.Clone(record.Movies), slices.Clone(record.Series)
+	record.Assets = maps.Clone(record.Assets)
+	record.Metadata, record.Matches = maps.Clone(record.Metadata), maps.Clone(record.Matches)
+	pruneDiscoveryAssets(&record)
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	policy := s.preferencesSnapshot().updatedAt
+	s.cache.mu.RLock()
+	defer s.cache.mu.RUnlock()
+	if !record.Revision.Equal(s.cache.libraryRefreshedAt) || !record.PreferencesUpdatedAt.Equal(policy) || s.ctx.Err() != nil {
+		return errCacheChanged
+	}
+	d := s.discoveryService
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return context.Canceled
+	}
+	if _, err = s.cache.db.Exec(`INSERT INTO discovery(id,data) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`, data); err == nil {
+		d.record = record
+	}
+	return err
 }
 
 func (s *Server) discoveryBrowse(ctx context.Context, kind, search string, revision time.Time) (model.BrowsePage, error) {
@@ -336,13 +381,11 @@ func (s *Server) discoveryBrowseCategory(ctx context.Context, kind, categoryID, 
 	}
 	q := model.BrowseQuery{Kind: kind, Category: categoryID, Search: search, Page: 1}
 	s.cache.mu.RLock()
+	q.SourceType = s.cache.browseSourceTypeLocked(q)
 	seriesCategory := ""
 	englishSeriesCategory := ""
 	for _, category := range s.cache.categories {
 		if category.Kind == kind && kind == "series" && (q.Category == "*" || q.Category == category.ID) {
-			if q.SourceType == "" {
-				q.SourceType = category.SourceType
-			}
 			if seriesCategory == "" {
 				seriesCategory = category.ID
 			}
@@ -362,53 +405,21 @@ func (s *Server) discoveryBrowseCategory(ctx context.Context, kind, categoryID, 
 			q.Category = seriesCategory
 		}
 	}
-	if page, found, err := s.cache.browse(q, s.refreshInterval(true)); err != nil || found {
-		page.Items = s.visibleItems(page.Items, true)
-		return page, err
+	s.cache.mu.RLock()
+	q.SourceType = s.cache.browseSourceTypeLocked(q)
+	s.cache.mu.RUnlock()
+	// Home rebuilds already run in the background; wait for fresh availability
+	// before publishing a replacement discovery snapshot.
+	if err := s.refreshBrowsePage(ctx, p, q); err != nil {
+		return model.BrowsePage{}, err
 	}
-	key := q.Kind + "\x00" + q.Category + "\x00" + q.Search + "\x001\x00" + revision.Format(time.RFC3339Nano)
-	value, err, _ := s.browseFlights.Do(key, func() (any, error) {
-		if page, found, err := s.cache.browse(q, s.refreshInterval(true)); err != nil || found {
-			return page, err
-		}
-		requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		policy := s.categoryPolicy(kind, q.Category)
-		if policy.Visibility != "show" || !policy.Dashboard || q.Category == "*" && !containsCategory(s.discoveryCategories(kind), "*") {
-			return model.BrowsePage{Items: []model.Item{}, Page: 1}, nil
-		}
-		page, err := p.Browse(requestCtx, q)
-		if err != nil {
-			return nil, err
-		}
-		if !s.cache.libraryRevision().Equal(revision) {
-			return nil, errors.New("library changed during discovery")
-		}
-		s.cache.mu.RLock()
-		names := map[string]string{}
-		for _, category := range s.cache.categories {
-			if category.Kind == kind {
-				names[category.ID] = category.Name
-			}
-		}
-		s.cache.mu.RUnlock()
-		for i := range page.Items {
-			if page.Items[i].CategoryID == "" && q.Category != "*" {
-				page.Items[i].CategoryID = q.Category
-			}
-			if name := names[page.Items[i].CategoryID]; name != "" {
-				page.Items[i].Category = name
-			}
-		}
-		if err := s.cache.setBrowseAtRevision(q, page, s.refreshInterval(true), revision); err != nil {
-			return nil, err
-		}
-		return page, nil
-	})
+	page, _, err := s.cache.browseSnapshot(q, s.refreshInterval(true))
 	if err != nil {
 		return model.BrowsePage{}, err
 	}
-	page := value.(model.BrowsePage)
+	if !s.cache.libraryRevision().Equal(revision) {
+		return model.BrowsePage{}, errCacheChanged
+	}
 	page.Items = s.visibleItems(page.Items, true)
 	return page, nil
 }
@@ -435,11 +446,15 @@ func (m tmdbTitle) name() string {
 	return m.Name
 }
 
-func (m tmdbTitle) year() int {
-	date := m.ReleaseDate
-	if date == "" {
-		date = m.FirstAirDate
+func (m tmdbTitle) releaseDate() string {
+	if m.ReleaseDate != "" {
+		return m.ReleaseDate
 	}
+	return m.FirstAirDate
+}
+
+func (m tmdbTitle) year() int {
+	date := m.releaseDate()
 	if len(date) < 4 {
 		return 0
 	}
@@ -452,21 +467,16 @@ func (s *Server) tmdbList(ctx context.Context, path string, query url.Values) ([
 		query = url.Values{}
 	}
 	query.Set("language", "en-US")
-	if s.cfg.TMDBReadAccessToken == "" {
-		query.Set("api_key", s.cfg.TMDBAPIKey)
-	}
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.themoviedb.org/3/"+path+"?"+query.Encode(), nil)
 	if err != nil {
 		return nil, errors.New("metadata request could not be created")
 	}
-	if s.cfg.TMDBReadAccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+s.cfg.TMDBReadAccessToken)
-	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.TMDBReadAccessToken)
 	req.Header.Set("Accept", "application/json")
 	res, err := s.discoveryService.client.Do(req)
 	if err != nil {
-		// HTTP transport errors can contain the request URL, including an API
-		// key. Never retain or expose that error text.
+		// HTTP transport errors can contain sensitive request details. Never
+		// retain or expose that error text.
 		return nil, errors.New("metadata request failed")
 	}
 	defer res.Body.Close()
@@ -484,26 +494,54 @@ func (s *Server) tmdbList(ctx context.Context, path string, query url.Values) ([
 }
 
 func (s *Server) buildDiscovery(ctx context.Context, revision time.Time) (discoveryRecord, error) {
-	record := discoveryRecord{Version: 1, Revision: revision, HadMetadata: s.tmdbConfigured(), Assets: map[string]discoveryAsset{}, PreferencesUpdatedAt: s.preferencesSnapshot().updatedAt}
+	d := s.discoveryService
+	d.mu.Lock()
+	record := d.record
+	d.mu.Unlock()
+	previous := record
+	record.Version, record.Revision, record.HadMetadata = 1, revision, s.tmdbConfigured()
+	record.PreferencesUpdatedAt = s.preferencesSnapshot().updatedAt
+	record.Error, record.NextAttempt = "", time.Time{}
+	record.Movies, record.Series = slices.Clone(record.Movies), slices.Clone(record.Series)
+	record.Assets = cloneDiscoveryMap(record.Assets)
+	record.Metadata, record.Matches = cloneDiscoveryMap(record.Metadata), cloneDiscoveryMap(record.Matches)
+	s.restoreDiscoveryMatches(&record, previous)
+	if !record.HadMetadata {
+		record.Movies, record.Series = nil, nil
+	}
+	// Reuse local artwork immediately; only the background builder scans pages.
+	items, err := s.discoveryCandidates()
+	if err != nil {
+		return record, err
+	}
+	record.ExploreMovies = mergeDiscovery(providerDiscovery(items, "movie"), record.ExploreMovies)
+	record.ExploreSeries = mergeDiscovery(providerDiscovery(items, "series"), record.ExploreSeries)
+	if err = s.publishDiscovery(record); err != nil {
+		return record, err
+	}
 	var firstErr error
 	for _, kind := range []string{"movie", "series"} {
-		if ctx.Err() != nil || !s.cache.libraryRevision().Equal(revision) {
-			return record, errors.New("library changed during discovery")
-		}
 		for _, category := range s.discoveryCategories(kind) {
 			if _, err := s.discoveryBrowseCategory(ctx, kind, category, "", revision); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
 	}
-	items, err := s.discoveryCandidates()
+	items, err = s.discoveryCandidates()
 	if err != nil {
 		return record, err
 	}
-	record.ExploreMovies, record.ExploreSeries = providerDiscovery(items, "movie"), providerDiscovery(items, "series")
-	if !s.tmdbConfigured() {
-		record.UpdatedAt = time.Now().UTC()
+	record.ExploreMovies = mergeDiscovery(providerDiscovery(items, "movie"), record.ExploreMovies)
+	record.ExploreSeries = mergeDiscovery(providerDiscovery(items, "series"), record.ExploreSeries)
+	if err = s.publishDiscovery(record); err != nil {
+		return record, err
+	}
+	if !record.HadMetadata {
 		return record, firstErr
+	}
+	fresh := make(map[string]model.Item, len(items))
+	for _, item := range items {
+		fresh[item.ID] = item
 	}
 	budget := discoverySearchBudget
 	for _, kind := range []string{"movie", "series"} {
@@ -516,24 +554,39 @@ func (s *Server) buildDiscovery(ctx context.Context, revision time.Time) (discov
 		if kind == "series" {
 			mediaType = "tv"
 		}
-		trends, err := s.tmdbList(ctx, "trending/"+mediaType+"/week", nil)
+		trends, err := s.discoveryTrends(ctx, &record, kind, mediaType)
 		if err != nil {
 			return record, err
 		}
-		if len(trends) > discoveryTrendCandidates {
-			trends = trends[:discoveryTrendCandidates]
+		values := &record.Movies
+		if kind == "series" {
+			values = &record.Series
+		}
+		*values = progressiveDiscovery(*values, trends)
+		if err = s.publishDiscovery(record); err != nil {
+			return record, err
 		}
 		for _, title := range trends {
 			if ctx.Err() != nil || !s.cache.libraryRevision().Equal(revision) {
-				return record, errors.New("library changed during discovery")
+				return record, errCacheChanged
 			}
-			if title.ID <= 0 || title.Adult || title.name() == "" {
+			key := discoveryMatchKey(kind, title.ID)
+			link, known := record.Matches[key]
+			if known && link.ItemID == "" && link.Revision.Equal(revision) && link.Policy.Equal(record.PreferencesUpdatedAt) && time.Since(link.CheckedAt) < s.discoveryRefreshInterval() {
 				continue
 			}
-			matches := discoveryMatches(items, kind, title)
+			matches := []model.Item{}
+			if item, exists := fresh[link.ItemID]; known && exists && item.Kind == kind && link.matches(item) {
+				matches = append(matches, item)
+			}
+			if len(matches) == 0 {
+				matches = discoveryMatches(items, kind, title)
+			}
+			searched, exhaustive := 0, true
 			if len(matches) == 0 {
 				for _, category := range categories {
 					if kindBudget <= 0 || budget <= 0 {
+						exhaustive = false
 						break
 					}
 					kindBudget--
@@ -542,7 +595,12 @@ func (s *Server) buildDiscovery(ctx context.Context, revision time.Time) (discov
 					if err != nil {
 						return record, err
 					}
+					searched++
+					exhaustive = exhaustive && !page.HasMore
 					items = append(items, page.Items...)
+					for _, item := range page.Items {
+						fresh[item.ID] = item
+					}
 					matches = discoveryMatches(items, kind, title)
 					if len(matches) > 0 {
 						break
@@ -550,32 +608,43 @@ func (s *Server) buildDiscovery(ctx context.Context, revision time.Time) (discov
 				}
 			}
 			if len(matches) == 0 {
-				continue
-			}
-			// A provider title without a year or external ID could be a remake.
-			// Resolve that ambiguity using exact metadata identities before it is
-			// allowed onto the available-only dashboard.
-			if matches[0].TMDBID == 0 {
-				year := discoveryMatchYear(matches[0], title)
-				if year == 0 {
-					identities, err := s.tmdbList(ctx, "search/"+mediaType, url.Values{"query": {title.name()}, "include_adult": {"false"}})
-					if err != nil {
+				// An incomplete or skipped search cannot prove a cached title gone.
+				if exhaustive && searched == len(categories) {
+					record.Matches[key] = discoveryMatch{CheckedAt: time.Now(), Revision: revision, Policy: record.PreferencesUpdatedAt}
+					*values = slices.DeleteFunc(*values, func(v DiscoveryTitle) bool { return v.TMDBID == title.ID })
+					record.ExploreMovies = removeDiscoveryItem(record.ExploreMovies, link.ItemID)
+					record.ExploreSeries = removeDiscoveryItem(record.ExploreSeries, link.ItemID)
+					if err = s.publishDiscovery(record); err != nil {
 						return record, err
 					}
-					if !uniqueDiscoveryIdentity(title, identities) {
-						continue
-					}
+				}
+				continue
+			}
+			confirmed := known && link.ItemID == matches[0].ID && link.matches(matches[0])
+			if !confirmed && matches[0].TMDBID == 0 && discoveryMatchYear(matches[0], title) == 0 {
+				identities, err := s.tmdbList(ctx, "search/"+mediaType, url.Values{"query": {title.name()}, "include_adult": {"false"}})
+				if err != nil {
+					return record, err
+				}
+				if !uniqueDiscoveryIdentity(title, identities) {
+					record.Matches[key] = discoveryMatch{CheckedAt: time.Now(), Revision: revision, Policy: record.PreferencesUpdatedAt}
+					*values = slices.DeleteFunc(*values, func(v DiscoveryTitle) bool { return v.TMDBID == title.ID })
+					continue
 				}
 			}
+			record.Matches[key] = newDiscoveryMatch(matches[0], time.Now(), revision, record.PreferencesUpdatedAt)
 			value := record.metadataTitle(matches[0], title)
-			if kind == "movie" {
-				record.Movies = append(record.Movies, value)
-			} else {
-				record.Series = append(record.Series, value)
+			*values = progressiveDiscovery(append(slices.DeleteFunc(*values, func(v DiscoveryTitle) bool { return v.TMDBID == title.ID }), value), trends)
+			if err = s.publishDiscovery(record); err != nil {
+				return record, err
 			}
 		}
+		*values = rankedDiscovery(*values, trends)
+		if err = s.publishDiscovery(record); err != nil {
+			return record, err
+		}
 	}
-	record.UpdatedAt = time.Now().UTC()
+	pruneDiscoveryMatches(&record)
 	return record, firstErr
 }
 
@@ -697,7 +766,7 @@ func uniqueDiscoveryIdentity(title tmdbTitle, identities []tmdbTitle) bool {
 var discoveryImagePathRE = regexp.MustCompile(`^/[A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp)$`)
 
 func (r *discoveryRecord) metadataTitle(item model.Item, title tmdbTitle) DiscoveryTitle {
-	value := DiscoveryTitle{TMDBID: title.ID, Item: publicItems([]model.Item{item})[0], Name: title.name(), Overview: title.Overview, Year: title.year(), Rating: title.Rating}
+	value := DiscoveryTitle{TMDBID: title.ID, Item: publicItems([]model.Item{item})[0], Name: title.name(), Overview: title.Overview, ReleaseDate: title.releaseDate(), Year: title.year(), Rating: title.Rating}
 	asset := discoveryAsset{ItemID: item.ID}
 	if discoveryImagePathRE.MatchString(title.Poster) {
 		asset.Poster = title.Poster
@@ -723,7 +792,6 @@ func (s *Server) discoveryImage(w http.ResponseWriter, r *http.Request) {
 	d := s.discoveryService
 	d.mu.Lock()
 	asset, exists := d.record.Assets[r.PathValue("id")]
-	revision := d.record.Revision
 	if asset.ItemID == "" {
 		for _, titles := range [][]DiscoveryTitle{d.record.Movies, d.record.Series, d.record.ExploreMovies, d.record.ExploreSeries} {
 			for _, title := range titles {
@@ -735,7 +803,7 @@ func (s *Server) discoveryImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	d.mu.Unlock()
-	if !exists || !s.cache.libraryRevision().Equal(revision) {
+	if !exists {
 		http.NotFound(w, r)
 		return
 	}
@@ -773,6 +841,13 @@ func (s *Server) discoveryImage(w http.ResponseWriter, r *http.Request) {
 		s.imageCache.Wait()
 		return image, nil
 	})
+	d.mu.Lock()
+	_, exists = d.record.Assets[r.PathValue("id")]
+	d.mu.Unlock()
+	if !exists {
+		http.NotFound(w, r)
+		return
+	}
 	item, known = s.cache.item(asset.ItemID)
 	if known && s.blockedItem(item) || !known && s.preferencesSnapshot().blocked {
 		blocked(w)

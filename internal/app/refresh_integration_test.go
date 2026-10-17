@@ -11,7 +11,7 @@ import (
 )
 
 func TestSettingsManualRefreshLifecycle(t *testing.T) {
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), CatalogRefresh: time.Hour, EPGRefresh: 2 * time.Hour, MaxStreams: 2, Timezone: "America/Toronto", EPGHours: 48, TranscodeMode: "auto", SessionTTL: time.Minute}
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), RefreshInterval: time.Hour, MaxStreams: 2, Timezone: "America/Toronto", EPGHours: 48, TranscodeMode: "auto", SessionTTL: time.Minute}
 	p := &fixtureProvider{}
 	s, err := New(cfg, p, nil)
 	if err != nil {
@@ -46,7 +46,7 @@ func TestSettingsManualRefreshLifecycle(t *testing.T) {
 		return !out.Refreshing && out.Sync["catalog"].LastSuccessfulAt != nil && out.Sync["epg"].LastSuccessfulAt != nil && out.Sync["catalog"].NextRefreshAt != nil && out.Sync["epg"].NextRefreshAt != nil
 	})
 	initial := readStatus()
-	if initial.Sync["catalog"].IntervalSeconds != 3600 || initial.Sync["epg"].IntervalSeconds != 7200 || initial.Library["liveChannels"] != float64(1) || initial.Library["categories"] != float64(2) || initial.Timezone != cfg.Timezone {
+	if initial.Sync["catalog"].IntervalSeconds != 3600 || initial.Sync["epg"].IntervalSeconds != 3600 || initial.Library["liveChannels"] != float64(1) || initial.Library["categories"] != float64(2) || initial.Timezone != cfg.Timezone {
 		t.Fatal(initial)
 	}
 	gate := make(chan struct{})

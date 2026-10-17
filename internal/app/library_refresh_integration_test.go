@@ -91,10 +91,10 @@ func readLibraryStatus(t *testing.T, ts *httptest.Server) libraryStatus {
 	return status
 }
 
-func newChangingLibrary(t *testing.T, ttl time.Duration) (*Server, *httptest.Server, *changingLibraryProvider) {
+func newChangingLibrary(t *testing.T, refreshInterval time.Duration) (*Server, *httptest.Server, *changingLibraryProvider) {
 	t.Helper()
 	p := &changingLibraryProvider{fixtureProvider: &fixtureProvider{}, browseStarted: make(chan struct{}, 1), episodeStarted: make(chan struct{}, 1)}
-	s, err := New(Config{DataDir: t.TempDir(), WebDir: t.TempDir(), CatalogRefresh: 24 * time.Hour, EPGRefresh: 24 * time.Hour, EpisodeCacheTTL: ttl}, p, nil)
+	s, err := New(Config{DataDir: t.TempDir(), WebDir: t.TempDir(), RefreshInterval: refreshInterval}, p, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,8 +132,8 @@ func refreshLibrary(t *testing.T, ts *httptest.Server) time.Time {
 	return readLibraryStatus(t, ts).LibraryUpdatedAt
 }
 
-func TestLibraryRefreshExpiresListsAndPreservesPlaybackItems(t *testing.T) {
-	s, ts, p := newChangingLibrary(t, time.Hour)
+func TestManualRefreshMarksListsDueAndPreservesCachedPlayback(t *testing.T) {
+	s, ts, p := newChangingLibrary(t, 0)
 	paths := []string{"/api/browse?kind=series&category=*&page=1", "/api/browse?kind=movie&category=*&page=1", "/api/series/series:2/episodes"}
 	for _, path := range paths {
 		libraryItems(t, ts, path, 1)
@@ -148,13 +148,13 @@ func TestLibraryRefreshExpiresListsAndPreservesPlaybackItems(t *testing.T) {
 	if _, ok := s.cache.item("episode:2:1:1"); !ok {
 		t.Fatal("refresh removed a playback item")
 	}
-	// Expiry and the revision survive a server restart; item records remain.
+	// Due markers and cached data survive reopening the store; playback records remain.
 	saved, err := openStore(s.cfg.DataDir, s.cfg.PortalURL, s.cfg.MAC)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := saved.browse(model.BrowseQuery{Kind: "series", Category: "*", Page: 1}, 24*time.Hour); err != nil || ok {
-		t.Fatal("saved page remained fresh", err)
+	if page, ok, err := saved.browse(model.BrowseQuery{Kind: "series", Category: "*", Page: 1}, 0); err != nil || !ok || len(page.Items) != 1 {
+		t.Fatal("manual refresh removed saved results", err)
 	}
 	if _, ok := saved.getEpisodes("series:2", time.Hour); ok {
 		t.Fatal("saved episodes remained fresh")
@@ -164,7 +164,8 @@ func TestLibraryRefreshExpiresListsAndPreservesPlaybackItems(t *testing.T) {
 	}
 	saved.close()
 	for _, path := range paths {
-		libraryItems(t, ts, path, 2)
+		libraryItems(t, ts, path, 1)
+		waitForLibraryItems(t, ts, path, 2)
 		libraryItems(t, ts, path, 2)
 	}
 	p.mu.Lock()
@@ -179,48 +180,87 @@ func TestLibraryRefreshExpiresListsAndPreservesPlaybackItems(t *testing.T) {
 		status := readLibraryStatus(t, ts)
 		return !status.Refreshing && status.Sync["catalog"].Error != ""
 	})
-	if !readLibraryStatus(t, ts).LibraryUpdatedAt.Equal(revision) {
-		t.Fatal("failed refresh expired saved lists")
+	if saved, ok, err := s.cache.browse(model.BrowseQuery{Kind: "series", Category: "*", Page: 1}, 0); err != nil || !ok || len(saved.Items) != 2 {
+		t.Fatal("failed manual refresh removed saved lists", err)
 	}
 	for _, path := range paths {
 		libraryItems(t, ts, path, 2)
 	}
 }
 
-func TestEpisodeCacheExpiresIndependentlyOfSeriesPages(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		ttl      time.Duration
-		expected int
-	}{{"default_hour", 0, 1}, {"custom_fifteen_minutes", 15 * time.Minute, 2}} {
-		t.Run(tc.name, func(t *testing.T) {
-			s, ts, p := newChangingLibrary(t, tc.ttl)
+func waitForLibraryItems(t *testing.T, ts *httptest.Server, path string, count int) {
+	t.Helper()
+	waitFor(t, func() bool {
+		code, body := request(t, ts.URL, "GET", path, "")
+		var result struct {
+			Items []model.Item `json:"items"`
+		}
+		return code == 200 && json.Unmarshal([]byte(body), &result) == nil && len(result.Items) == count
+	})
+}
+
+func TestEpisodeCooldownIsIndependentOfLibraryCadence(t *testing.T) {
+	for _, interval := range []time.Duration{time.Hour, 24 * time.Hour} {
+		t.Run(interval.String(), func(t *testing.T) {
+			s, ts, p := newChangingLibrary(t, interval)
 			libraryItems(t, ts, "/api/browse?kind=series&category=*&page=1", 1)
 			libraryItems(t, ts, "/api/series/series:2/episodes", 1)
 			p.mu.Lock()
 			p.version = 1
 			p.mu.Unlock()
 			s.cache.mu.Lock()
-			s.cache.episodesAt["series:2"] = time.Now().Add(-30 * time.Minute)
+			s.cache.episodesAt["series:2"] = time.Now().Add(-20 * time.Minute)
 			s.cache.mu.Unlock()
-			libraryItems(t, ts, "/api/series/series:2/episodes", tc.expected)
+			for range 12 {
+				libraryItems(t, ts, "/api/series/series:2/episodes", 1)
+			}
+			p.mu.Lock()
+			if p.episodeCalls != 1 {
+				t.Error("fresh episodes refetched", p.episodeCalls)
+			}
+			p.mu.Unlock()
 			s.cache.mu.Lock()
-			s.cache.episodesAt["series:2"] = time.Now().Add(-90 * time.Minute)
+			s.cache.episodesAt["series:2"] = time.Now().Add(-31 * time.Minute)
 			s.cache.mu.Unlock()
-			libraryItems(t, ts, "/api/series/series:2/episodes", 2)
+			libraryItems(t, ts, "/api/series/series:2/episodes", 1)
+			waitForLibraryItems(t, ts, "/api/series/series:2/episodes", 2)
 			libraryItems(t, ts, "/api/browse?kind=series&category=*&page=1", 1)
 			p.mu.Lock()
 			defer p.mu.Unlock()
-			if p.browseCalls != 1 {
-				t.Fatal("episode expiry refreshed unrelated series pages")
+			if p.browseCalls != 1 || p.episodeCalls != 2 {
+				t.Fatal("episode check fetched unrelated data or repeated work", p.browseCalls, p.episodeCalls)
 			}
 		})
 	}
 }
 
+func TestScheduledLibraryRefreshKeepsFreshLists(t *testing.T) {
+	s, ts, p := newChangingLibrary(t, 24*time.Hour)
+	paths := []string{"/api/browse?kind=series&category=*&page=1", "/api/browse?kind=movie&category=*&page=1", "/api/series/series:2/episodes"}
+	for _, path := range paths {
+		libraryItems(t, ts, path, 1)
+	}
+	p.mu.Lock()
+	p.version = 1
+	p.mu.Unlock()
+	if err := s.doRefresh(true, false); err != nil {
+		t.Fatal(err)
+	}
+	for range 8 {
+		for _, path := range paths {
+			libraryItems(t, ts, path, 1)
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.browseCalls != 2 || p.episodeCalls != 1 {
+		t.Fatal("scheduled refresh refetched cached listings", p.browseCalls, p.episodeCalls)
+	}
+}
+
 func TestRefreshDoesNotJoinOrCacheOlderListRequests(t *testing.T) {
-	s, ts, p := newChangingLibrary(t, time.Hour)
-	if err := s.cache.setBrowseAtRevision(model.BrowseQuery{Kind: "series", Category: "seed", Page: 1}, model.BrowsePage{Items: []model.Item{{ID: "series:2", Kind: "series"}}}, 24*time.Hour, s.cache.libraryRevision()); err != nil {
+	s, ts, p := newChangingLibrary(t, 0)
+	if err := seedBrowsePage(s.cache, model.BrowseQuery{Kind: "series", Category: "seed", Page: 1}, model.BrowsePage{Items: []model.Item{{ID: "series:2", Kind: "series"}}}); err != nil {
 		t.Fatal(err)
 	}
 	gate := make(chan struct{})
@@ -230,9 +270,9 @@ func TestRefreshDoesNotJoinOrCacheOlderListRequests(t *testing.T) {
 	p.oldGate = gate
 	p.mu.Unlock()
 	paths := []string{"/api/browse?kind=series&category=*&page=1", "/api/series/series:2/episodes"}
-	oldDone := make(chan struct{}, 2)
+	oldDone := make(chan int, 2)
 	for _, path := range paths {
-		go func() { libraryItems(t, ts, path, 2); oldDone <- struct{}{} }()
+		go func() { code, _ := request(t, ts.URL, "GET", path, ""); oldDone <- code }()
 	}
 	for _, started := range []chan struct{}{p.browseStarted, p.episodeStarted} {
 		select {
@@ -245,13 +285,16 @@ func TestRefreshDoesNotJoinOrCacheOlderListRequests(t *testing.T) {
 	p.version = 1
 	p.mu.Unlock()
 	refreshLibrary(t, ts)
-	freshDone := make(chan struct{}, 2)
+	freshDone := make(chan int, 2)
 	for _, path := range paths {
-		go func() { libraryItems(t, ts, path, 2); freshDone <- struct{}{} }()
+		go func() { code, _ := request(t, ts.URL, "GET", path, ""); freshDone <- code }()
 	}
 	for range paths {
 		select {
-		case <-freshDone:
+		case code := <-freshDone:
+			if code != 200 {
+				t.Errorf("fresh request failed: %d", code)
+			}
 		case <-time.After(3 * time.Second):
 			t.Fatal("fresh request joined an older fetch")
 		}
@@ -266,12 +309,6 @@ func TestRefreshDoesNotJoinOrCacheOlderListRequests(t *testing.T) {
 	}
 	for _, path := range paths {
 		libraryItems(t, ts, path, 2)
-	}
-	for _, id := range []string{"series:2-old", "episode:2:1:3"} {
-		code, body := request(t, ts.URL, "GET", "/api/items/"+id, "")
-		if code != 200 {
-			t.Fatalf("old response title cannot be played: %d %s", code, body)
-		}
 	}
 	for id, name := range map[string]string{"series:2": "Updated title", "episode:2:1:1": "Updated pilot"} {
 		item, ok := s.cache.item(id)

@@ -15,7 +15,6 @@ env:
 jobs:
   test:
     name: Test and build
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -24,10 +23,6 @@ jobs:
         uses: actions/checkout@v7
       - name: Install tools with mise
         uses: jdx/mise-action@v5
-      - name: Install playback test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Cache Go dependencies and builds
         uses: actions/cache@v5
         with:
@@ -42,12 +37,15 @@ jobs:
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
-      - name: Run integration tests and build frontend
+      - name: Run integration tests and build local binaries and frontend
         run: |
-          mise run test ::: frontend
+          mise run test ::: build ::: frontend
+      - name: Smoke-test the container image
+        run: mise run test:container
 
   publish:
     name: Build and publish image
+    needs: test
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:

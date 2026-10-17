@@ -156,7 +156,7 @@ func TestBrowseCacheUpgradePreservesOtherSavedData(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := model.BrowseQuery{Kind: "movie", Category: "7", Search: "literal", Page: 1}
-	if err := s.setBrowseAtRevision(q, model.BrowsePage{Items: []model.Item{{ID: "movie:3", Kind: "movie", Name: "Cached film"}}, Page: 1}, time.Hour, s.libraryRevision()); err != nil {
+	if err := seedBrowsePage(s, q, model.BrowsePage{Items: []model.Item{{ID: "movie:3", Kind: "movie", Name: "Cached film"}}, Page: 1}); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(2 * time.Minute)

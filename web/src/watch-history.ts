@@ -15,6 +15,7 @@ export type WatchHistoryEntry = {
   completed: boolean;
   updatedAt?: number;
 };
+export type HistoryUndo = { id: number; label: string };
 type HistoryState = { entries: WatchHistoryEntry[]; persistent: boolean };
 type PlaybackSelection = { title: Item; item: Item };
 
@@ -117,10 +118,10 @@ function recentEntries(entries: WatchHistoryEntry[]) {
     });
 }
 
-function readHistory(): HistoryState {
+function readHistory(storageKey: string): HistoryState {
   let raw: string | null;
   try {
-    raw = window.localStorage.getItem(WATCH_HISTORY_KEY);
+    raw = window.localStorage.getItem(storageKey);
   } catch {
     return { entries: [], persistent: false };
   }
@@ -136,32 +137,46 @@ function readHistory(): HistoryState {
   }
 }
 
-export function useWatchHistory() {
-  const [state, setState] = useState(readHistory);
+export function useWatchHistory(userId?: string) {
+  const storageKey = userId
+    ? `${WATCH_HISTORY_KEY}.user.${encodeURIComponent(userId)}`
+    : WATCH_HISTORY_KEY;
+  const [state, setState] = useState(() => readHistory(storageKey));
   const current = useRef(state);
   const pendingFlush = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dirty = useRef(false);
   const lastWrite = useRef(0);
+  const [pendingUndo, setPendingUndo] = useState<HistoryUndo | null>(null);
+  const removedEntries = useRef<WatchHistoryEntry[]>([]);
+  const undoSequence = useRef(0);
 
-  const persist = useCallback((entries: WatchHistoryEntry[]) => {
-    if (pendingFlush.current !== null) clearTimeout(pendingFlush.current);
-    pendingFlush.current = null;
-    dirty.current = false;
-    lastWrite.current = Date.now();
-    let persistent = true;
-    try {
-      if (entries.length)
-        window.localStorage.setItem(
-          WATCH_HISTORY_KEY,
-          JSON.stringify({ version: 1, entries }),
-        );
-      else window.localStorage.removeItem(WATCH_HISTORY_KEY);
-    } catch {
-      persistent = false;
-    }
-    current.current = { entries, persistent };
-    setState(current.current);
+  const dismissUndo = useCallback(() => {
+    removedEntries.current = [];
+    setPendingUndo(null);
   }, []);
+
+  const persist = useCallback(
+    (entries: WatchHistoryEntry[]) => {
+      if (pendingFlush.current !== null) clearTimeout(pendingFlush.current);
+      pendingFlush.current = null;
+      dirty.current = false;
+      lastWrite.current = Date.now();
+      let persistent = true;
+      try {
+        if (entries.length)
+          window.localStorage.setItem(
+            storageKey,
+            JSON.stringify({ version: 1, entries }),
+          );
+        else window.localStorage.removeItem(storageKey);
+      } catch {
+        persistent = false;
+      }
+      current.current = { entries, persistent };
+      setState(current.current);
+    },
+    [storageKey],
+  );
 
   const update = useCallback(
     (change: (entries: WatchHistoryEntry[]) => WatchHistoryEntry[]) =>
@@ -177,12 +192,14 @@ export function useWatchHistory() {
 
   useEffect(() => {
     const restore = (event: StorageEvent) => {
-      if (event.key !== WATCH_HISTORY_KEY && event.key !== null) return;
+      if (event.key !== storageKey && event.key !== null) return;
       // A clear/remove in another tab wins over this tab's pending progress.
       if (pendingFlush.current !== null) clearTimeout(pendingFlush.current);
       pendingFlush.current = null;
       dirty.current = false;
-      current.current = readHistory();
+      // Another tab explicitly clearing history also cancels restoration.
+      if (event.key === null || event.newValue === null) dismissUndo();
+      current.current = readHistory(storageKey);
       setState(current.current);
     };
     const hide = () => {
@@ -197,7 +214,7 @@ export function useWatchHistory() {
       document.removeEventListener("visibilitychange", hide);
       flushProgress();
     };
-  }, [flushProgress]);
+  }, [dismissUndo, flushProgress, storageKey]);
 
   const record = useCallback(
     (selection: PlaybackSelection) => {
@@ -283,17 +300,88 @@ export function useWatchHistory() {
     [flushProgress],
   );
   const remove = useCallback(
-    (entry: WatchHistoryEntry) =>
-      update((entries) =>
-        entries.filter(
-          (value) =>
-            value.title.id !== entry.title.id ||
-            value.title.kind !== entry.title.kind,
-        ),
-      ),
+    (entry: WatchHistoryEntry) => {
+      const removed = current.current.entries.filter(
+        (value) =>
+          value.title.id === entry.title.id &&
+          value.title.kind === entry.title.kind,
+      );
+      if (!removed.length) return;
+      removedEntries.current = removed;
+      setPendingUndo({
+        id: ++undoSequence.current,
+        label: "Removed from history",
+      });
+      update((entries) => entries.filter((value) => !removed.includes(value)));
+    },
     [update],
   );
-  const clear = useCallback(() => update(() => []), [update]);
+  const clear = useCallback(() => {
+    if (!current.current.entries.length) return;
+    removedEntries.current = [...current.current.entries];
+    setPendingUndo({ id: ++undoSequence.current, label: "History cleared" });
+    update(() => []);
+  }, [update]);
 
-  return { ...state, record, updateProgress, flushProgress, remove, clear };
+  const undoRemoval = useCallback(() => {
+    const removed = removedEntries.current;
+    if (!removed.length) return;
+    const saved = readHistory(storageKey);
+    // An external clear may arrive before its storage event. Respect it even
+    // when this tab still has the previous entries in memory.
+    if (
+      saved.persistent &&
+      current.current.persistent &&
+      !saved.entries.length &&
+      current.current.entries.length
+    ) {
+      dismissUndo();
+      return;
+    }
+    // Read storage again in case another tab wrote before its storage event
+    // arrived. Keep locally buffered progress only for entries still present.
+    const entries =
+      saved.persistent && current.current.persistent
+        ? saved.entries
+        : current.current.entries;
+    const merged = entries.map((entry) => {
+      const local = current.current.entries.find(
+        (value) =>
+          value.title.id === entry.title.id &&
+          value.title.kind === entry.title.kind,
+      );
+      return dirty.current &&
+        local &&
+        (local.updatedAt ?? local.watchedAt) >
+          (entry.updatedAt ?? entry.watchedAt)
+        ? local
+        : entry;
+    });
+    // Existing entries always win: a later playback may use another episode
+    // or a newer position for the same title.
+    const present = new Set(
+      merged.map((entry) => `${entry.title.kind}:${entry.title.id}`),
+    );
+    persist(
+      recentEntries([
+        ...merged,
+        ...removed.filter(
+          (entry) => !present.has(`${entry.title.kind}:${entry.title.id}`),
+        ),
+      ]),
+    );
+    dismissUndo();
+  }, [dismissUndo, persist, storageKey]);
+
+  return {
+    ...state,
+    pendingUndo,
+    record,
+    updateProgress,
+    flushProgress,
+    remove,
+    clear,
+    undoRemoval,
+    dismissUndo,
+  };
 }

@@ -5,12 +5,19 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { MagnifyingGlassIcon } from "@phosphor-icons/react/dist/csr/MagnifyingGlass";
-import { XIcon } from "@phosphor-icons/react/dist/csr/X";
-import { request, type BrowsePage, type Item, type Program } from "../api";
+import {
+  loadBrowsePage,
+  type BrowsePage,
+  type Item,
+  type Program,
+} from "../api";
 import { Artwork } from "./artwork";
-import { Button } from "./ui/button";
+import { BeamSearch } from "./spectrumui/beam-search";
+import { LoadingButton } from "./spectrumui/loading-button";
+import { AnimatedAlert } from "./spectrumui/animated-alert";
 import { Skeleton } from "./ui/skeleton";
+import { Spinner } from "./spectrumui/spinner-dependencies";
+import InfiniteScroll from "./spectrumui/infinite-scroll";
 import "./search-page.css";
 
 type SearchKind = "movie" | "series" | "live";
@@ -72,9 +79,9 @@ export function SearchPage({
   setCatalogGrid,
   gridColumns,
 }: SearchPageProps) {
-  const input = useRef<HTMLInputElement>(null);
   const generation = useRef(0);
   const controllers = useRef(new Map<SearchKind, AbortController>());
+  const pages = useRef(new Map<SearchKind, BrowsePage>());
   const [state, setState] = useState({
     query: "",
     started: false,
@@ -85,9 +92,16 @@ export function SearchPage({
     generation.current++;
     for (const controller of controllers.current.values()) controller.abort();
     controllers.current.clear();
+    pages.current.clear();
   }, []);
   const loadPage = useCallback(
-    (kind: "movie" | "series", page: number, query: string, run: number) => {
+    (
+      kind: "movie" | "series",
+      page: number,
+      query: string,
+      run: number,
+      refreshRange = false,
+    ) => {
       const controller = new AbortController();
       controllers.current.get(kind)?.abort();
       controllers.current.set(kind, controller);
@@ -105,35 +119,31 @@ export function SearchPage({
               }
             : previous,
         );
-      update((previous) => ({ ...previous, loading: true, error: "" }));
+      update((previous) => ({ ...previous, loading: true }));
       const params = new URLSearchParams({
         kind,
         category: "*",
         search: query,
         page: String(page),
       });
-      void request<BrowsePage>(`/api/browse?${params}`, {
-        signal: controller.signal,
-      })
-        .then((response) => {
+      void loadBrowsePage(
+        params,
+        page,
+        pages.current.get(kind) || null,
+        controller.signal,
+        (response) => {
           if (!current()) return;
-          update((previous) => {
-            const items = new Map(
-              previous.items.map((item) => [item.id, item]),
-            );
-            for (const item of response.items || []) {
-              if (item.kind === kind && isVisible(item))
-                items.set(item.id, item);
-            }
-            return {
-              items: [...items.values()],
-              page: response.page || page,
-              hasMore: !!response.hasMore,
-              loading: false,
-              error: "",
-            };
-          });
-        })
+          pages.current.set(kind, response);
+          update(() => ({
+            items: response.items.filter((item) => item.kind === kind),
+            page: response.page || page,
+            hasMore: !!response.hasMore,
+            loading: true,
+            error: "",
+          }));
+        },
+        refreshRange,
+      )
         .catch((cause: unknown) => {
           update((previous) => ({
             ...previous,
@@ -145,11 +155,12 @@ export function SearchPage({
           }));
         })
         .finally(() => {
+          update((previous) => ({ ...previous, loading: false }));
           if (controllers.current.get(kind) === controller)
             controllers.current.delete(kind);
         });
     },
-    [isVisible],
+    [],
   );
 
   useEffect(() => {
@@ -160,20 +171,7 @@ export function SearchPage({
     const timer = window.setTimeout(() => {
       if (generation.current !== run) return;
       const query = value.trim();
-      const terms = normalize(query).split(/\s+/).filter(Boolean);
-      const live = liveItems.filter(
-        (item) =>
-          item.kind === "live" &&
-          isVisible(item) &&
-          terms.every((term) =>
-            normalize(`${item.name} ${item.number || ""}`).includes(term),
-          ),
-      );
-      setState({
-        query: value,
-        started: true,
-        results: { ...initialResults(), live: { ...empty(), items: live } },
-      });
+      setState({ query: value, started: true, results: initialResults() });
       loadPage("movie", 1, query, run);
       loadPage("series", 1, query, run);
     }, 350);
@@ -181,7 +179,37 @@ export function SearchPage({
       window.clearTimeout(timer);
       cancel();
     };
-  }, [value, valid, refreshRevision, liveItems, isVisible, loadPage, cancel]);
+  }, [value, valid, loadPage, cancel]);
+
+  useEffect(() => {
+    if (!valid || !state.started || state.query !== value) return;
+    const terms = normalize(value.trim()).split(/\s+/).filter(Boolean);
+    const live = liveItems.filter(
+      (item) =>
+        item.kind === "live" &&
+        isVisible(item) &&
+        terms.every((term) =>
+          normalize(`${item.name} ${item.number || ""}`).includes(term),
+        ),
+    );
+    setState((previous) => ({
+      ...previous,
+      results: {
+        ...previous.results,
+        live: { ...empty(), items: live },
+      },
+    }));
+  }, [value, valid, state.started, state.query, liveItems, isVisible]);
+
+  const lastRevision = useRef(refreshRevision);
+  useEffect(() => {
+    const previous = lastRevision.current;
+    lastRevision.current = refreshRevision;
+    if (previous === refreshRevision || !valid) return;
+    for (const kind of ["movie", "series"] as const)
+      if (pages.current.has(kind))
+        loadPage(kind, 1, value.trim(), generation.current, true);
+  }, [refreshRevision, valid, value, loadPage]);
 
   const changeQuery = (query: string) => {
     cancel();
@@ -189,40 +217,23 @@ export function SearchPage({
     onQueryChange(query);
   };
   const showResults = valid && state.query === value && state.started;
+  const pagedKinds = ["movie", "series"] as const;
+  const hasMore = pagedKinds.some(
+    (kind) => state.results[kind].hasMore && !state.results[kind].error,
+  );
+  const loading = pagedKinds.some((kind) => state.results[kind].loading);
   return (
     <div className="global-search-page">
-      <div className="global-search-field">
-        <MagnifyingGlassIcon size={28} weight="light" aria-hidden="true" />
-        <input
-          ref={input}
-          autoFocus
-          type="search"
-          value={value}
-          aria-label="Search library"
-          placeholder="Search"
-          autoComplete="off"
-          spellCheck={false}
-          onChange={(event) => changeQuery(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Escape") changeQuery("");
-          }}
-        />
-        {value && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="global-search-clear"
-            aria-label="Clear search"
-            onClick={() => {
-              changeQuery("");
-              input.current?.focus();
-            }}
-          >
-            <XIcon size={20} weight="light" aria-hidden="true" />
-          </Button>
-        )}
-      </div>
+      <BeamSearch
+        className="global-search-field"
+        theme="dark"
+        colorVariant="mono"
+        autoFocus
+        value={value}
+        ariaLabel="Search library"
+        placeholder="Search"
+        onChange={changeQuery}
+      />
       {showResults &&
         sections.map(({ kind, label, action }) => {
           const result = state.results[kind];
@@ -297,53 +308,66 @@ export function SearchPage({
                   </div>
                 )}
               </div>
-              {result.loading && (
+              {result.loading && !result.error && !items.length && (
                 <div
                   className="global-search-loading"
                   role="status"
                   aria-label={`Loading ${action}`}
                 >
-                  {items.length ? (
-                    <span>Loading…</span>
-                  ) : (
-                    Array.from({ length: 4 }, (_, index) => (
-                      <Skeleton
-                        key={index}
-                        className="search-poster-skeleton"
-                      />
-                    ))
-                  )}
+                  {Array.from({ length: 4 }, (_, index) => (
+                    <Skeleton key={index} className="search-poster-skeleton" />
+                  ))}
                 </div>
               )}
               {result.error && (
-                <div className="global-search-error" role="alert">
+                <AnimatedAlert className="global-search-error" variant="error">
                   <span>{result.error}</span>
-                  <Button
+                  <LoadingButton
                     variant="secondary"
                     aria-label={`Retry ${action}`}
+                    loading={result.loading}
+                    loadingLabel="Retrying…"
                     onClick={nextPage}
                   >
                     Retry
-                  </Button>
-                </div>
+                  </LoadingButton>
+                </AnimatedAlert>
               )}
-              {!result.loading && !result.error && !items.length && (
-                <p className="global-search-empty">No matches found.</p>
-              )}
-              {kind !== "live" && result.hasMore && !result.error && (
-                <Button
-                  variant="secondary"
-                  className="global-search-more"
-                  disabled={result.loading}
-                  aria-label={`Load more ${action}`}
-                  onClick={nextPage}
-                >
-                  Load more
-                </Button>
-              )}
+              {!result.loading &&
+                !result.error &&
+                !result.hasMore &&
+                !items.length && (
+                  <p className="global-search-empty">No matches found.</p>
+                )}
             </section>
           );
         })}
+      {showResults && hasMore && (
+        <InfiniteScroll
+          isLoading={loading}
+          hasMore={hasMore}
+          next={() => {
+            for (const kind of pagedKinds) {
+              const result = state.results[kind];
+              if (result.hasMore && !result.loading && !result.error)
+                loadPage(
+                  kind,
+                  result.page + 1,
+                  value.trim(),
+                  generation.current,
+                );
+            }
+          }}
+        >
+          <div className="auto-loader">
+            {loading && (
+              <span role="status" aria-label="Loading more results">
+                <Spinner size="small" className="app-spinner" />
+              </span>
+            )}
+          </div>
+        </InfiniteScroll>
+      )}
     </div>
   );
 }

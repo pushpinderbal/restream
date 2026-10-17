@@ -75,6 +75,7 @@ type store struct {
 	categories                                         []model.Category
 	catalogAt, epgAt, categoriesAt, catalogPublishedAt time.Time
 	libraryRefreshedAt                                 time.Time
+	libraryInvalidatedAt                               time.Time
 	portalCooldownUntil                                time.Time
 	catalogJSON, epgJSON                               []byte
 	catalogETag, epgETag                               string
@@ -115,7 +116,9 @@ func openStore(dir, portal, mac string) (*store, error) {
  CREATE TABLE IF NOT EXISTS categories(kind TEXT NOT NULL,id TEXT NOT NULL,data BLOB NOT NULL,PRIMARY KEY(kind,id));
  CREATE TABLE IF NOT EXISTS episodes(series_id TEXT PRIMARY KEY,data BLOB NOT NULL,fetched_at INTEGER NOT NULL DEFAULT 0);
  CREATE TABLE IF NOT EXISTS epg(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL);
- CREATE TABLE IF NOT EXISTS discovery(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL);`); err != nil {
+ CREATE TABLE IF NOT EXISTS discovery(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL);
+ CREATE TABLE IF NOT EXISTS listing_revisions(listing TEXT PRIMARY KEY,revision INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS cache_retries(entry TEXT PRIMARY KEY,failures INTEGER NOT NULL,retry_at INTEGER NOT NULL);`); err != nil {
 		return fail(err)
 	}
 	if err = os.Chmod(path, 0600); err != nil {
@@ -280,7 +283,7 @@ func (s *store) clearForProvider() error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"items", "pages", "categories", "episodes", "epg", "discovery", "meta"} {
+	for _, table := range []string{"items", "pages", "categories", "episodes", "epg", "discovery", "listing_revisions", "cache_retries", "meta"} {
 		if _, err = tx.Exec("DELETE FROM " + table); err != nil {
 			return err
 		}
@@ -379,7 +382,7 @@ func (s *store) load() error {
 			return err
 		}
 	}
-	for key, dest := range map[string]*time.Time{"live_at": &s.catalogAt, "epg_at": &s.epgAt, "categories_at": &s.categoriesAt, "library_refreshed_at": &s.libraryRefreshedAt, "cooldown": &s.portalCooldownUntil} {
+	for key, dest := range map[string]*time.Time{"live_at": &s.catalogAt, "epg_at": &s.epgAt, "categories_at": &s.categoriesAt, "library_refreshed_at": &s.libraryRefreshedAt, "library_invalidated_at": &s.libraryInvalidatedAt, "cooldown": &s.portalCooldownUntil} {
 		var v string
 		err = s.db.QueryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(&v)
 		if err == nil {
@@ -567,6 +570,9 @@ func (s *store) setCategories(c []model.Category) error {
 		if _, err = tx.Exec(`DELETE FROM pages WHERE kind='series'`); err != nil {
 			return err
 		}
+		if _, err = tx.Exec(`UPDATE listing_revisions SET revision=revision+1 WHERE json_extract(listing,'$[0]')='series'`); err != nil {
+			return err
+		}
 	}
 	if _, err = tx.Exec(`DELETE FROM categories`); err != nil {
 		return err
@@ -587,14 +593,14 @@ func (s *store) setCategories(c []model.Category) error {
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	s.categories = c
+	s.categories = append([]model.Category(nil), c...)
 	s.categoriesAt = now
 	s.catalogPublishedAt = now
 	return nil
 }
 
-// Keep item records for active playback, but expire all lists atomically.
-// The revision also prevents older in-flight requests from repopulating them.
+// Manual refresh keeps saved results available while making lists due for revalidation.
+// The revision prevents older in-flight requests from repopulating them.
 func (s *store) invalidateLibrary() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -603,13 +609,19 @@ func (s *store) invalidateLibrary() error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`DELETE FROM pages`); err != nil {
+	if _, err = tx.Exec(`UPDATE pages SET fetched_at=0`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE listing_revisions SET revision=revision+1`); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`UPDATE episodes SET fetched_at=0`); err != nil {
 		return err
 	}
 	now := time.Now().UTC()
+	if err = putMeta(tx, "library_invalidated_at", now.Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
 	if err = putMeta(tx, "library_refreshed_at", now.Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
@@ -620,44 +632,32 @@ func (s *store) invalidateLibrary() error {
 		s.episodesAt[id] = time.Time{}
 	}
 	s.libraryRefreshedAt = now
+	s.libraryInvalidatedAt = now
 	return nil
+}
+
+// Scheduled metadata refreshes publish a revision without expiring useful lists.
+func (s *store) publishLibrary() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	_, err := s.db.Exec(`INSERT INTO meta(key,value) VALUES('library_refreshed_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, now.Format(time.RFC3339Nano))
+	if err == nil {
+		s.libraryRefreshedAt = now
+	}
+	return err
+}
+
+func (s *store) cacheRevision() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.libraryInvalidatedAt
 }
 
 func (s *store) libraryRevision() time.Time {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.libraryRefreshedAt
-}
-
-// Caller holds mu. A response fetched before refresh still needs playback
-// records for its titles, but must not replace records from newer responses.
-func (s *store) retainMissingItems(items []model.Item) error {
-	missing := make([]model.Item, 0)
-	for _, item := range items {
-		if _, exists := s.byID[item.ID]; !exists {
-			missing = append(missing, item)
-		}
-	}
-	if len(missing) == 0 {
-		return nil
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, item := range missing {
-		if err = insertItem(tx, item); err != nil {
-			return err
-		}
-	}
-	if err = tx.Commit(); err != nil {
-		return err
-	}
-	for _, item := range missing {
-		s.byID[item.ID] = item
-	}
-	return nil
 }
 
 func (s *store) browse(q model.BrowseQuery, ttl time.Duration) (model.BrowsePage, bool, error) {
@@ -680,43 +680,6 @@ func (s *store) browse(q model.BrowseQuery, ttl time.Duration) (model.BrowsePage
 	return page, true, nil
 }
 
-func (s *store) setBrowseAtRevision(q model.BrowseQuery, p model.BrowsePage, ttl time.Duration, revision time.Time) error {
-	b, err := encodePage(p)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.libraryRefreshedAt.Equal(revision) {
-		return s.retainMissingItems(p.Items)
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if ttl <= 0 {
-		ttl = 24 * time.Hour
-	}
-	if _, err = tx.Exec(`DELETE FROM pages WHERE fetched_at<?`, time.Now().Add(-ttl).UnixNano()); err != nil {
-		return err
-	}
-	for _, i := range p.Items {
-		if err = insertItem(tx, i); err != nil {
-			return err
-		}
-	}
-	if _, err = tx.Exec(`INSERT INTO pages(kind,category,search,page,data,fetched_at)VALUES(?,?,?,?,?,?) ON CONFLICT(kind,category,search,page)DO UPDATE SET data=excluded.data,fetched_at=excluded.fetched_at`, q.Kind, q.Category, q.Search, q.Page, b, time.Now().UnixNano()); err != nil {
-		return err
-	}
-	if err = tx.Commit(); err != nil {
-		return err
-	}
-	for _, i := range p.Items {
-		s.byID[i.ID] = i
-	}
-	return nil
-}
 func (s *store) setPortalCooldown(at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -745,8 +708,8 @@ func (s *store) setEpisodesAtRevision(id string, items []model.Item, revision ti
 func (s *store) setEpisodeListAtRevision(seriesID, key string, items []model.Item, revision time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.libraryRefreshedAt.Equal(revision) {
-		return s.retainMissingItems(items)
+	if revision.Before(s.libraryInvalidatedAt) {
+		return errCacheChanged
 	}
 	series, ok := s.byID[seriesID]
 	if !ok || series.Kind != "series" {
@@ -785,14 +748,19 @@ func (s *store) setEpisodeListAtRevision(seriesID, key string, items []model.Ite
 	}
 	return nil
 }
-func (s *store) getEpisodes(id string, ttl time.Duration) ([]model.Item, bool) {
+func (s *store) episodeSnapshot(id string, ttl time.Duration) ([]model.Item, bool, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	items, ok := s.episodes[id]
-	if !ok || ttl > 0 && time.Since(s.episodesAt[id]) > ttl {
+	fresh := ok && (ttl <= 0 || time.Since(s.episodesAt[id]) < ttl)
+	return append([]model.Item(nil), items...), ok, fresh
+}
+func (s *store) getEpisodes(id string, ttl time.Duration) ([]model.Item, bool) {
+	items, _, fresh := s.episodeSnapshot(id, ttl)
+	if !fresh {
 		return nil, false
 	}
-	return append([]model.Item(nil), items...), true
+	return items, true
 }
 func (s *store) item(id string) (model.Item, bool) {
 	s.mu.RLock()

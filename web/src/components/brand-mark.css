@@ -1,8 +1,8 @@
 .brand-mark {
   display: block;
   flex-shrink: 0;
-  width: var(--brand-mark-size, 38px);
-  height: var(--brand-mark-size, 38px);
+  width: var(--brand-mark-size, 42px);
+  height: var(--brand-mark-size, 42px);
   overflow: visible;
   color: #f5f5f7;
 }
@@ -11,6 +11,10 @@
   transform-origin: center;
   animation: brand-assemble 1s cubic-bezier(0.22, 1, 0.36, 1) both;
   animation-delay: var(--fragment-delay, 0ms);
+}
+.brand-fragment-tip,
+.brand-fragment-center {
+  fill: #f08a83;
 }
 .brand-fragment-top {
   --fragment-x: -4px;
@@ -35,34 +39,19 @@
   --fragment-y: 6px;
   --fragment-rotation: 12deg;
 }
-.brand-resolved {
-  animation: brand-resolve 1.2s ease both;
-}
-@keyframes brand-resolve {
-  0%,
-  80% {
-    opacity: 0;
-  }
-  100% {
-    opacity: 1;
-  }
-}
 @keyframes brand-assemble {
   0% {
     transform: translate(var(--fragment-x), var(--fragment-y))
       rotate(var(--fragment-rotation));
-    fill: #f08a83;
     opacity: 0.2;
   }
   100% {
     transform: translate(0, 0) rotate(0deg);
-    fill: #f5f5f7;
     opacity: 1;
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .brand-fragment,
-  .brand-resolved {
+  .brand-fragment {
     animation: none;
   }
 }

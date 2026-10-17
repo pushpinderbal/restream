@@ -1,8 +1,10 @@
 import * as React from "react";
 import { BorderBeam, type BorderBeamColorVariant } from "border-beam";
 import { Search, X } from "lucide-react";
+import { useReducedMotion } from "motion/react";
 
 import { cn } from "../../lib/utils";
+import { Button } from "../ui/button";
 import { useSurfaceTheme, type SurfaceTheme } from "./use-surface-theme";
 
 export interface BeamSearchProps {
@@ -35,6 +37,7 @@ export function BeamSearch({
   className,
 }: BeamSearchProps) {
   const resolvedTheme = useSurfaceTheme(theme);
+  const reduceMotion = useReducedMotion();
   const [innerValue, setInnerValue] = React.useState(defaultValue);
   const [focused, setFocused] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
@@ -50,12 +53,16 @@ export function BeamSearch({
       size="line"
       colorVariant={colorVariant}
       theme={resolvedTheme}
-      active={alwaysOn || focused}
+      active={!reduceMotion && (alwaysOn || focused)}
+      staticColors={colorVariant === "mono"}
+      strength={0.45}
+      glowSize={0.5}
+      duration={3.6}
       className={cn("beam-search w-full", className)}
     >
-      <label
+      <div
         className={cn(
-          "flex h-12 w-full items-center gap-3 rounded-xl border border-white/12 bg-neutral-950/90 px-3.5 transition-colors",
+          "beam-search-control flex h-12 w-full items-center gap-3 rounded-xl border border-white/12 bg-neutral-950/90 px-3.5 transition-colors",
           focused && "border-white/20",
         )}
       >
@@ -67,6 +74,8 @@ export function BeamSearch({
           value={currentValue}
           aria-label={ariaLabel}
           placeholder={placeholder}
+          autoComplete="off"
+          spellCheck={false}
           onChange={(event) => update(event.target.value)}
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
@@ -77,7 +86,9 @@ export function BeamSearch({
           className="min-w-0 flex-1 bg-transparent text-[13px] text-neutral-100 outline-none placeholder:text-neutral-500 [&::-webkit-search-cancel-button]:hidden"
         />
         {currentValue ? (
-          <button
+          <Button
+            variant="ghost"
+            size="icon-xs"
             type="button"
             aria-label="Clear search"
             onMouseDown={(event) => event.preventDefault()}
@@ -85,14 +96,14 @@ export function BeamSearch({
               update("");
               inputRef.current?.focus();
             }}
-            className="flex size-7 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-white/8 hover:text-neutral-100"
+            className="beam-search-clear flex size-7 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-white/8 hover:text-neutral-100"
           >
-            <X className="size-3.5" />
-          </button>
+            <X className="size-3.5" aria-hidden="true" />
+          </Button>
         ) : (
           trailing
         )}
-      </label>
+      </div>
     </BorderBeam>
   );
 }

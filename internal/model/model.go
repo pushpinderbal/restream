@@ -45,10 +45,13 @@ type BrowseQuery struct {
 }
 
 type BrowsePage struct {
-	Items   []Item `json:"items"`
-	Page    int    `json:"page"`
-	Total   int    `json:"total"`
-	HasMore bool   `json:"hasMore"`
+	Items      []Item `json:"items"`
+	Page       int    `json:"page"`
+	Total      int    `json:"total"`
+	HasMore    bool   `json:"hasMore"`
+	Revision   int64  `json:"revision"`
+	Stale      bool   `json:"stale,omitempty"`
+	Refreshing bool   `json:"refreshing,omitempty"`
 }
 
 // BrowseProvider discovers categories without importing VOD and fetches one
