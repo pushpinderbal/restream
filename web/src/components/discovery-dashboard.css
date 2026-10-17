@@ -22,7 +22,9 @@
   isolation: isolate;
   z-index: 0;
 }
-.discovery-dashboard button:not([data-slot="button"]):focus-visible {
+:root:not([data-input-modality="pointer"])
+  .discovery-dashboard
+  button:not([data-slot="button"]):focus-visible {
   outline: 2px solid #f4f4f5;
   outline-offset: 4px;
 }
@@ -230,8 +232,6 @@
   padding: 0;
   border: 0;
   border-radius: 0;
-  outline: none;
-  box-shadow: none;
   background: transparent;
 }
 .discovery-dashboard .discovery-rail-control {
@@ -241,9 +241,6 @@
 }
 .discovery-dashboard .discovery-rail-control:hover {
   color: #fff;
-}
-.discovery-dashboard .discovery-rail-control:focus-visible {
-  color: #e5484d;
 }
 .discovery-rail-control svg {
   width: 26px;
@@ -276,19 +273,16 @@
 .discovery-rail-overlay .discovery-rail-next {
   right: 8px;
 }
-.discovery-rail-overlay .discovery-rail-control:focus-visible {
-  outline: 2px solid #fff;
-  outline-offset: 2px;
-}
 .discovery-poster-grid::-webkit-scrollbar,
 .discovery-continue-grid::-webkit-scrollbar,
 .discovery-next-grid::-webkit-scrollbar,
 .discovery-channel-grid::-webkit-scrollbar,
-.discovery-recent-grid::-webkit-scrollbar,
-.discovery-recent-filters::-webkit-scrollbar {
+.discovery-recent-grid::-webkit-scrollbar {
   display: none;
 }
-.discovery-rail-shell > [tabindex]:focus-visible {
+:root:not([data-input-modality="pointer"])
+  .discovery-rail-shell
+  > [tabindex]:focus-visible {
   outline: 2px solid #a1a1aa;
   outline-offset: 4px;
 }
@@ -542,11 +536,6 @@
   color: #a1a1aa;
   font-size: 12px;
 }
-.discovery-recent-filters {
-  width: fit-content;
-  max-width: 100%;
-  margin-bottom: 20px;
-}
 .discovery-recent-card {
   position: relative;
   min-width: 0;
@@ -722,11 +711,6 @@
   }
   .discovery-bottom {
     gap: 28px;
-  }
-  .discovery-recent-filters {
-    overflow-x: auto;
-    scrollbar-width: none;
-    -ms-overflow-style: none;
   }
 }
 @media (prefers-reduced-motion: reduce) {

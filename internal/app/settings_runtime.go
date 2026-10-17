@@ -28,6 +28,7 @@ type Runtime struct {
 	provider model.Provider
 	handler  http.Handler
 	closed   bool
+	auth     *authManager
 }
 
 func NewRuntime(cfg Config) (*Runtime, error) {
@@ -82,11 +83,16 @@ func NewRuntime(cfg Config) (*Runtime, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	rt.auth, err = newAuth(cfg.Auth, db)
+	if err != nil {
+		rt.Close()
+		return nil, err
+	}
 	guard := http.NewCrossOriginProtection()
 	guard.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fail(w, 403, "origin", "Cross-origin requests are not allowed.")
 	}))
-	rt.handler = guard.Handler(http.HandlerFunc(rt.serve))
+	rt.handler = guard.Handler(rt.auth.middleware(http.HandlerFunc(rt.serve)))
 	return rt, nil
 }
 func runtimeDependencies(cfg Config) (model.Provider, *stream.Manager, error) {
@@ -232,6 +238,7 @@ func (rt *Runtime) updateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if !providerChanged {
 		server.sessionItems = oldServer.sessionItems
+		server.sessionOwners = oldServer.sessionOwners
 	}
 	rt.server, rt.provider, rt.manager, rt.settings = server, provider, manager, next
 	server.stopBlockedSessions()
@@ -254,6 +261,7 @@ func (rt *Runtime) restoreGeneration(providerChanged bool, previous *Server) {
 	rt.server, _ = New(cfg, rt.provider, streamInterface(rt.manager))
 	if rt.server != nil && !providerChanged {
 		rt.server.sessionItems = previous.sessionItems
+		rt.server.sessionOwners = previous.sessionOwners
 	}
 }
 func (rt *Runtime) Close() {
@@ -268,6 +276,9 @@ func (rt *Runtime) Close() {
 	}
 	if rt.manager != nil {
 		_ = rt.manager.Close()
+	}
+	if rt.auth != nil {
+		rt.auth.close()
 	}
 	_ = rt.db.Close()
 }

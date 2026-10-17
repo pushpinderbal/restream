@@ -2,7 +2,7 @@ import { BroadcastIcon } from "@phosphor-icons/react/dist/csr/Broadcast";
 import { CompassIcon } from "@phosphor-icons/react/dist/csr/Compass";
 import { FilmReelIcon } from "@phosphor-icons/react/dist/csr/FilmReel";
 import { MagnifyingGlassIcon } from "@phosphor-icons/react/dist/csr/MagnifyingGlass";
-import { SlidersHorizontalIcon } from "@phosphor-icons/react/dist/csr/SlidersHorizontal";
+import { AccountMenu } from "./account-menu";
 import { BrandMark } from "./brand-mark";
 import "./navigation.css";
 import { Button } from "./ui/button";
@@ -19,7 +19,6 @@ const destinations = [
   { id: "home", label: "Home", icon: CompassIcon },
   { id: "vod", label: "VOD", icon: FilmReelIcon },
   { id: "live", label: "Live TV", icon: BroadcastIcon },
-  { id: "settings", label: "Settings", icon: SlidersHorizontalIcon },
 ] as const;
 
 export function AppNavigation({
@@ -29,6 +28,12 @@ export function AppNavigation({
   active: Destination;
   onNavigate: (destination: Destination) => void;
 }) {
+  const accountMenu = (
+    <AccountMenu
+      active={active === "settings"}
+      onSettings={() => onNavigate("settings")}
+    />
+  );
   const renderLink = ({
     id,
     label,
@@ -63,21 +68,24 @@ export function AppNavigation({
     <>
       <TooltipProvider delayDuration={400} skipDelayDuration={200}>
         <aside className="app-sidebar">
-          <button
+          <Button
+            variant="ghost"
+            size="icon-lg"
             className="sidebar-brand"
             aria-label="Restream home"
             onClick={() => onNavigate("home")}
           >
             <BrandMark />
-          </button>
+          </Button>
           <nav className="side-navigation" aria-label="Library">
-            <div className="navigation-main">{desktopLinks.slice(0, 4)}</div>
-            <div className="navigation-footer">{desktopLinks[4]}</div>
+            <div className="navigation-main">{desktopLinks}</div>
+            <div className="navigation-footer">{accountMenu}</div>
           </nav>
         </aside>
       </TooltipProvider>
       <nav className="mobile-bottom-nav" aria-label="Primary navigation">
         {destinations.map(renderLink)}
+        {accountMenu}
       </nav>
     </>
   );

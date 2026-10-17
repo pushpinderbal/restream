@@ -285,7 +285,7 @@ export function UndoPill({
             className={cn(
               "-my-1 touch-manipulation rounded-full px-1.5 py-1 font-medium underline-offset-2 transition-colors",
               "hover:bg-white/10 hover:underline active:bg-white/20 dark:hover:bg-neutral-900/10 dark:active:bg-neutral-900/15",
-              "focus-visible:underline focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-white/70 dark:focus-visible:ring-neutral-900/60",
+              "outline-none keyboard-focus:underline",
             )}
           >
             {undoLabel}

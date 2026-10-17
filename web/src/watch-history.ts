@@ -118,10 +118,10 @@ function recentEntries(entries: WatchHistoryEntry[]) {
     });
 }
 
-function readHistory(): HistoryState {
+function readHistory(storageKey: string): HistoryState {
   let raw: string | null;
   try {
-    raw = window.localStorage.getItem(WATCH_HISTORY_KEY);
+    raw = window.localStorage.getItem(storageKey);
   } catch {
     return { entries: [], persistent: false };
   }
@@ -137,8 +137,11 @@ function readHistory(): HistoryState {
   }
 }
 
-export function useWatchHistory() {
-  const [state, setState] = useState(readHistory);
+export function useWatchHistory(userId?: string) {
+  const storageKey = userId
+    ? `${WATCH_HISTORY_KEY}.user.${encodeURIComponent(userId)}`
+    : WATCH_HISTORY_KEY;
+  const [state, setState] = useState(() => readHistory(storageKey));
   const current = useRef(state);
   const pendingFlush = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dirty = useRef(false);
@@ -152,25 +155,28 @@ export function useWatchHistory() {
     setPendingUndo(null);
   }, []);
 
-  const persist = useCallback((entries: WatchHistoryEntry[]) => {
-    if (pendingFlush.current !== null) clearTimeout(pendingFlush.current);
-    pendingFlush.current = null;
-    dirty.current = false;
-    lastWrite.current = Date.now();
-    let persistent = true;
-    try {
-      if (entries.length)
-        window.localStorage.setItem(
-          WATCH_HISTORY_KEY,
-          JSON.stringify({ version: 1, entries }),
-        );
-      else window.localStorage.removeItem(WATCH_HISTORY_KEY);
-    } catch {
-      persistent = false;
-    }
-    current.current = { entries, persistent };
-    setState(current.current);
-  }, []);
+  const persist = useCallback(
+    (entries: WatchHistoryEntry[]) => {
+      if (pendingFlush.current !== null) clearTimeout(pendingFlush.current);
+      pendingFlush.current = null;
+      dirty.current = false;
+      lastWrite.current = Date.now();
+      let persistent = true;
+      try {
+        if (entries.length)
+          window.localStorage.setItem(
+            storageKey,
+            JSON.stringify({ version: 1, entries }),
+          );
+        else window.localStorage.removeItem(storageKey);
+      } catch {
+        persistent = false;
+      }
+      current.current = { entries, persistent };
+      setState(current.current);
+    },
+    [storageKey],
+  );
 
   const update = useCallback(
     (change: (entries: WatchHistoryEntry[]) => WatchHistoryEntry[]) =>
@@ -186,14 +192,14 @@ export function useWatchHistory() {
 
   useEffect(() => {
     const restore = (event: StorageEvent) => {
-      if (event.key !== WATCH_HISTORY_KEY && event.key !== null) return;
+      if (event.key !== storageKey && event.key !== null) return;
       // A clear/remove in another tab wins over this tab's pending progress.
       if (pendingFlush.current !== null) clearTimeout(pendingFlush.current);
       pendingFlush.current = null;
       dirty.current = false;
       // Another tab explicitly clearing history also cancels restoration.
       if (event.key === null || event.newValue === null) dismissUndo();
-      current.current = readHistory();
+      current.current = readHistory(storageKey);
       setState(current.current);
     };
     const hide = () => {
@@ -208,7 +214,7 @@ export function useWatchHistory() {
       document.removeEventListener("visibilitychange", hide);
       flushProgress();
     };
-  }, [dismissUndo, flushProgress]);
+  }, [dismissUndo, flushProgress, storageKey]);
 
   const record = useCallback(
     (selection: PlaybackSelection) => {
@@ -320,7 +326,7 @@ export function useWatchHistory() {
   const undoRemoval = useCallback(() => {
     const removed = removedEntries.current;
     if (!removed.length) return;
-    const saved = readHistory();
+    const saved = readHistory(storageKey);
     // An external clear may arrive before its storage event. Respect it even
     // when this tab still has the previous entries in memory.
     if (
@@ -365,7 +371,7 @@ export function useWatchHistory() {
       ]),
     );
     dismissUndo();
-  }, [dismissUndo, persist]);
+  }, [dismissUndo, persist, storageKey]);
 
   return {
     ...state,

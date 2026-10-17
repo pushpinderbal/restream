@@ -61,6 +61,7 @@ type Server struct {
 	preferencesService     *preferencesService
 	sessionItemsMu         sync.Mutex
 	sessionItems           map[string]model.Item
+	sessionOwners          map[string]string
 }
 
 type refreshState struct {
@@ -118,6 +119,7 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	}
 	s.refreshWake = [2]chan struct{}{make(chan struct{}, 1), make(chan struct{}, 1)}
 	s.sessionItems = make(map[string]model.Item)
+	s.sessionOwners = make(map[string]string)
 	cache.mu.RLock()
 	slog.Info("Cache restored", "liveChannels", len(cache.items), "categories", len(cache.categories), "programs", len(cache.programs))
 	if until := cache.portalCooldownUntil; until.After(time.Now()) {
@@ -304,20 +306,9 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		epgSync.LastSuccessfulAt = &epg
 	}
 	busy := catSync.Queued || catSync.Running || epgSync.Queued || epgSync.Running
-	active := 0
-	if s.streams != nil {
-		active = s.streams.Active()
-	}
-	out := map[string]any{"configured": s.provider != nil, "refreshing": busy, "activeStreams": active, "maxStreams": s.cfg.MaxStreams}
-	if updated := s.preferencesSnapshot().updatedAt; !updated.IsZero() {
+	out := map[string]any{"configured": s.provider != nil, "refreshing": busy, "library": library}
+	if updated := policy.updatedAt; !updated.IsZero() {
 		out["preferencesUpdatedAt"] = updated
-	}
-	out["sync"] = map[string]any{"catalog": catSync, "epg": epgSync}
-	out["library"] = library
-	out["timezone"], out["guideHours"] = s.cfg.Timezone, s.cfg.EPGHours
-	out["playback"] = map[string]any{"transcodeMode": s.cfg.TranscodeMode, "sessionTimeoutSeconds": s.cfg.SessionTTL.Seconds()}
-	if cooldown.After(time.Now()) {
-		out["portalCooldownUntil"] = cooldown
 	}
 	if !cat.IsZero() {
 		out["catalogUpdatedAt"] = cat
@@ -330,6 +321,24 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	if !epg.IsZero() {
 		out["epgUpdatedAt"] = epg
+	}
+	if user := authenticatedUser(r); user != nil && user.Role == "viewer" {
+		if catErr != "" || epgErr != "" {
+			out["error"] = "Library updates are temporarily unavailable."
+		}
+		respond(w, 200, out)
+		return
+	}
+	active := 0
+	if s.streams != nil {
+		active = s.streams.Active()
+	}
+	out["activeStreams"], out["maxStreams"] = active, s.cfg.MaxStreams
+	out["sync"] = map[string]any{"catalog": catSync, "epg": epgSync}
+	out["timezone"], out["guideHours"] = s.cfg.Timezone, s.cfg.EPGHours
+	out["playback"] = map[string]any{"transcodeMode": s.cfg.TranscodeMode, "sessionTimeoutSeconds": s.cfg.SessionTTL.Seconds()}
+	if cooldown.After(time.Now()) {
+		out["portalCooldownUntil"] = cooldown
 	}
 	if catErr != "" {
 		out["error"] = catErr
@@ -799,14 +808,14 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		streamError(w, err)
 		return
 	}
-	if !s.rememberSession(session.ID, item) {
+	if !s.rememberSession(r, session.ID, item) {
 		blocked(w)
 		return
 	}
 	respond(w, 201, session)
 }
 func (s *Server) session(w http.ResponseWriter, r *http.Request) {
-	if !s.sessionAllowed(w, r.PathValue("id")) {
+	if !s.sessionAllowed(w, r, r.PathValue("id")) {
 		return
 	}
 	if s.streams == nil {
@@ -821,7 +830,7 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, session)
 }
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
-	if !s.sessionAllowed(w, r.PathValue("id")) {
+	if !s.sessionAllowed(w, r, r.PathValue("id")) {
 		return
 	}
 	if s.streams == nil {
@@ -835,7 +844,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 func (s *Server) seek(w http.ResponseWriter, r *http.Request) {
-	if !s.sessionAllowed(w, r.PathValue("id")) {
+	if !s.sessionAllowed(w, r, r.PathValue("id")) {
 		return
 	}
 	if s.streams == nil {
@@ -860,6 +869,9 @@ func (s *Server) seek(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, session)
 }
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
+	if !s.sessionOwned(w, r, r.PathValue("id")) {
+		return
+	}
 	if s.streams != nil {
 		err := s.streams.Stop(r.PathValue("id"))
 		if err != nil && !errors.Is(err, stream.ErrNotFound) {
@@ -869,6 +881,7 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	}
 	s.sessionItemsMu.Lock()
 	delete(s.sessionItems, r.PathValue("id"))
+	delete(s.sessionOwners, r.PathValue("id"))
 	s.sessionItemsMu.Unlock()
 	w.WriteHeader(204)
 }

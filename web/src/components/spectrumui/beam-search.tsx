@@ -4,6 +4,7 @@ import { Search, X } from "lucide-react";
 import { useReducedMotion } from "motion/react";
 
 import { cn } from "../../lib/utils";
+import { Button } from "../ui/button";
 import { useSurfaceTheme, type SurfaceTheme } from "./use-surface-theme";
 
 export interface BeamSearchProps {
@@ -85,7 +86,9 @@ export function BeamSearch({
           className="min-w-0 flex-1 bg-transparent text-[13px] text-neutral-100 outline-none placeholder:text-neutral-500 [&::-webkit-search-cancel-button]:hidden"
         />
         {currentValue ? (
-          <button
+          <Button
+            variant="ghost"
+            size="icon-xs"
             type="button"
             aria-label="Clear search"
             onMouseDown={(event) => event.preventDefault()}
@@ -96,7 +99,7 @@ export function BeamSearch({
             className="beam-search-clear flex size-7 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-white/8 hover:text-neutral-100"
           >
             <X className="size-3.5" aria-hidden="true" />
-          </button>
+          </Button>
         ) : (
           trailing
         )}

@@ -1,10 +1,12 @@
 /* Adapted from Spectrum UI Multiple Selector (Apache-2.0).
  * https://spectrumhq.in/docs/multiple-selector-with-form
  * Local categories only: cmdk handles filtering, focus and keyboard selection. */
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Command } from "cmdk";
 import { X } from "lucide-react";
 import type { Category } from "../../api";
+import { Button } from "../ui/button";
+import { Label } from "../ui/label";
 
 const groups = { live: "Live TV", movie: "Movies", series: "Shows" } as const;
 export function CategorySelector({
@@ -24,6 +26,10 @@ export function CategorySelector({
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [inputId, setInputId] = useState<string>();
+  const captureInputId = useCallback((input: HTMLInputElement | null) => {
+    if (input) setInputId(input.id);
+  }, []);
   const options = useMemo(
     () =>
       categories.map((category) => ({
@@ -35,9 +41,10 @@ export function CategorySelector({
   const remove = (value: string) =>
     onChange(values.filter((entry) => entry !== value));
   return (
-    <div className="settings-category-field">
-      <label htmlFor={id}>{label}</label>
+    <div id={id} className="settings-category-field">
+      <Label htmlFor={inputId}>{label}</Label>
       <Command
+        label={label}
         className="settings-category-selector"
         onKeyDown={(event) => {
           if (event.key === "Escape") {
@@ -56,19 +63,21 @@ export function CategorySelector({
                 <span>
                   {option ? `${option.name} · ${groups[option.kind]}` : value}
                 </span>
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon-xs"
                   disabled={disabled}
                   aria-label={`Remove ${option?.name || value} from ${label}`}
                   onClick={() => remove(value)}
                 >
                   <X size={13} aria-hidden />
-                </button>
+                </Button>
               </span>
             );
           })}
           <Command.Input
-            id={id}
+            ref={captureInputId}
             disabled={disabled}
             value={query}
             onValueChange={(value) => {
@@ -85,7 +94,6 @@ export function CategorySelector({
               )
                 setOpen(false);
             }}
-            aria-label={label}
           />
         </div>
         {open && !disabled && (
@@ -113,6 +121,7 @@ export function CategorySelector({
                       keywords={[option.name, name]}
                       onMouseDown={(event) => event.preventDefault()}
                       onSelect={() => {
+                        if (disabled) return;
                         onChange([...values, option.value]);
                         setQuery("");
                       }}

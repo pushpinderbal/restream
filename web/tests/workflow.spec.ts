@@ -1,4 +1,8 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Locator } from "@playwright/test";
+
+// Tailwind's shadow-none can serialize as several transparent, zero-size shadows.
+const noVisibleShadow =
+  /^(?:none|(?:rgba\(0, 0, 0, 0\) 0px 0px 0px 0px,? ?)+)$/;
 
 const live = {
   id: "live-1",
@@ -105,6 +109,62 @@ async function navigateLibrary(
       })
       .click();
   }
+}
+
+async function reviewInteraction(page: Page, target: Locator, label: string) {
+  if (!process.env.INTERACTION_REVIEW) return;
+  await target.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: `../output/interaction-review/${label}.png` });
+}
+
+async function focusUnderline(target: Locator, pseudo = "::before") {
+  return target.evaluate((element, selector) => {
+    const style = getComputedStyle(element, selector);
+    return (
+      style.content !== "none" &&
+      style.content !== "normal" &&
+      style.display !== "none" &&
+      Number(style.opacity) > 0 &&
+      parseFloat(style.width) > 0 &&
+      parseFloat(style.height) > 0
+    );
+  }, pseudo);
+}
+
+async function expectPointerFocus(page: Page, target: Locator) {
+  await expect(page.locator("html")).toHaveAttribute(
+    "data-input-modality",
+    "pointer",
+  );
+  await expect(target).toHaveCSS("outline-style", "none");
+  await expect(target).toHaveCSS("box-shadow", noVisibleShadow);
+  await expect(target).not.toHaveCSS("text-decoration-line", /underline/);
+  if (
+    await target.evaluate((element) => element.classList.contains("focus-icon"))
+  )
+    await expect.poll(() => focusUnderline(target)).toBe(false);
+}
+
+async function expectKeyboardIcon(page: Page, target: Locator) {
+  await expect(page.locator("html")).toHaveAttribute(
+    "data-input-modality",
+    "keyboard",
+  );
+  await expect(target).toBeFocused();
+  await expect(target).toHaveCSS("outline-style", "none");
+  await expect(target).toHaveCSS("box-shadow", noVisibleShadow);
+  await expect.poll(() => focusUnderline(target)).toBe(true);
+}
+
+async function openSettings(page: Page) {
+  await page
+    .getByRole("button", { name: "Account", exact: true })
+    .filter({ visible: true })
+    .click();
+  await page
+    .getByRole("menu", { name: "Account", exact: true })
+    .getByRole("menuitem", { name: "Settings", exact: true })
+    .click();
 }
 
 async function openSearch(page: Page) {
@@ -319,6 +379,7 @@ async function mockApi(
   let preferencesUpdatedAt: string | undefined;
   let providerConfigured = !options.unconfigured;
   const providerPatches: Record<string, unknown>[] = [];
+  const settingsPatches: Record<string, unknown>[] = [];
   const settings = {
     providerEnvironment: options.providerEnvironment ?? [],
     provider: {
@@ -420,6 +481,9 @@ async function mockApi(
         contentType: "application/json",
         body: JSON.stringify(body),
       });
+    if (path === "/api/auth") {
+      return json({ mode: "none", user: null });
+    }
     if (path === "/api/settings") {
       if (options.preferencesGate) await options.preferencesGate;
       if (
@@ -429,6 +493,7 @@ async function mockApi(
       )
         return json({ error: "Configuration is temporarily unavailable" }, 503);
       if (method === "PATCH") {
+        settingsPatches.push(structuredClone(route.request().postDataJSON()));
         if (options.settingsSaveGate) await options.settingsSaveGate;
         if (
           typeof options.settingsSaveFailure === "function"
@@ -765,6 +830,7 @@ async function mockApi(
     effectivePreferences: () => structuredClone(preferences),
     effectiveSettings: () => structuredClone(settings),
     providerPatches,
+    settingsPatches,
     deployConfiguration: (next: BrowserPreferences) => {
       preferences = structuredClone(next);
       preferencesUpdatedAt = new Date().toISOString();
@@ -856,12 +922,17 @@ test("LIVE greys behind the stream and jumps to the latest seek point while resu
     );
     await page.locator(".primary-control").focus();
     await expect(page.locator(".primary-control")).toBeFocused();
+    await expectKeyboardIcon(page, page.locator(".primary-control"));
     await expect(page.locator(".video-controls :focus-visible")).toHaveCount(1);
   };
   await revealControls();
   await expect(page.locator("#inline-title-details")).toHaveCount(0);
   await expect(page.locator(".primary-control")).toBeFocused();
   await expect(page.locator(".video-controls :focus-visible")).toHaveCount(1);
+  await page.locator(".primary-control").click();
+  await expectPointerFocus(page, page.locator(".primary-control"));
+  await page.locator(".primary-control").click();
+  await revealControls();
   await expect(liveButton).toHaveAttribute("data-behind", "true");
   await expect(liveButton).toHaveCSS("color", "rgb(146, 152, 165)");
   await page.getByRole("button", { name: "Pause", exact: true }).press("Enter");
@@ -1014,10 +1085,48 @@ for (const viewport of [
     await expect(page).toHaveURL(/episode=episode-3/);
     await expect(page.locator(".primary-control")).toBeEnabled();
     await playableVideo(page);
-    await page
+    const season = page.getByRole("combobox", { name: "Season", exact: true });
+    await page.keyboard.press("Tab");
+    await season.focus();
+    await expect(season).toHaveCSS("text-decoration-line", "underline");
+    await expect(season).toHaveCSS("border-top-width", "0px");
+    await expect(season).toHaveCSS("outline-style", "none");
+    await expect(season).toHaveCSS("box-shadow", noVisibleShadow);
+    await reviewInteraction(page, season, `season-${viewport.width}-keyboard`);
+    const details = page
       .getByRole("complementary", { name: "Watch context", exact: true })
-      .getByRole("button", { name: "Title details", exact: true })
-      .click();
+      .getByRole("button", { name: "Title details", exact: true });
+    await page.keyboard.press("Tab");
+    await details.focus();
+    await expect(details).toHaveCSS("text-decoration-line", "underline");
+    await expect(details).toHaveCSS("outline-style", "none");
+    const stop = page.getByRole("button", {
+      name: "Stop playback",
+      exact: true,
+    });
+    await page.keyboard.press("Tab");
+    await stop.focus();
+    await expectKeyboardIcon(page, stop);
+    await reviewInteraction(page, stop, `player-${viewport.width}-keyboard`);
+    await season.click();
+    await page.getByRole("option", { name: "Season 2", exact: true }).click();
+    await expect(season).toHaveText("Season 2");
+    await expect(season).toBeFocused();
+    await expectPointerFocus(page, season);
+    await expect(season).toHaveCSS("border-top-width", "0px");
+    await reviewInteraction(
+      page,
+      season,
+      `season-${viewport.width}-pointer-selection`,
+    );
+    await stop.focus();
+    await expectPointerFocus(page, stop);
+    await reviewInteraction(
+      page,
+      stop,
+      `player-${viewport.width}-pointer-restored`,
+    );
+    await details.click();
     await expect(page).toHaveURL(/section=series/);
     await expect(page).toHaveURL(/season=2/);
     await expect(page.getByRole("combobox", { name: "Season" })).toHaveText(
@@ -1429,39 +1538,110 @@ test("capacity error is announced", async ({ page }) => {
   ).toBeVisible();
 });
 
-test("category dropdown opens independently of VOD tabs and Escape restores focus", async ({
-  page,
-}) => {
-  await mockApi(page);
-  await page.goto("/?section=live");
-  await navigateLibrary(page, "movie");
-  const movies = page
-    .getByRole("tablist", { name: "VOD type" })
-    .getByRole("tab", { name: "Movies", exact: true });
-  await expect(movies).toHaveAttribute("aria-selected", "true");
-  const category = page.getByRole("combobox", {
-    name: "Category",
-    exact: true,
-  });
-  await expect(category).toContainText("All categories");
-  expect(await category.evaluate((element) => element.tagName)).toBe("BUTTON");
-  await category.click();
-  await expect(
-    page.getByRole("combobox", {
+for (const width of [1280, 390, 320]) {
+  test(`category dropdown opens independently of VOD tabs and Escape restores focus at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 844 });
+    await mockApi(page);
+    await page.goto("/?section=live");
+    await navigateLibrary(page, "movie");
+    const movies = page
+      .getByRole("tablist", { name: "VOD type" })
+      .getByRole("tab", { name: "Movies", exact: true });
+    await expect(movies).toHaveAttribute("aria-selected", "true");
+    const category = page.getByRole("combobox", {
       name: "Category",
       exact: true,
-      includeHidden: true,
-    }),
-  ).toHaveAttribute("aria-expanded", "true");
-  await expect(
-    page.getByRole("option", { name: "Drama", exact: true }),
-  ).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(page.getByRole("listbox")).toHaveCount(0);
-  await expect(category).toHaveAttribute("aria-expanded", "false");
-  await expect(category).toBeFocused();
-  await expect(movies).toHaveAttribute("aria-selected", "true");
-});
+    });
+    await expect(category).toContainText("All categories");
+    expect(await category.evaluate((element) => element.tagName)).toBe(
+      "BUTTON",
+    );
+    await category.click();
+    await expect(
+      page.getByRole("combobox", {
+        name: "Category",
+        exact: true,
+        includeHidden: true,
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    await expect(
+      page.getByRole("option", { name: "Drama", exact: true }),
+    ).toBeVisible();
+    const search = page.getByPlaceholder("Find category…", { exact: true });
+    await expect(search).toBeFocused();
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `../output/category-focus/category-search-${width}.png`,
+      });
+    await expect(search).toHaveCSS("outline-style", "none");
+    await expect(search).toHaveCSS("box-shadow", "none");
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("listbox")).toHaveCount(0);
+    await expect(category).toHaveAttribute("aria-expanded", "false");
+    await expect(category).toBeFocused();
+    await expect(page.locator("html")).toHaveAttribute(
+      "data-input-modality",
+      "keyboard",
+    );
+    await expect.poll(() => focusUnderline(category, "::after")).toBe(true);
+    await expect(category).toHaveCSS("outline-style", "none");
+    await expect(category).toHaveCSS("box-shadow", "none");
+    await reviewInteraction(
+      page,
+      category,
+      `category-${width}-keyboard-escape`,
+    );
+    {
+      await category.click();
+      await search.fill("Drama");
+      await page.getByRole("option", { name: "Drama", exact: true }).click();
+      await expect(category).toBeFocused();
+      await expectPointerFocus(page, category);
+      await expect.poll(() => focusUnderline(category, "::after")).toBe(false);
+      await reviewInteraction(
+        page,
+        category,
+        `category-${width}-pointer-selection`,
+      );
+      await category.click();
+      await search.fill("Drama");
+      await page.keyboard.press("Escape");
+      await expect(category).toBeFocused();
+      await expect(page.locator("html")).toHaveAttribute(
+        "data-input-modality",
+        "keyboard",
+      );
+      await expect.poll(() => focusUnderline(category, "::after")).toBe(true);
+      await expect(category).toHaveCSS("outline-style", "none");
+      await expect(category).toHaveCSS("box-shadow", "none");
+      await reviewInteraction(
+        page,
+        category,
+        `category-${width}-searched-escape`,
+      );
+      await category.click();
+      await page.mouse.click(width - 8, 100);
+      await expect(page.getByRole("listbox")).toHaveCount(0);
+      await expectPointerFocus(page, category);
+      await expect.poll(() => focusUnderline(category, "::after")).toBe(false);
+      await reviewInteraction(
+        page,
+        category,
+        `category-${width}-pointer-outside`,
+      );
+      await movies.click();
+      await expectPointerFocus(page, movies);
+      await expect.poll(() => focusUnderline(movies, "::after")).toBe(false);
+      await reviewInteraction(page, movies, `tab-${width}-pointer-selection`);
+      await page.keyboard.press("Tab");
+      await movies.focus();
+      await expect.poll(() => focusUnderline(movies, "::after")).toBe(true);
+    }
+    await expect(movies).toHaveAttribute("aria-selected", "true");
+  });
+}
 
 test("All movies automatically passes empty provider pages and preserves the cursor", async ({
   page,
@@ -1805,24 +1985,30 @@ for (const width of [1440, 390, 320]) {
         };
       },
     });
+    const clockStart = Date.now();
+    await page.clock.install({ time: clockStart });
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/?section=live");
     const search = await openSearch(page);
+    // Pause after navigation settles so action scheduling cannot consume the debounce.
+    await page.clock.pauseAt(clockStart + 60_000);
     const requests = () =>
       api.events.filter((event) => event.startsWith("BROWSE:"));
     try {
       await expect(search).toHaveValue("");
       await expect(page.getByRole("button", { name: /^Open / })).toHaveCount(0);
       await search.fill(" N ");
-      await page.waitForTimeout(450);
+      await page.clock.runFor(450);
       expect(requests()).toEqual([]);
       await expect(
         page.getByRole("region", { name: "Movies results", exact: true }),
       ).toHaveCount(0);
       await search.fill("discarded");
-      await page.waitForTimeout(100);
+      await page.clock.runFor(100);
       await search.fill("  North  ");
+      await page.clock.runFor(349);
       expect(requests()).toEqual([]);
+      await page.clock.runFor(1);
       await expect.poll(() => requests().length).toBe(2);
       expect(
         requests()
@@ -1840,6 +2026,7 @@ for (const width of [1440, 390, 320]) {
         { kind: "movie", category: "*", page: "1", search: "North" },
         { kind: "series", category: "*", page: "1", search: "North" },
       ]);
+      await page.clock.resume();
       await expect(
         page
           .getByRole("region", { name: "Live TV results", exact: true })
@@ -2686,7 +2873,7 @@ test("library refresh discovers new series and episodes after leaving playback f
   await expect(page.locator(".primary-control")).toBeEnabled();
   await playableVideo(page);
   published = true;
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await openSettings(page);
   await expect(page.locator("video")).toHaveCount(0);
   await expect
     .poll(() => api.events.filter((event) => event === "DELETE").length)
@@ -2737,12 +2924,32 @@ test("Settings accordions support keyboard controls and retain independent draft
   });
   await expect(device).toHaveAttribute("aria-expanded", "false");
   await expect(playback).toHaveAttribute("aria-expanded", "false");
+  await expect(
+    device.getByText("Serial number and device IDs", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    playback.getByText("Video conversion settings", { exact: true }),
+  ).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
   if (process.env.CAPTURE_SCREENSHOTS)
     await page.screenshot({
       path: "../output/settings-design/settings-inputs-accordion-desktop-closed.png",
     });
+  const restingDeviceBackground = await device.evaluate(
+    (element) => getComputedStyle(element).backgroundColor,
+  );
+  await page.keyboard.press("Tab");
   await device.focus();
+  await expect(device).not.toHaveCSS(
+    "background-color",
+    restingDeviceBackground,
+  );
+  await expect(device.locator('[data-slot="accordion-title"]')).toHaveCSS(
+    "text-decoration-line",
+    "underline",
+  );
+  await expect(device).toHaveCSS("outline-style", "none");
+  await expect(device).toHaveCSS("box-shadow", "none");
   await page.keyboard.press("Enter");
   await expect(device).toBeFocused();
   await expect(device).toHaveAttribute("aria-expanded", "true");
@@ -2758,6 +2965,12 @@ test("Settings accordions support keyboard controls and retain independent draft
     )
     .not.toBe("none");
   const serial = page.getByLabel("Serial number", { exact: true });
+  const restingSerialShadow = await serial.evaluate(
+    (element) => getComputedStyle(element).boxShadow,
+  );
+  await serial.click();
+  await expect(serial).toHaveCSS("outline-style", "none");
+  await expect(serial).toHaveCSS("box-shadow", restingSerialShadow);
   await serial.fill("accordion-draft-serial");
   await expect(page.getByLabel("Device ID", { exact: true })).toBeDisabled();
   await expect(page.getByLabel("Device ID", { exact: true })).toHaveValue("");
@@ -2788,8 +3001,15 @@ test("Settings accordions support keyboard controls and retain independent draft
     name: "Playback processing",
     exact: true,
   });
+  const restingProcessingShadow = await processing.evaluate(
+    (element) => getComputedStyle(element).boxShadow,
+  );
   await processing.click();
   await page.getByRole("option", { name: "Copy", exact: true }).click();
+  await expect(processing).toBeFocused();
+  await expect(processing).toHaveCSS("outline-style", "none");
+  await expect(processing).toHaveCSS("box-shadow", restingProcessingShadow);
+  await page.keyboard.press("Tab");
   await playback.focus();
   await page.keyboard.press("Enter");
   await expect(playback).toHaveAttribute("aria-expanded", "false");
@@ -2821,12 +3041,36 @@ test("Settings accordions support keyboard controls and retain independent draft
     await page.screenshot({
       path: "../output/settings-design/settings-inputs-accordion-390-open.png",
     });
-  await playback.click();
-  await expect(playback).toHaveAttribute("aria-expanded", "false");
-  await playback.click();
-  await expect(processing).toContainText("Copy");
-  for (const width of [390, 320]) {
+  for (const width of [1487, 390, 320]) {
     await page.setViewportSize({ width, height: 844 });
+    await playback.click();
+    await expectPointerFocus(page, playback);
+    await expect(playback.locator('[data-slot="accordion-title"]')).toHaveCSS(
+      "text-decoration-line",
+      "none",
+    );
+    await expect(playback).toHaveAttribute("aria-expanded", "false");
+    await expect(
+      playback.getByText("Video conversion settings", { exact: true }),
+    ).toBeVisible();
+    await expect(processing).not.toBeVisible();
+    if (process.env.CAPTURE_SCREENSHOTS) {
+      await playback.evaluate((element) =>
+        window.scrollTo({
+          top: window.scrollY + element.getBoundingClientRect().top - 110,
+          behavior: "instant",
+        }),
+      );
+      await page.screenshot({
+        path: `../output/settings-design/settings-advanced-playback-${width}-closed.png`,
+      });
+    }
+    await playback.click();
+    await expect(processing).toContainText("Copy");
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `../output/settings-design/settings-advanced-playback-${width}-open.png`,
+      });
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth),
     ).toBeLessThanOrEqual(width);
@@ -2838,7 +3082,7 @@ test("Settings scroll navigation preserves drafts across sections and responsive
   page,
 }) => {
   await page.setViewportSize({ width: 1487, height: 1058 });
-  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.emulateMedia({ reducedMotion: "no-preference" });
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   page.on("console", (message) => {
@@ -2865,6 +3109,43 @@ test("Settings scroll navigation preserves drafts across sections and responsive
   const active = (name: string) =>
     navigation.getByRole("link", { name, exact: true });
   await expect(active("Provider")).toHaveAttribute("aria-current", "location");
+  const sectionChanges = await navigation.evaluateHandle((element) => {
+    const visited: string[] = [];
+    const observer = new MutationObserver(() => {
+      const current = element
+        .querySelector('[aria-current="location"]')
+        ?.textContent?.trim();
+      if (current && current !== visited.at(-1)) visited.push(current);
+    });
+    observer.observe(element, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-current"],
+    });
+    return { visited, disconnect: () => observer.disconnect() };
+  });
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await active("About").click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          Math.ceil(window.scrollY + window.innerHeight) >=
+          document.documentElement.scrollHeight - 2,
+      ),
+    )
+    .toBe(true);
+  await expect(active("About")).toHaveAttribute("aria-current", "location");
+  expect(
+    await sectionChanges.evaluate((trace) => {
+      trace.disconnect();
+      return trace.visited;
+    }),
+  ).toEqual(["About"]);
+  await sectionChanges.dispose();
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
+  await page.mouse.wheel(0, -1);
+  await expect(active("Provider")).toHaveAttribute("aria-current", "location");
   const settingsURL = page.url();
   if (process.env.CAPTURE_SCREENSHOTS)
     await page.screenshot({
@@ -2876,6 +3157,13 @@ test("Settings scroll navigation preserves drafts across sections and responsive
   const originalInput = await serial.elementHandle();
   await page.emulateMedia({ reducedMotion: "no-preference" });
   await active("Playback").click();
+  await expectPointerFocus(page, active("Playback"));
+  await page.keyboard.press("Tab");
+  await active("Playback").focus();
+  await expect(active("Playback")).toHaveCSS(
+    "text-decoration-line",
+    "underline",
+  );
   await expect(active("Playback")).toHaveAttribute("aria-current", "location");
   await expect(page.locator("#settings-playback")).toBeInViewport();
   await page
@@ -2884,11 +3172,8 @@ test("Settings scroll navigation preserves drafts across sections and responsive
   await expect(active("Playback")).toHaveAttribute("aria-current", "location");
   await page.keyboard.press("ArrowUp");
   await expect(active("Playback")).toHaveAttribute("aria-current", "location");
-  await active("Library status").click();
-  await expect(active("Library status")).toHaveAttribute(
-    "aria-current",
-    "location",
-  );
+  await active("Status").click();
+  await expect(active("Status")).toHaveAttribute("aria-current", "location");
   await expect(page.locator("#settings-status")).toBeInViewport();
   await page.mouse.wheel(0, 10000);
   await expect(active("About")).toHaveAttribute("aria-current", "location");
@@ -2924,10 +3209,8 @@ test("Settings scroll navigation preserves drafts across sections and responsive
   });
   await expect(jump).toBeVisible();
   await jump.click();
-  await page
-    .getByRole("option", { name: "Library status", exact: true })
-    .click();
-  await expect(jump).toContainText("Library status");
+  await page.getByRole("option", { name: "Status", exact: true }).click();
+  await expect(jump).toContainText("Status");
   await expect(page.locator("#settings-status")).toBeInViewport();
   await jump.click();
   await page.getByRole("option", { name: "About", exact: true }).click();
@@ -2963,6 +3246,11 @@ test("Settings scroll navigation preserves drafts across sections and responsive
         path: `../output/settings-design/settings-scroll-implemented-${width}.png`,
       });
   }
+  const tokenLink = page.locator(".settings-inline-link");
+  await page.keyboard.press("Tab");
+  await tokenLink.focus();
+  await expect(tokenLink).toHaveCSS("text-decoration-line", "underline");
+  await expect(tokenLink).toHaveCSS("outline-style", "none");
   expect(api.mutations).toEqual([]);
   expect(errors).toEqual([]);
 });
@@ -2976,7 +3264,7 @@ test("Settings actions support keyboard submission and prevent duplicate pending
   });
   const api = await mockApi(page, { settingsSaveGate, refreshDelayMs: 1000 });
   await page.goto("/?view=settings");
-  const save = page.getByRole("button", { name: "Save playback", exact: true });
+  const save = page.getByRole("button", { name: "Save changes", exact: true });
   await page
     .getByLabel("Maximum simultaneous streams", { exact: true })
     .fill("2");
@@ -2987,6 +3275,21 @@ test("Settings actions support keyboard submission and prevent duplicate pending
     await expect(save).toHaveAttribute("aria-busy", "true");
     await expect(save).toHaveAttribute("aria-disabled", "true");
     await expect(save).toContainText("Saving");
+    await expect(
+      page.getByRole("button", { name: "Discard changes", exact: true }),
+    ).toBeDisabled();
+    for (const label of [
+      "Portal URL",
+      "Guide coverage in hours",
+      "Maximum simultaneous streams",
+      "TMDB read access token",
+    ]) {
+      await expect(page.getByLabel(label, { exact: true })).toBeDisabled();
+    }
+    await expect(page.locator("#settings-form > fieldset")).toHaveAttribute(
+      "inert",
+      "",
+    );
     await page.keyboard.press("Enter");
     await expect
       .poll(
@@ -2999,9 +3302,7 @@ test("Settings actions support keyboard submission and prevent duplicate pending
     releaseSave();
   }
   await expect(
-    page
-      .locator("#settings-playback")
-      .getByText("Playback saved.", { exact: true }),
+    page.getByText("All changes saved.", { exact: true }),
   ).toBeVisible();
   await expect(save).not.toHaveAttribute("aria-busy", "true");
   expect(api.effectiveSettings().playback.maxStreams).toBe(2);
@@ -3018,21 +3319,42 @@ test("Settings actions support keyboard submission and prevent duplicate pending
   expect(api.events.filter((event) => event === "REFRESH:all")).toHaveLength(1);
 });
 
-test("Settings saves library categories and playback and restores saved values", async ({
+test("Settings saves modified sections together and restores saved values", async ({
   page,
 }) => {
   const api = await mockApi(page);
   await page.goto("/?view=settings");
+  const save = page.getByRole("button", { name: "Save changes", exact: true });
+  const discard = page.getByRole("button", {
+    name: "Discard changes",
+    exact: true,
+  });
+  await expect(save).toHaveCount(1);
+  await expect(save).toBeDisabled();
+  await expect(discard).toBeDisabled();
+  await expect(
+    page.getByText("No unsaved changes", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .fill("2");
+  await expect(save).toBeEnabled();
+  await page
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .fill("1");
+  await expect(save).toBeDisabled();
   await page
     .getByRole("combobox", { name: "Refresh every", exact: true })
     .click();
-  await page
-    .getByRole("option", { name: /24 hours|Every day|Daily|1 day/ })
-    .click();
+  await page.getByRole("option", { name: "1 day", exact: true }).click();
   await page.getByLabel("Guide coverage in hours", { exact: true }).fill("24");
   await page
-    .getByRole("combobox", { name: "Home categories", exact: true })
+    .locator('[data-slot="label"]')
+    .filter({ hasText: /^Home categories$/ })
     .click();
+  await expect(
+    page.getByRole("combobox", { name: "Home categories", exact: true }),
+  ).toBeFocused();
   await page
     .getByRole("option", { name: "Drama", exact: true })
     .first()
@@ -3043,67 +3365,39 @@ test("Settings saves library categories and playback and restores saved values",
     .click();
   await page.getByRole("option", { name: "Documentary", exact: true }).click();
   await page.keyboard.press("Escape");
-  await page.getByRole("button", { name: "Save library", exact: true }).click();
-  await expect.poll(() => api.effectiveSettings().library.guideHours).toBe(24);
-  expect(api.effectiveSettings().library.refreshIntervalSeconds).toBe(86400);
-  expect(api.effectiveSettings().library.dashboardCategories).toContain(
-    "movie:drama-movie",
-  );
-  expect(api.effectiveSettings().library.blockedCategories).toContain(
-    "live:documentary",
-  );
-  const librarySaved = page.getByText("Library saved.", { exact: true });
-  await expect(librarySaved).toBeVisible();
   await page
     .getByLabel("Maximum simultaneous streams", { exact: true })
     .fill("3");
-  await page
-    .getByRole("button", {
-      name: "Remove Drama from Home categories",
-      exact: true,
-    })
-    .click();
-  await expect(librarySaved).not.toBeVisible();
-  await expect(
-    page.getByLabel("Maximum simultaneous streams", { exact: true }),
-  ).toHaveValue("3");
-  await page.getByRole("button", { name: "Save library", exact: true }).click();
-  await expect(librarySaved).toBeVisible();
-  await expect(
-    page.getByLabel("Maximum simultaneous streams", { exact: true }),
-  ).toHaveValue("3");
-  await page
-    .getByRole("combobox", { name: "Refresh every", exact: true })
-    .click();
-  await page.getByRole("option", { name: "6 hours", exact: true }).click();
-  await expect(librarySaved).not.toBeVisible();
-  await page
-    .getByLabel("Maximum simultaneous streams", { exact: true })
-    .fill("2");
   await page.getByText("Advanced playback", { exact: true }).click();
   await page
     .getByRole("combobox", { name: "Playback processing", exact: true })
     .click();
   await page.getByRole("option", { name: "Copy", exact: true }).click();
-  await page
-    .getByRole("button", { name: "Save playback", exact: true })
-    .click();
-  await expect.poll(() => api.effectiveSettings().playback.maxStreams).toBe(2);
   await expect(
-    page.getByRole("button", {
-      name: "Remove Drama from Home categories",
-      exact: true,
-    }),
-  ).toHaveCount(0);
-  expect(api.effectiveSettings().library.dashboardCategories).toEqual([]);
-  expect(api.effectiveSettings().library.refreshIntervalSeconds).toBe(86400);
+    page.getByText("Unsaved changes", { exact: true }),
+  ).toBeVisible();
+  await save.click();
   await expect(
-    page.getByRole("combobox", { name: "Refresh every", exact: true }),
-  ).toContainText("6 hours");
+    page.getByText("All changes saved.", { exact: true }),
+  ).toBeVisible();
+  expect(api.settingsPatches).toEqual([
+    {
+      library: {
+        refreshIntervalSeconds: 86400,
+        guideHours: 24,
+        dashboardCategories: ["movie:drama-movie"],
+        blockedCategories: ["live:documentary"],
+      },
+      playback: { maxStreams: 3, transcodeMode: "copy" },
+    },
+  ]);
+  expect(api.providerPatches).toEqual([]);
+  await expect(save).toBeDisabled();
+  await expect(discard).toBeDisabled();
   await page.reload();
   await expect(
     page.getByLabel("Maximum simultaneous streams", { exact: true }),
-  ).toHaveValue("2");
+  ).toHaveValue("3");
   await expect(
     page.getByLabel("Guide coverage in hours", { exact: true }),
   ).toHaveValue("24");
@@ -3111,14 +3405,77 @@ test("Settings saves library categories and playback and restores saved values",
   await expect(
     page.getByRole("combobox", { name: "Playback processing", exact: true }),
   ).toContainText("Copy");
-  expect(api.effectiveSettings().playback.transcodeMode).toBe("copy");
-  expect(
-    api.mutations.every(
-      (request) =>
-        request.path === "/api/settings" && request.method === "PATCH",
-    ),
-  ).toBe(true);
+  await expect(
+    page.getByRole("button", {
+      name: "Remove Drama from Home categories",
+      exact: true,
+    }),
+  ).toBeVisible();
+  expect(api.mutations).toEqual([{ method: "PATCH", path: "/api/settings" }]);
 });
+
+for (const width of [1440, 390]) {
+  test(`Settings discards all drafts without saving and preserves drafts during refresh at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    const api = await mockApi(page, { refreshDelayMs: 500 });
+    await page.goto("/?view=settings");
+    await page.getByLabel("Timezone", { exact: true }).fill("Europe/London");
+    await page
+      .getByLabel("Guide coverage in hours", { exact: true })
+      .fill("24");
+    await page
+      .getByLabel("Maximum simultaneous streams", { exact: true })
+      .fill("3");
+    await page
+      .getByLabel("TMDB read access token", { exact: true })
+      .fill("discarded-token");
+    const refresh = page
+      .locator("#settings-status")
+      .getByRole("button", { name: /^(Refresh now|Refreshing…|Refreshed)$/ });
+    await refresh.click();
+    await expect(refresh).toHaveAccessibleName("Refreshed", { timeout: 8000 });
+    await expect(page.getByLabel("Timezone", { exact: true })).toHaveValue(
+      "Europe/London",
+    );
+    await expect(
+      page.getByLabel("Guide coverage in hours", { exact: true }),
+    ).toHaveValue("24");
+    await expect(
+      page.getByLabel("Maximum simultaneous streams", { exact: true }),
+    ).toHaveValue("3");
+    await expect(
+      page.getByLabel("TMDB read access token", { exact: true }),
+    ).toHaveValue("discarded-token");
+    await page
+      .getByRole("button", { name: "Discard changes", exact: true })
+      .click();
+    await expect(page.getByLabel("Timezone", { exact: true })).toHaveValue(
+      "America/Toronto",
+    );
+    await expect(
+      page.getByLabel("Guide coverage in hours", { exact: true }),
+    ).toHaveValue("48");
+    await expect(
+      page.getByLabel("Maximum simultaneous streams", { exact: true }),
+    ).toHaveValue("1");
+    await expect(
+      page.getByLabel("TMDB read access token", { exact: true }),
+    ).toHaveValue("");
+    await expect(
+      page.getByRole("button", { name: "Save changes", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      page.getByRole("button", { name: "Discard changes", exact: true }),
+    ).toBeDisabled();
+    expect(api.settingsPatches).toEqual([]);
+    expect(api.mutations).toEqual([{ method: "POST", path: "/api/refresh" }]);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+  });
+}
 
 test("Settings preserves and removes unavailable category rules on mobile", async ({
   page,
@@ -3155,7 +3512,7 @@ test("Settings preserves and removes unavailable category rules on mobile", asyn
   await page.keyboard.press("ArrowDown");
   await page.keyboard.press("Enter");
   await page.keyboard.press("Escape");
-  await page.getByRole("button", { name: "Save library", exact: true }).click();
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
   await expect
     .poll(() => api.effectiveSettings().library.dashboardCategories)
     .toEqual([]);
@@ -3192,7 +3549,7 @@ for (const width of [1440, 390]) {
       .getByLabel("Secondary device ID", { exact: true })
       .fill("app-managed-device-two");
     await page
-      .getByRole("button", { name: "Save provider", exact: true })
+      .getByRole("button", { name: "Save changes", exact: true })
       .click();
     await expect.poll(() => api.providerPatches.length).toBe(1);
     expect(api.providerPatches[0]).toEqual({
@@ -3201,7 +3558,7 @@ for (const width of [1440, 390]) {
       deviceId2: "app-managed-device-two",
     });
     await expect(
-      page.getByText("Provider saved.", { exact: true }),
+      page.getByText("All changes saved.", { exact: true }),
     ).toBeVisible();
     await page.reload();
     await page.getByText("Device identity", { exact: true }).click();
@@ -3246,13 +3603,13 @@ for (const width of [1440, 390]) {
       await expect(page.getByLabel(label, { exact: true })).toHaveValue("");
     }
     await expect(
-      page.getByRole("button", { name: "Save provider", exact: true }),
+      page.getByRole("button", { name: "Save changes", exact: true }),
     ).toBeDisabled();
     await page
       .getByLabel("Maximum simultaneous streams", { exact: true })
       .fill("2");
     await page
-      .getByRole("button", { name: "Save playback", exact: true })
+      .getByRole("button", { name: "Save changes", exact: true })
       .click();
     await expect
       .poll(() => api.effectiveSettings().playback.maxStreams)
@@ -3284,9 +3641,7 @@ test("Settings completes provider setup when only the portal URL is managed by e
   await page
     .getByLabel("MAC address", { exact: true })
     .fill("00:11:22:33:44:55");
-  await page
-    .getByRole("button", { name: "Save provider", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
   await expect.poll(() => api.providerPatches.length).toBe(1);
   expect(api.providerPatches[0]).not.toHaveProperty("portalUrl");
   expect(api.providerPatches[0]).toHaveProperty("mac", "00:11:22:33:44:55");
@@ -3304,33 +3659,69 @@ test("Settings keeps failed drafts and masks, retains and clears the TMDB token"
   const token = page.getByLabel("TMDB read access token", { exact: true });
   await expect(token).toHaveAttribute("type", "password");
   await token.fill("example-browser-test-token");
+  await page.getByLabel("Timezone", { exact: true }).fill("Europe/London");
+  await page.getByLabel("Guide coverage in hours", { exact: true }).fill("24");
   await page
-    .getByRole("button", { name: "Save discovery", exact: true })
-    .click();
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .fill("3");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
   await expect(
-    page
-      .locator("#settings-discovery")
-      .getByRole("alert")
-      .filter({ hasText: "Settings could not be saved" }),
+    page.getByRole("alert").filter({ hasText: "Settings could not be saved" }),
   ).toBeVisible();
   await expect(token).toHaveValue("example-browser-test-token");
+  await expect(page.getByLabel("Timezone", { exact: true })).toHaveValue(
+    "Europe/London",
+  );
+  await expect(
+    page.getByLabel("Guide coverage in hours", { exact: true }),
+  ).toHaveValue("24");
+  await expect(
+    page.getByLabel("Maximum simultaneous streams", { exact: true }),
+  ).toHaveValue("3");
+  expect(api.effectiveSettings().playback.maxStreams).toBe(1);
+  expect(api.effectiveSettings().discovery.tmdbTokenConfigured).toBe(false);
   fail = false;
-  await page
-    .getByRole("button", { name: "Save discovery", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
   await expect
     .poll(() => api.effectiveSettings().discovery.tmdbTokenConfigured)
     .toBe(true);
   await expect(token).toHaveValue("");
+  expect(Object.keys(api.settingsPatches[1]).sort()).toEqual([
+    "discovery",
+    "library",
+    "playback",
+    "provider",
+  ]);
+  expect(api.settingsPatches[1]).toEqual(api.settingsPatches[0]);
   await page.reload();
   await expect(token).toHaveValue("");
   expect(await page.locator("body").innerText()).not.toContain(
     "example-browser-test-token",
   );
   await page.getByRole("button", { name: "Remove token", exact: true }).click();
+  await expect(
+    page.getByText("Token will be removed when you save.", { exact: true }),
+  ).toBeVisible();
   await page
-    .getByRole("button", { name: "Save discovery", exact: true })
+    .getByRole("button", { name: "Discard changes", exact: true })
     .click();
+  expect(api.effectiveSettings().discovery.tmdbTokenConfigured).toBe(true);
+  await expect(
+    page.getByRole("button", { name: "Save changes", exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByLabel("Maximum simultaneous streams", { exact: true })
+    .fill("2");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(
+    page.getByText("All changes saved.", { exact: true }),
+  ).toBeVisible();
+  expect(api.settingsPatches.at(-1)).toEqual({
+    playback: { maxStreams: 2, transcodeMode: "auto" },
+  });
+  expect(api.effectiveSettings().discovery.tmdbTokenConfigured).toBe(true);
+  await page.getByRole("button", { name: "Remove token", exact: true }).click();
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
   await expect
     .poll(() => api.effectiveSettings().discovery.tmdbTokenConfigured)
     .toBe(false);
@@ -3347,7 +3738,7 @@ test("Settings releases playback and refreshes metadata without changing saved c
   await expect(page.locator(".primary-control")).toBeEnabled();
   await playableVideo(page);
   const originalVideo = await page.locator("video").elementHandle();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await openSettings(page);
   await expect(
     page.getByRole("heading", { name: "Settings", exact: true }),
   ).toBeVisible();
@@ -3445,10 +3836,41 @@ for (const width of [1440, 390, 320]) {
   }) => {
     await page.setViewportSize({ width, height: 900 });
     const api = await mockApi(page, { unconfigured: true });
-    await page.goto("/");
-    await page
-      .getByRole("button", { name: "Connect provider", exact: true })
-      .click();
+    for (const [name, url] of [
+      ["home", "/"],
+      ["live", "/?section=live"],
+      ["movies", "/?section=movie"],
+      ["shows", "/?section=series"],
+      ["search", "/?view=search&search=North"],
+      ["player", "/?view=player&section=movie&item=movie-1"],
+    ]) {
+      await page.goto(url);
+      const notice = page.getByRole("status", {
+        name: "Provider setup",
+        exact: true,
+      });
+      await expect(notice).toHaveCount(1);
+      await expect(notice).toContainText(
+        "Connect your provider to start watching.",
+      );
+      await expect(
+        page.getByText("Provider not configured", { exact: true }),
+      ).toHaveCount(0);
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth),
+      ).toBeLessThanOrEqual(width);
+      if (process.env.CAPTURE_SCREENSHOTS)
+        await page.screenshot({
+          path: `../output/provider-setup/${name}-${width}.png`,
+        });
+      await notice
+        .getByRole("button", { name: "Open settings", exact: true })
+        .click();
+      await expect(
+        page.getByRole("heading", { name: "Settings", exact: true }),
+      ).toBeVisible();
+      await expect(notice).toHaveCount(0);
+    }
     await expect(
       page.getByRole("heading", { name: "Settings", exact: true }),
     ).toBeVisible();
@@ -3473,7 +3895,7 @@ for (const width of [1440, 390, 320]) {
       .getByLabel("Secondary device ID", { exact: true })
       .fill("registered-device-two");
     await page
-      .getByRole("button", { name: "Save provider", exact: true })
+      .getByRole("button", { name: "Save changes", exact: true })
       .click();
     await expect
       .poll(() => api.effectiveSettings().provider.portalUrl)
@@ -3503,6 +3925,17 @@ for (const width of [1440, 390, 320]) {
         path: `/tmp/restream-settings-editable-${width}.png`,
         fullPage: true,
       });
+    const navigation = page.getByRole("navigation", {
+      name: width <= 820 ? "Primary navigation" : "Library",
+      exact: true,
+    });
+    await navigation.getByRole("button", { name: "Home", exact: true }).click();
+    await expect(
+      page.getByRole("region", { name: "Home", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("status", { name: "Provider setup", exact: true }),
+    ).toHaveCount(0);
   });
 }
 
@@ -3856,6 +4289,31 @@ test("dashboard history records playing media, survives reloads, reopens a seaso
       .getByRole("region", { name: "Recently played" })
       .locator(".discovery-recent-card"),
   ).toHaveCount(3);
+  const combinedHistory = page.getByRole("region", {
+    name: "Recently played",
+    exact: true,
+  });
+  await expect(
+    combinedHistory.getByRole("group", { name: "History type", exact: true }),
+  ).toHaveCount(0);
+  expect(
+    await combinedHistory
+      .getByRole("button", { name: /^Open / })
+      .evaluateAll((buttons) =>
+        buttons.map((button) => button.getAttribute("aria-label")),
+      ),
+  ).toEqual(["Open Night Shift", "Open The Quiet Coast", "Open North News"]);
+  if (process.env.CAPTURE_SCREENSHOTS) {
+    const viewport = page.viewportSize()!;
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 900 });
+      await combinedHistory.screenshot({
+        path: `../output/cinema-review/${width}-recently-played-combined.png`,
+        animations: "disabled",
+      });
+    }
+    await page.setViewportSize(viewport);
+  }
   await expect(
     page.getByRole("region", { name: "Recently played" }),
   ).toContainText("S2 · E1");
@@ -4755,7 +5213,7 @@ test("a pending Dashboard Play request cannot reopen the player after leaving", 
       .getByRole("button", { name: `Play ${movie.name}`, exact: true })
       .click();
     await requested;
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await openSettings(page);
     await expect(
       page.getByRole("heading", { name: "Settings", exact: true }),
     ).toBeVisible();
@@ -5537,6 +5995,7 @@ test("category dropdown supports keyboard selection and retains scoped VOD contr
     exact: true,
   });
   await expect(category).toHaveAttribute("aria-haspopup", "dialog");
+  await page.keyboard.press("Tab");
   await category.focus();
   await page.keyboard.press("Enter");
   await expect(page.getByRole("listbox")).toBeVisible();
@@ -5574,7 +6033,7 @@ test("category dropdown supports keyboard selection and retains scoped VOD contr
 });
 
 for (const width of [1440, 821, 390, 320]) {
-  test(`icon navigation reaches Home, Search, VOD, Live TV and Settings at ${width}px`, async ({
+  test(`icon navigation reaches Home, Search, VOD, Live TV and Account settings at ${width}px`, async ({
     page,
   }) => {
     const api = await mockApi(page);
@@ -5586,7 +6045,7 @@ for (const width of [1440, 821, 390, 320]) {
     });
     await expectHome(page);
     await expect(navigation.getByRole("button")).toHaveCount(5);
-    for (const name of ["Home", "Search", "VOD", "Live TV", "Settings"]) {
+    for (const name of ["Home", "Search", "VOD", "Live TV", "Account"]) {
       const button = navigation.getByRole("button", { name, exact: true });
       await expect(button).toBeVisible();
       await expect(button.locator("svg")).toHaveCount(1);
@@ -5632,9 +6091,7 @@ for (const width of [1440, 821, 390, 320]) {
         .getByRole("tablist", { name: "VOD type", exact: true })
         .getByRole("tab", { name: "Shows", exact: true }),
     ).toHaveAttribute("aria-selected", "true");
-    await navigation
-      .getByRole("button", { name: "Settings", exact: true })
-      .click();
+    await openSettings(page);
     await expect(
       page.getByRole("heading", { name: "Settings", exact: true }),
     ).toBeVisible();
@@ -5651,9 +6108,12 @@ for (const width of [1440, 390, 320]) {
   test(`long category dropdown scrolls and filters titles without page overflow at ${width}px`, async ({
     page,
   }) => {
+    const longCategory =
+      "Genre 23 — International independent cinema and award-winning documentaries";
     const categories = Array.from({ length: 60 }, (_, index) => ({
       id: `genre-${index}`,
-      name: `Genre ${String(index).padStart(2, "0")}`,
+      name:
+        index === 23 ? longCategory : `Genre ${String(index).padStart(2, "0")}`,
       kind: "movie",
     }));
     const titles = categories.map((category, index) => ({
@@ -5703,12 +6163,35 @@ for (const width of [1440, 390, 320]) {
       .getByRole("combobox", { name: "Find category", exact: true })
       .fill("Genre 23");
     await expect(
-      page.getByRole("option", { name: "Genre 23", exact: true }),
+      page.getByRole("option", { name: longCategory, exact: true }),
     ).toHaveAttribute("aria-selected", "true");
     await page.keyboard.press("Enter");
     await expect(
       page.getByRole("button", { name: "Open Film 23", exact: true }),
     ).toBeVisible();
+    await expect(category).toContainText(longCategory);
+    const selectedBounds = await category.boundingBox();
+    const tabsBounds = await page
+      .getByRole("tablist", { name: "VOD type", exact: true })
+      .boundingBox();
+    expect(selectedBounds).not.toBeNull();
+    expect(tabsBounds).not.toBeNull();
+    expect(selectedBounds!.x).toBeGreaterThanOrEqual(
+      tabsBounds!.x + tabsBounds!.width,
+    );
+    expect(
+      selectedBounds!.x - (tabsBounds!.x + tabsBounds!.width),
+    ).toBeLessThanOrEqual(32);
+    expect(
+      Math.abs(
+        selectedBounds!.y +
+          selectedBounds!.height / 2 -
+          (tabsBounds!.y + tabsBounds!.height / 2),
+      ),
+    ).toBeLessThanOrEqual(2);
+    expect(selectedBounds!.x + selectedBounds!.width).toBeLessThanOrEqual(
+      width,
+    );
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth),
     ).toBeLessThanOrEqual(width);
@@ -5793,8 +6276,13 @@ for (const reducedMotion of ["no-preference", "reduce"] as const) {
     await expect(brand.locator(".brand-resolved")).toHaveCount(0);
     await expect(brand.locator(".brand-fragment-top")).toHaveCSS(
       "fill",
-      "rgb(240, 138, 131)",
+      "rgb(245, 245, 247)",
     );
+    for (const fragment of ["center", "tip"])
+      await expect(brand.locator(`.brand-fragment-${fragment}`)).toHaveCSS(
+        "fill",
+        "rgb(240, 138, 131)",
+      );
     for (const fragment of await fragments.all())
       await expect(fragment).toHaveCSS("opacity", "1");
     const before = await fragments
@@ -5933,9 +6421,7 @@ for (const width of [1440, 390, 320]) {
       .click();
     await expect(page).toHaveURL(origin);
     await expect(search).toHaveValue("North");
-    await navigation
-      .getByRole("button", { name: "Settings", exact: true })
-      .click();
+    await openSettings(page);
     await expect(
       page.getByRole("heading", { name: "Settings", exact: true }),
     ).toBeVisible();
@@ -5980,6 +6466,23 @@ for (const width of [1440, 390, 320]) {
       name: "Category",
       exact: true,
     });
+    const tabsBounds = await tabs.boundingBox();
+    const categoryBounds = await category.boundingBox();
+    expect(tabsBounds).not.toBeNull();
+    expect(categoryBounds).not.toBeNull();
+    const gap = categoryBounds!.x - (tabsBounds!.x + tabsBounds!.width);
+    expect(gap).toBeGreaterThanOrEqual(0);
+    expect(gap).toBeLessThanOrEqual(32);
+    expect(
+      Math.abs(
+        categoryBounds!.y +
+          categoryBounds!.height / 2 -
+          (tabsBounds!.y + tabsBounds!.height / 2),
+      ),
+    ).toBeLessThanOrEqual(2);
+    expect(categoryBounds!.x + categoryBounds!.width).toBeLessThanOrEqual(
+      width,
+    );
     const originalTabs = await tabs.elementHandle();
     const originalCategory = await category.elementHandle();
     const movies = tabs.getByRole("tab", { name: "Movies", exact: true });
@@ -5996,6 +6499,7 @@ for (const width of [1440, 390, 320]) {
       await shows.click();
       await expect(shows).toHaveAttribute("aria-selected", "true");
       await expect(shows).toBeFocused();
+      await expect(shows).toHaveCSS("outline-style", "none");
       const panel = page.getByRole("tabpanel", {
         name: "Shows",
         exact: true,
@@ -6035,7 +6539,13 @@ for (const width of [1440, 390, 320]) {
       await expect(shows).toBeFocused();
       await page.keyboard.press("ArrowLeft");
       await expect(movies).toBeFocused();
+      await expect(movies).toHaveCSS("outline-style", "none");
       await expect(shows).toHaveAttribute("aria-selected", "true");
+      if (process.env.CAPTURE_SCREENSHOTS)
+        await page.screenshot({
+          path: `../output/cinema-review/${width}-vod-keyboard-focus.png`,
+          animations: "disabled",
+        });
       await page.keyboard.press("Enter");
       await expect(movies).toHaveAttribute("aria-selected", "true");
       await expect(movies).toBeFocused();
@@ -6630,7 +7140,7 @@ for (const width of [1440, 390]) {
         exact: true,
       })
       .click();
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await openSettings(page);
     await expect(undo).toBeVisible();
     await page.mouse.move(1, 1);
     await page.clock.runFor(8500);
@@ -6811,17 +7321,23 @@ for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 900 });
     await mockApi(page);
     let requests = 0;
-    await page.route("**/api/discovery", (route) => {
-      const partial = ++requests >= 2;
+    let releaseProgress!: () => void;
+    const progress = new Promise<void>((resolve) => {
+      releaseProgress = resolve;
+    });
+    await page.route("**/api/discovery", async (route) => {
+      const requestNumber = ++requests;
+      const partial = requestNumber >= 2;
+      if (partial) await progress;
       return route.fulfill({
         json: {
           configured: true,
-          refreshing: requests < 3,
+          refreshing: requestNumber < 3,
           trendingMovies: partial
             ? [{ tmdbId: 1, item: movie, name: movie.name }]
             : [],
           trendingSeries:
-            requests >= 3
+            requestNumber >= 3
               ? [{ tmdbId: 2, item: series, name: series.name }]
               : [],
           exploreMovies: [],
@@ -6830,7 +7346,11 @@ for (const width of [1440, 390]) {
       });
     });
     await page.goto("/?view=dashboard");
-    await expect(page.locator(".discovery-skeleton-grid")).toBeVisible();
+    try {
+      await expect(page.locator(".discovery-skeleton-grid")).toBeVisible();
+    } finally {
+      releaseProgress();
+    }
     const rail = page.getByRole("region", {
       name: "Trending now",
       exact: true,
@@ -6922,6 +7442,10 @@ for (const width of [1440, 390]) {
       poster!.y + poster!.height,
     );
     await right.click();
+    await expectPointerFocus(page, right);
+    await page.keyboard.press("Tab");
+    await right.focus();
+    await expectKeyboardIcon(page, right);
     await expect(left).toBeVisible();
     await expect
       .poll(() => rail.evaluate((node) => node.scrollLeft))
@@ -6937,6 +7461,7 @@ for (const width of [1440, 390]) {
       node.scrollTo({ left: 0, behavior: "instant" }),
     );
     await expect(left).toHaveCount(0);
+    await page.keyboard.press("Tab");
     await rail.focus();
     await page.keyboard.press("ArrowRight");
     await expect(left).toBeVisible();
@@ -6958,7 +7483,7 @@ for (const width of [1440, 390]) {
     ).toBeVisible();
     expect(api.events).not.toContain("POST");
 
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await openSettings(page);
     const about = page.getByRole("region", { name: "About", exact: true });
     await expect(
       about.getByRole("img", { name: "TMDB", exact: true }),

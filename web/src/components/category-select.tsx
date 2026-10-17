@@ -27,7 +27,7 @@ export function CategorySelect({
       <Popover.Trigger asChild>
         <Button
           type="button"
-          variant="outline"
+          variant="tab"
           className="category-select-trigger"
           role="combobox"
           aria-label="Category"

@@ -104,7 +104,12 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer app.Close()
-	server := httptest.NewServer(app)
+	auth, err := newAuth(AuthConfig{}, app.cache.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer auth.close()
+	server := httptest.NewServer(auth.middleware(app))
 	defer server.Close()
 	waitFor(t, func() bool { _, ok := app.cache.item("live:1"); return ok })
 	status, browseBody := request(t, server.URL, "GET", "/api/browse?kind=movie&category=7&page=1", "")

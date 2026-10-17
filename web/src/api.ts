@@ -113,8 +113,8 @@ export type Status = {
   catalogRefreshCompletedAt?: string;
   epgUpdatedAt?: string;
   error?: string;
-  activeStreams: number;
-  maxStreams: number;
+  activeStreams?: number;
+  maxStreams?: number;
   sync?: { catalog: RefreshState; epg: RefreshState };
   portalCooldownUntil?: string;
   timezone?: string;
@@ -166,6 +166,14 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
       error?: string;
       code?: string;
     } | null;
+    if (
+      path !== "/api/auth" &&
+      (response.status === 401 ||
+        (response.status === 403 && body?.code === "forbidden"))
+    )
+      window.dispatchEvent(
+        new CustomEvent("restream:auth-changed", { detail: response.status }),
+      );
     throw new ApiError(
       body?.error || `Request failed (${response.status})`,
       response.status,

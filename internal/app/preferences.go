@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pushpinderbal/restream/internal/model"
+	"github.com/pushpinderbal/restream/internal/stream"
 )
 
 type CategoryPreference struct {
@@ -263,16 +264,20 @@ func blocked(w http.ResponseWriter) {
 	fail(w, 403, "blocked", "Category blocked by server configuration.")
 }
 
-func (s *Server) rememberSession(id string, item model.Item) bool {
+func (s *Server) rememberSession(r *http.Request, id string, item model.Item) bool {
 	s.sessionItemsMu.Lock()
 	if len(s.sessionItems) >= 256 {
 		for previousID := range s.sessionItems {
 			if _, err := s.streams.Get(previousID); err != nil {
 				delete(s.sessionItems, previousID)
+				delete(s.sessionOwners, previousID)
 			}
 		}
 	}
 	s.sessionItems[id] = item
+	if user := authenticatedUser(r); user != nil {
+		s.sessionOwners[id] = user.ID
+	}
 	denied := s.blockedItem(item)
 	s.sessionItemsMu.Unlock()
 	if denied {
@@ -281,7 +286,25 @@ func (s *Server) rememberSession(id string, item model.Item) bool {
 	return !denied
 }
 
-func (s *Server) sessionAllowed(w http.ResponseWriter, id string) bool {
+// Playback identifiers are never access credentials. Every control and media
+// request must belong to the signed-in user, including administrator requests.
+func (s *Server) sessionOwned(w http.ResponseWriter, r *http.Request, id string) bool {
+	if user := authenticatedUser(r); user != nil {
+		s.sessionItemsMu.Lock()
+		owner := s.sessionOwners[id]
+		s.sessionItemsMu.Unlock()
+		if owner != user.ID {
+			streamError(w, stream.ErrNotFound)
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) sessionAllowed(w http.ResponseWriter, r *http.Request, id string) bool {
+	if !s.sessionOwned(w, r, id) {
+		return false
+	}
 	s.sessionItemsMu.Lock()
 	item, known := s.sessionItems[id]
 	s.sessionItemsMu.Unlock()
@@ -315,7 +338,7 @@ func (s *Server) stopBlockedSessions() {
 func (s *Server) policyMedia(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, _, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/api/streams/"), "/")
-		if s.sessionAllowed(w, id) {
+		if s.sessionAllowed(w, r, id) {
 			next.ServeHTTP(w, r)
 		}
 	})

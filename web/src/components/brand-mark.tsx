@@ -16,15 +16,15 @@ export function BrandMark({ className = "" }: { className?: string }) {
       />
       <path
         className="brand-fragment brand-fragment-tip"
-        d="M24 15.5 35 21.5 24 27.5Z"
+        d="M25 15 36 21 25 27Z"
       />
       <path
         className="brand-fragment brand-fragment-center"
-        d="M12 21 23 15 23 27Z"
+        d="M11 21 22 15 22 27Z"
       />
       <path
         className="brand-fragment brand-fragment-bottom"
-        d="M12 22.5 23 28.5 12 34.5Z"
+        d="M12 25.5 23 31.5 12 37.5Z"
       />
     </svg>
   );

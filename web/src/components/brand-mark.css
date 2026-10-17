@@ -12,8 +12,11 @@
   animation: brand-assemble 1s cubic-bezier(0.22, 1, 0.36, 1) both;
   animation-delay: var(--fragment-delay, 0ms);
 }
-.brand-fragment-top {
+.brand-fragment-tip,
+.brand-fragment-center {
   fill: #f08a83;
+}
+.brand-fragment-top {
   --fragment-x: -4px;
   --fragment-y: -6px;
   --fragment-rotation: -12deg;

@@ -1,11 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { motion, useReducedMotion } from "motion/react";
 import {
   ArrowRight,
   ChevronLeft,
   ChevronRight,
-  Clapperboard,
-  Film,
   MonitorPlay,
   Play,
   X,
@@ -22,7 +19,6 @@ import { isContinueWatching, type WatchHistoryEntry } from "../watch-history";
 import { Artwork } from "./artwork";
 import { Button } from "./ui/button";
 import { Skeleton } from "./ui/skeleton";
-import { SectionTabs } from "./ui/section-tabs";
 import { Spinner } from "./spectrumui/spinner-dependencies";
 import { AnimatedAlert } from "./spectrumui/animated-alert";
 import { DiscoveryHero } from "./discovery-hero";
@@ -31,12 +27,6 @@ import "./discovery-dashboard.css";
 type LibraryKind = "live" | "movie" | "series";
 type NextEpisode = { entry: WatchHistoryEntry; episode: Item };
 type EpisodePage = { items: Item[]; seasons?: number[]; season?: number };
-const sections = [
-  { kind: "live", label: "Live TV", icon: MonitorPlay },
-  { kind: "movie", label: "Movies", icon: Film },
-  { kind: "series", label: "Shows", icon: Clapperboard },
-] as const;
-
 function episodeLabel(item: Item) {
   return `S${item.season || 1}${item.episode ? ` · E${item.episode}` : ""}`;
 }
@@ -72,18 +62,15 @@ function releaseLabel(title: DiscoveryTitle) {
 function ContentRail({
   label,
   className,
-  contentKey,
   overlay = false,
   children,
 }: {
   label: string;
   className: string;
-  contentKey?: string;
   overlay?: boolean;
   children: ReactNode;
 }) {
   const rail = useRef<HTMLDivElement>(null);
-  const reducedMotion = useReducedMotion();
   const [scrollable, setScrollable] = useState({
     previous: false,
     next: false,
@@ -124,19 +111,15 @@ function ContentRail({
     <div
       className={`discovery-rail-shell${overlay ? " discovery-rail-overlay" : ""}`}
     >
-      <motion.div
-        key={contentKey}
+      <div
         ref={rail}
         className={className}
         role="group"
         aria-label={label}
         tabIndex={0}
-        initial={contentKey && !reducedMotion ? { opacity: 0 } : false}
-        animate={{ opacity: 1 }}
-        transition={{ duration: reducedMotion ? 0 : 0.18 }}
       >
         {children}
-      </motion.div>
+      </div>
       {(scrollable.previous || scrollable.next) && (
         <div
           className="discovery-rail-controls"
@@ -224,7 +207,6 @@ export function Dashboard({
   const [upNext, setUpNext] = useState<NextEpisode[]>([]);
   const [opening, setOpening] = useState("");
   const [error, setError] = useState("");
-  const [recentKind, setRecentKind] = useState<LibraryKind | "all">("all");
   const pending = useRef<AbortController | null>(null);
   const operation = useRef(0);
 
@@ -360,9 +342,7 @@ export function Dashboard({
   }, [configured, completedKey, playbackActive]);
 
   const continueWatching = entries.filter(isContinueWatching).slice(0, 6);
-  const recent = entries
-    .filter((entry) => recentKind === "all" || entry.title.kind === recentKind)
-    .slice(0, 6);
+  const recent = entries.slice(0, 6);
   const livePrograms = useMemo(() => {
     const current = new Map<string, Program>();
     if (playbackActive) return current;
@@ -509,11 +489,6 @@ export function Dashboard({
     >
       {!playbackActive && (
         <>
-          {!configured && (
-            <AnimatedAlert variant="info">
-              Provider not configured
-            </AnimatedAlert>
-          )}
           {error && <AnimatedAlert variant="error">{error}</AnimatedAlert>}
           {discoveryFailed && (
             <AnimatedAlert variant="warning" className="discovery-fetch-note">
@@ -715,11 +690,6 @@ export function Dashboard({
           </div>
           {playbackActive && (
             <>
-              {!configured && (
-                <AnimatedAlert variant="info">
-                  Provider not configured
-                </AnimatedAlert>
-              )}
               {error && <AnimatedAlert variant="error">{error}</AnimatedAlert>}
               {discoveryFailed && (
                 <AnimatedAlert
@@ -785,9 +755,7 @@ export function Dashboard({
               ))}
             </div>
           ) : (
-            <p className="discovery-explore-empty">
-              {configured ? "No titles" : "Provider not configured"}
-            </p>
+            <p className="discovery-explore-empty">No titles</p>
           )}
         </section>
       )}
@@ -853,32 +821,9 @@ export function Dashboard({
                   History isn’t saved.
                 </AnimatedAlert>
               )}
-              <SectionTabs
-                label="History type"
-                value={recentKind}
-                className="discovery-recent-filters"
-                onValueChange={(value) => {
-                  if (
-                    value === "all" ||
-                    value === "live" ||
-                    value === "movie" ||
-                    value === "series"
-                  )
-                    setRecentKind(value);
-                }}
-                items={[
-                  { value: "all", label: "All" },
-                  ...sections.map(({ kind, label, icon }) => ({
-                    value: kind,
-                    label,
-                    icon,
-                  })),
-                ]}
-              />
               <ContentRail
                 label="Recently played"
                 className="discovery-recent-grid"
-                contentKey={recentKind}
               >
                 {recent.map((entry) => (
                   <div

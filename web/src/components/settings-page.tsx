@@ -2,12 +2,12 @@ import {
   useEffect,
   useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
   type FormEvent,
 } from "react";
-import { useReducedMotion } from "motion/react";
-import { TreeNav } from "./spectrumui/tree-nav";
-import { RefreshCw } from "lucide-react";
+import { Fingerprint, RefreshCw, SlidersHorizontal } from "lucide-react";
+import { useAuth } from "../auth";
 import {
   getSettings,
   updateSettings,
@@ -16,7 +16,9 @@ import {
   type SettingsUpdate,
   type Category,
   type Status,
+  type RefreshState,
 } from "../api";
+import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import {
@@ -48,13 +50,15 @@ const settingsSections = [
   { id: "settings-library", label: "Library & guide" },
   { id: "settings-discovery", label: "Discovery" },
   { id: "settings-playback", label: "Playback" },
-  { id: "settings-status", label: "Library status" },
+  { id: "settings-status", label: "Status" },
   { id: "settings-about", label: "About" },
 ];
-const settingsNavItems = settingsSections.map((section) => ({
-  label: section.label,
-  href: `#${section.id}`,
-}));
+const readOnlySections = settingsSections.slice(-2);
+const processingLabels: Record<string, string> = {
+  auto: "Automatic",
+  copy: "Copy",
+  transcode: "Transcode",
+};
 
 function timestamp(value?: string) {
   if (!value) return "Not yet refreshed";
@@ -83,6 +87,14 @@ function interval(seconds?: number) {
   return `${count} ${unit[1]}${count === 1 ? "" : "s"}`;
 }
 
+function refreshState(state?: RefreshState) {
+  if (!state) return "—";
+  if (state.running) return "Running";
+  if (state.queued) return "Queued";
+  if (state.error) return "Failed";
+  return "Idle";
+}
+
 export function SettingsPage({
   status,
   statusError,
@@ -94,30 +106,39 @@ export function SettingsPage({
   onRefresh: (target: RefreshTarget) => Promise<void>;
   onSaved?: () => void;
 }) {
+  const { canAdmin } = useAuth();
+  const sections = canAdmin ? settingsSections : readOnlySections;
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const pageRef = useRef<HTMLElement>(null);
   const jumpTarget = useRef<string | null>(null);
-  const [activeSection, setActiveSection] = useState(settingsSections[0].id);
-  const reducedMotion = useReducedMotion();
+  const [activeSection, setActiveSection] = useState(sections[0].id);
   const jumpToSection = (id: string) => {
     const section = document.getElementById(id);
     if (!section) return;
     jumpTarget.current = id;
     setActiveSection(id);
     section.scrollIntoView({
-      behavior: reducedMotion ? "instant" : "smooth",
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "instant"
+        : "smooth",
       block: "start",
     });
     section.focus({ preventScroll: true });
   };
   useEffect(() => {
-    if (!settings) return;
+    if (canAdmin && !settings) return;
     let frame = 0;
     const update = () => {
       frame = 0;
+      // A section jump owns selection until the user scrolls again. Otherwise
+      // scroll tracking selects every section crossed by the smooth scroll.
+      if (jumpTarget.current) {
+        setActiveSection(jumpTarget.current);
+        return;
+      }
       const offset = window.matchMedia("(max-width: 820px)").matches ? 100 : 36;
-      let current = settingsSections[0].id;
-      for (const section of settingsSections) {
+      let current = sections[0].id;
+      for (const section of sections) {
         const element = document.getElementById(section.id);
         if (element && element.getBoundingClientRect().top <= offset)
           current = section.id;
@@ -127,10 +148,8 @@ export function SettingsPage({
         Math.ceil(window.scrollY + window.innerHeight) >=
           document.documentElement.scrollHeight - 2
       )
-        // Short final sections share a clamped scroll position. Honor an
-        // explicit jump until the next user scroll; manual bottom scrolling
-        // always settles on About.
-        current = jumpTarget.current || settingsSections.at(-1)!.id;
+        // Short final sections share a clamped scroll position.
+        current = sections.at(-1)!.id;
       setActiveSection(current);
     };
     const schedule = () => {
@@ -196,10 +215,10 @@ export function SettingsPage({
       window.removeEventListener("keydown", scrollKey);
       observer.disconnect();
     };
-  }, [!!settings]);
+  }, [!!settings, canAdmin, sections]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [categoryError, setCategoryError] = useState("");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(canAdmin);
   const [loadError, setLoadError] = useState("");
   const [retry, setRetry] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
@@ -209,6 +228,7 @@ export function SettingsPage({
   >("idle");
 
   useEffect(() => {
+    if (!canAdmin) return;
     const controller = new AbortController();
     setLoading(true);
     void getSettings(controller.signal)
@@ -225,9 +245,10 @@ export function SettingsPage({
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [retry]);
+  }, [retry, canAdmin]);
 
   useEffect(() => {
+    if (!canAdmin) return;
     const controller = new AbortController();
     void request<{ categories: Category[] }>("/api/categories?manage=1", {
       signal: controller.signal,
@@ -245,13 +266,14 @@ export function SettingsPage({
           );
       });
     return () => controller.abort();
-  }, [retry, status?.catalogUpdatedAt]);
+  }, [retry, status?.catalogUpdatedAt, canAdmin]);
 
   const configured = status?.configured ?? false;
   const cooldown =
+    canAdmin &&
     !!status?.portalCooldownUntil &&
     Date.parse(status.portalCooldownUntil) > Date.now();
-  const syncStates = [status?.sync?.catalog, status?.sync?.epg];
+  const syncStates = canAdmin ? [status?.sync?.catalog, status?.sync?.epg] : [];
   const busy =
     refreshing ||
     !!status?.refreshing ||
@@ -268,7 +290,9 @@ export function SettingsPage({
       .map((state) => state?.lastSuccessfulAt)
       .filter((value): value is string => !!value)
       .sort()
-      .at(-1) || status?.libraryUpdatedAt;
+      .at(-1) ||
+    status?.catalogRefreshCompletedAt ||
+    status?.libraryUpdatedAt;
   useEffect(() => {
     if (refreshPhase !== "requested" || busy) return;
     setRefreshPhase(
@@ -283,7 +307,7 @@ export function SettingsPage({
   }, [refreshPhase]);
 
   const refresh = async () => {
-    if (busy || !configured || cooldown || statusError) return;
+    if (!canAdmin || busy || !configured || cooldown || statusError) return;
     setRefreshing(true);
     setRefreshError("");
     setRefreshPhase("idle");
@@ -300,40 +324,197 @@ export function SettingsPage({
     }
   };
 
+  const details = (
+    <>
+      <section
+        id="settings-status"
+        tabIndex={-1}
+        className="settings-status"
+        aria-labelledby="settings-status-title"
+      >
+        <div className="settings-status-heading">
+          <div>
+            <h2 id="settings-status-title">Status</h2>
+            <p>Library availability and update information.</p>
+          </div>
+          {canAdmin && (
+            <MorphButton
+              className="settings-refresh"
+              disabled={!configured || cooldown || !!statusError}
+              state={
+                busy
+                  ? "loading"
+                  : refreshPhase === "complete"
+                    ? "success"
+                    : refreshPhase === "failed"
+                      ? "error"
+                      : "idle"
+              }
+              loadingLabel="Refreshing…"
+              successLabel="Refreshed"
+              errorLabel="Try again"
+              onClick={() => void refresh()}
+            >
+              <RefreshCw size={16} aria-hidden="true" />
+              Refresh now
+            </MorphButton>
+          )}
+        </div>
+        {cooldown && (
+          <AnimatedAlert variant="warning" role="group" className="mt-5">
+            <TextStates
+              text={`Refresh resumes after ${timestamp(status?.portalCooldownUntil)}.`}
+            />
+          </AnimatedAlert>
+        )}
+        {refreshError && (
+          <AnimatedAlert className="mt-5">{refreshError}</AnimatedAlert>
+        )}
+        {syncErrors.map((error) => (
+          <AnimatedAlert key={error} className="mt-5">
+            {error}
+          </AnimatedAlert>
+        ))}
+
+        <dl aria-label="Server status">
+          <div>
+            <dt>Provider</dt>
+            <dd>
+              {status ? (configured ? "Configured" : "Not configured") : "—"}
+            </dd>
+          </div>
+          <div>
+            <dt>Last refreshed</dt>
+            <dd>
+              <time dateTime={lastUpdated}>{timestamp(lastUpdated)}</time>
+            </dd>
+          </div>
+          <div>
+            <dt>Update activity</dt>
+            <dd>{status ? (busy ? "Updating" : "Idle") : "—"}</dd>
+          </div>
+          <div>
+            <dt>Guide updated</dt>
+            <dd>{timestamp(status?.epgUpdatedAt)}</dd>
+          </div>
+          <div>
+            <dt>Live channels</dt>
+            <dd>{status?.library?.liveChannels.toLocaleString() ?? "—"}</dd>
+          </div>
+          <div>
+            <dt>Categories</dt>
+            <dd>{status?.library?.categories.toLocaleString() ?? "—"}</dd>
+          </div>
+        </dl>
+        {canAdmin && (
+          <>
+            <h3 className="settings-diagnostics-title">Diagnostics</h3>
+            <dl aria-label="Admin diagnostics">
+              {[
+                [
+                  "Refresh interval",
+                  interval(
+                    settings?.library.refreshIntervalSeconds ??
+                      status?.sync?.catalog?.intervalSeconds,
+                  ),
+                ],
+                ["Catalog refresh", refreshState(status?.sync?.catalog)],
+                [
+                  "Next catalog refresh",
+                  status?.sync?.catalog?.nextRefreshAt
+                    ? timestamp(status.sync.catalog.nextRefreshAt)
+                    : "Not scheduled",
+                ],
+                ["Guide refresh", refreshState(status?.sync?.epg)],
+                [
+                  "Next guide refresh",
+                  status?.sync?.epg?.nextRefreshAt
+                    ? timestamp(status.sync.epg.nextRefreshAt)
+                    : "Not scheduled",
+                ],
+                [
+                  "Guide coverage",
+                  status?.library?.guideStartsAt && status.library.guideEndsAt
+                    ? `${timestamp(status.library.guideStartsAt)} – ${timestamp(status.library.guideEndsAt)}`
+                    : "Not available",
+                ],
+                [
+                  "Cached movies",
+                  status?.library?.cachedMovies.toLocaleString() ?? "—",
+                ],
+                [
+                  "Cached shows",
+                  status?.library?.cachedSeries.toLocaleString() ?? "—",
+                ],
+                [
+                  "Guide programmes",
+                  status?.library?.programmes.toLocaleString() ?? "—",
+                ],
+                [
+                  "Streams",
+                  status?.activeStreams !== undefined &&
+                  status.maxStreams !== undefined
+                    ? `${status.activeStreams} / ${status.maxStreams}`
+                    : "—",
+                ],
+                [
+                  "Playback processing",
+                  processingLabels[status?.playback?.transcodeMode ?? ""] ??
+                    "—",
+                ],
+                [
+                  "Playback idle timeout",
+                  interval(status?.playback?.sessionTimeoutSeconds),
+                ],
+              ].map(([label, value]) => (
+                <div key={label}>
+                  <dt>{label}</dt>
+                  <dd>{value}</dd>
+                </div>
+              ))}
+            </dl>
+          </>
+        )}
+      </section>
+      <section
+        id="settings-about"
+        tabIndex={-1}
+        className="settings-about"
+        aria-labelledby="settings-about-title"
+      >
+        <h2 id="settings-about-title">About</h2>
+        <a href="https://www.themoviedb.org/" target="_blank" rel="noreferrer">
+          <img src="/tmdb-logo.svg" alt="TMDB" width={55} height={24} />
+          <span>Metadata and artwork by TMDB</span>
+        </a>
+        <p>
+          This product uses the TMDB API but is not endorsed or certified by
+          TMDB.
+        </p>
+      </section>
+    </>
+  );
+
   return (
     <section
       ref={pageRef}
-      className="settings-page settings-editable"
+      className={`settings-page${canAdmin ? " settings-editable" : ""}`}
       aria-labelledby="settings-title"
     >
       <div className="settings-heading">
         <h1 id="settings-title">Settings</h1>
-        <MorphButton
-          className="settings-refresh"
-          disabled={!configured || cooldown || !!statusError}
-          state={
-            busy
-              ? "loading"
-              : refreshPhase === "complete"
-                ? "success"
-                : refreshPhase === "failed"
-                  ? "error"
-                  : "idle"
-          }
-          loadingLabel="Refreshing…"
-          successLabel="Refreshed"
-          errorLabel="Try again"
-          onClick={() => void refresh()}
-        >
-          <RefreshCw size={16} aria-hidden="true" />
-          Refresh now
-        </MorphButton>
       </div>
       {(!status && !statusError) || (status && !configured) ? (
         <div className="settings-current-state">
           {!status && <Spinner size="small" className="app-spinner" />}
           <TextStates
-            text={!status ? "Checking server…" : "Provider setup required."}
+            text={
+              !status
+                ? "Checking server…"
+                : canAdmin
+                  ? "Provider setup required."
+                  : "Provider setup required. Contact an administrator."
+            }
           />
         </div>
       ) : null}
@@ -342,22 +523,7 @@ export function SettingsPage({
           Server unavailable. {statusError}
         </AnimatedAlert>
       )}
-      {cooldown && (
-        <AnimatedAlert variant="warning" role="group" className="mt-5">
-          <TextStates
-            text={`Refresh resumes after ${timestamp(status?.portalCooldownUntil)}.`}
-          />
-        </AnimatedAlert>
-      )}
-      {refreshError && (
-        <AnimatedAlert className="mt-5">{refreshError}</AnimatedAlert>
-      )}
-      {syncErrors.map((error) => (
-        <AnimatedAlert key={error} className="mt-5">
-          {error}
-        </AnimatedAlert>
-      ))}
-      {loadError && (
+      {canAdmin && loadError && (
         <AnimatedAlert className="mt-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <span>{loadError}</span>
@@ -373,30 +539,54 @@ export function SettingsPage({
           </div>
         </AnimatedAlert>
       )}
-      {loading && !settings && !loadError && (
+      {canAdmin && loading && !settings && !loadError && (
         <div className="mt-8" role="status" aria-label="Loading settings">
           <Skeleton className="h-48 w-full" />
         </div>
       )}
       <div className="settings-layout">
         <nav className="settings-section-nav" aria-label="Settings sections">
-          <TreeNav
-            items={settingsNavItems}
-            activeHref={`#${activeSection}`}
-            followHover={false}
-            onSelect={(item, event) => {
-              event.preventDefault();
-              jumpToSection(item.href.slice(1));
-            }}
-          />
+          <ul
+            className="settings-section-links"
+            style={
+              {
+                "--settings-active-index": sections.findIndex(
+                  (section) => section.id === activeSection,
+                ),
+              } as CSSProperties
+            }
+          >
+            {sections.map((section) => (
+              <li key={section.id}>
+                <Button
+                  asChild
+                  variant="ghost"
+                  className="settings-section-link"
+                >
+                  <a
+                    href={`#${section.id}`}
+                    aria-current={
+                      activeSection === section.id ? "location" : undefined
+                    }
+                    onClick={(event) => {
+                      event.preventDefault();
+                      jumpToSection(section.id);
+                    }}
+                  >
+                    {section.label}
+                  </a>
+                </Button>
+              </li>
+            ))}
+          </ul>
         </nav>
         <div className="settings-mobile-nav">
           <Select value={activeSection} onValueChange={jumpToSection}>
-            <SelectTrigger aria-label="Jump to section">
+            <SelectTrigger size="form" aria-label="Jump to section">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {settingsSections.map((section) => (
+              {sections.map((section) => (
                 <SelectItem key={section.id} value={section.id}>
                   {section.label}
                 </SelectItem>
@@ -405,7 +595,7 @@ export function SettingsPage({
           </Select>
         </div>
         <div className="settings-main">
-          {settings && (
+          {canAdmin && settings ? (
             <SettingsForms
               settings={settings}
               categories={categories}
@@ -416,166 +606,42 @@ export function SettingsPage({
                 onSaved?.();
                 return next;
               }}
-            />
-          )}
-          <section
-            id="settings-status"
-            tabIndex={-1}
-            className="settings-status"
-            aria-labelledby="settings-status-title"
-          >
-            <h2 id="settings-status-title">Library status</h2>
-            <dl aria-label="Server status">
-              <div>
-                <dt>Provider</dt>
-                <dd>
-                  {status
-                    ? configured
-                      ? "Configured"
-                      : "Not configured"
-                    : "—"}
-                </dd>
-              </div>
-              <div>
-                <dt>Last refreshed</dt>
-                <dd>
-                  <time dateTime={lastUpdated}>{timestamp(lastUpdated)}</time>
-                </dd>
-              </div>
-              <div>
-                <dt>Refresh interval</dt>
-                <dd>
-                  {interval(
-                    settings?.library.refreshIntervalSeconds ??
-                      status?.sync?.catalog?.intervalSeconds,
-                  )}
-                </dd>
-              </div>
-              <div>
-                <dt>Live channels</dt>
-                <dd>{status?.library?.liveChannels.toLocaleString() ?? "—"}</dd>
-              </div>
-              <div>
-                <dt>Categories</dt>
-                <dd>{status?.library?.categories.toLocaleString() ?? "—"}</dd>
-              </div>
-              <div>
-                <dt>Streams</dt>
-                <dd>
-                  {status
-                    ? `${status.activeStreams} / ${status.maxStreams}`
-                    : "—"}
-                </dd>
-              </div>
-            </dl>
-          </section>
-          <section
-            id="settings-about"
-            tabIndex={-1}
-            className="settings-about"
-            aria-labelledby="settings-about-title"
-          >
-            <h2 id="settings-about-title">About</h2>
-            <a
-              href="https://www.themoviedb.org/"
-              target="_blank"
-              rel="noreferrer"
             >
-              <img src="/tmdb-logo.svg" alt="TMDB" width={55} height={24} />
-              <span>Metadata and artwork by TMDB</span>
-            </a>
-            <p>
-              This product uses the TMDB API but is not endorsed or certified by
-              TMDB.
-            </p>
-          </section>
+              {details}
+            </SettingsForms>
+          ) : (
+            details
+          )}
         </div>
       </div>
     </section>
   );
 }
 
-function SettingsForm({
+function SettingsSection({
   id,
   title,
   description,
-  action,
   children,
-  save,
-  disabled = false,
-  draftKey,
 }: {
   id: string;
   title: string;
   description: string;
-  action: string;
   children: ReactNode;
-  save: () => Promise<string>;
-  disabled?: boolean;
-  draftKey: string;
 }) {
-  const [saving, setSaving] = useState(false);
-  const [feedback, setFeedback] = useState<{
-    draft: string;
-    error?: string;
-  } | null>(null);
-  const currentFeedback = feedback?.draft === draftKey ? feedback : null;
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    if (saving || disabled) return;
-    setSaving(true);
-    setFeedback(null);
-    try {
-      const savedDraft = await save();
-      setFeedback({ draft: savedDraft });
-    } catch (cause) {
-      setFeedback({
-        draft: draftKey,
-        error:
-          cause instanceof Error ? cause.message : "Couldn’t save. Try again.",
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
   return (
-    <form
+    <section
       id={id}
       tabIndex={-1}
       className="settings-section"
-      aria-label={title}
-      onSubmit={(event) => void submit(event)}
+      aria-labelledby={`${id}-title`}
     >
       <div className="settings-section-intro">
-        <h2>{title}</h2>
+        <h2 id={`${id}-title`}>{title}</h2>
         <p>{description}</p>
       </div>
-      <div className="settings-section-content">
-        <fieldset disabled={saving} inert={saving}>
-          {children}
-        </fieldset>
-        {currentFeedback?.error && (
-          <AnimatedAlert>{currentFeedback.error}</AnimatedAlert>
-        )}
-        <div className="settings-save-row">
-          <LoadingButton
-            type="submit"
-            loading={saving}
-            loadingLabel="Saving…"
-            disabled={disabled}
-          >
-            {action}
-          </LoadingButton>
-          {currentFeedback && !currentFeedback.error && (
-            <span>
-              <TextStates
-                text={`${title === "Library & guide" ? "Library" : title === "Provider connection" ? "Provider" : title} saved.`}
-              />
-            </span>
-          )}
-        </div>
-      </div>
-    </form>
+      <div className="settings-section-content">{children}</div>
+    </section>
   );
 }
 
@@ -585,20 +651,22 @@ function SettingsSelect({
   value,
   onChange,
   options,
+  disabled,
 }: {
   id: string;
   label: string;
   value: string;
   onChange: (value: string) => void;
   options: { value: string; label: string }[];
+  disabled?: boolean;
 }) {
   return (
     <div className="settings-select-field">
       <Label id={`${id}-label`} htmlFor={id}>
         {label}
       </Label>
-      <Select value={value} onValueChange={onChange}>
-        <SelectTrigger id={id} aria-labelledby={`${id}-label`}>
+      <Select value={value} onValueChange={onChange} disabled={disabled}>
+        <SelectTrigger size="form" id={id} aria-labelledby={`${id}-label`}>
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -618,11 +686,13 @@ function SettingsForms({
   categories,
   categoryError,
   onSave,
+  children,
 }: {
   settings: AppSettings;
   categories: Category[];
   categoryError: string;
   onSave: (patch: SettingsUpdate) => Promise<AppSettings>;
+  children: ReactNode;
 }) {
   const [provider, setProvider] = useState(settings.provider);
   const [library, setLibrary] = useState(settings.library);
@@ -630,6 +700,69 @@ function SettingsForms({
   const [token, setToken] = useState("");
   const [removeToken, setRemoveToken] = useState(false);
   const managedProvider = settings.providerEnvironment || [];
+  const [saving, setSaving] = useState(false);
+  const [feedback, setFeedback] = useState<{
+    draft: string;
+    error?: string;
+  } | null>(null);
+  const patch: SettingsUpdate = {};
+  const providerChanges = Object.fromEntries(
+    Object.entries(provider).filter(
+      ([key, value]) =>
+        !managedProvider.includes(key as keyof AppSettings["provider"]) &&
+        value !== settings.provider[key as keyof AppSettings["provider"]],
+    ),
+  );
+  if (Object.keys(providerChanges).length) patch.provider = providerChanges;
+  if (JSON.stringify(library) !== JSON.stringify(settings.library))
+    patch.library = library;
+  if (JSON.stringify(playback) !== JSON.stringify(settings.playback))
+    patch.playback = playback;
+  if (token.trim() || removeToken)
+    patch.discovery = { tmdbReadAccessToken: removeToken ? "" : token.trim() };
+  const dirty = Object.keys(patch).length > 0;
+  const draftKey = JSON.stringify({
+    provider,
+    library,
+    playback,
+    token,
+    removeToken,
+  });
+  const currentFeedback = feedback?.draft === draftKey ? feedback : null;
+  const resetDrafts = (value: AppSettings) => {
+    setProvider(value.provider);
+    setLibrary(value.library);
+    setPlayback(value.playback);
+    setToken("");
+    setRemoveToken(false);
+  };
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (saving || !dirty) return;
+    setSaving(true);
+    setFeedback(null);
+    try {
+      const next = await onSave(patch);
+      resetDrafts(next);
+      setFeedback({
+        draft: JSON.stringify({
+          provider: next.provider,
+          library: next.library,
+          playback: next.playback,
+          token: "",
+          removeToken: false,
+        }),
+      });
+    } catch (cause) {
+      setFeedback({
+        draft: draftKey,
+        error:
+          cause instanceof Error ? cause.message : "Couldn’t save. Try again.",
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
   const providerInput = (
     key: keyof AppSettings["provider"],
     label: string,
@@ -664,259 +797,291 @@ function SettingsForms({
   if (!refreshOptions.includes(library.refreshIntervalSeconds))
     refreshOptions.push(library.refreshIntervalSeconds);
   return (
-    <div className="settings-forms">
-      <SettingsForm
-        id="settings-provider"
-        title="Provider connection"
-        description="Connect your provider to bring your channels, movies and shows into Restream. Changes apply to everyone using this server."
-        action="Save provider"
-        disabled={Object.keys(provider).every((key) =>
-          managedProvider.includes(key as keyof AppSettings["provider"]),
-        )}
-        draftKey={JSON.stringify(provider)}
-        save={async () => {
-          const editableProvider = Object.fromEntries(
-            Object.entries(provider).filter(
-              ([key]) =>
-                !managedProvider.includes(key as keyof AppSettings["provider"]),
-            ),
-          );
-          const next = await onSave({ provider: editableProvider });
-          setProvider(next.provider);
-          return JSON.stringify(next.provider);
-        }}
+    <form
+      id="settings-form"
+      className="settings-forms"
+      aria-label="App settings"
+      onSubmit={(event) => void submit(event)}
+    >
+      <fieldset
+        disabled={saving}
+        inert={saving}
+        className="settings-editable-fields"
       >
-        {managedProvider.length > 0 && (
-          <p className="settings-source-note">
-            Fields managed by environment are read-only here.
-          </p>
-        )}
-        <div className="settings-fields">
-          <div className="settings-field-wide">
-            {providerInput("portalUrl", "Portal URL", "url")}
+        <SettingsSection
+          id="settings-provider"
+          title="Provider connection"
+          description="Connect your provider to bring your channels, movies and shows into Restream. Changes apply to everyone using this server."
+        >
+          {managedProvider.length > 0 && (
+            <p className="settings-source-note">
+              Fields managed by environment are read-only here.
+            </p>
+          )}
+          <div className="settings-fields">
+            <div className="settings-field-wide">
+              {providerInput("portalUrl", "Portal URL", "url")}
+            </div>
+            {providerInput("mac", "MAC address")}
+            {providerInput("timezone", "Timezone")}
           </div>
-          {providerInput("mac", "MAC address")}
-          {providerInput("timezone", "Timezone")}
-        </div>
-        <p className="settings-field-help">
-          Use the MAC address registered with your provider and a timezone such
-          as America/Toronto. Stop active playback before changing your
-          connection.
-        </p>
-        <Accordion type="single" collapsible className="settings-advanced">
-          <AccordionItem value="device-identity">
-            <AccordionTrigger>Device identity</AccordionTrigger>
-            <AccordionContent>
-              <p className="settings-field-help">
-                Only fill these in if your provider requires a registered device
-                identity.
-              </p>
-              <div className="settings-fields">
-                {providerInput("serialNumber", "Serial number")}
-                {providerInput("deviceId", "Device ID")}
-                {providerInput("deviceId2", "Secondary device ID")}
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-        </Accordion>
-      </SettingsForm>
-      <SettingsForm
-        id="settings-library"
-        title="Library & guide"
-        description="Choose how your library stays fresh and what appears around the app."
-        action="Save library"
-        draftKey={JSON.stringify(library)}
-        save={async () => {
-          const next = await onSave({ library });
-          setLibrary(next.library);
-          return JSON.stringify(next.library);
-        }}
-      >
-        <div className="settings-fields">
-          <SettingsSelect
-            id="refresh-interval"
-            label="Refresh every"
-            value={String(library.refreshIntervalSeconds)}
-            options={refreshOptions
-              .sort((a, b) => a - b)
-              .map((value) => ({
-                value: String(value),
-                label: interval(value),
-              }))}
-            onChange={(value) =>
-              setLibrary({ ...library, refreshIntervalSeconds: Number(value) })
-            }
-          />
-          <div>
-            <Label htmlFor="guide-hours">Guide coverage in hours</Label>
-            <Input
-              id="guide-hours"
-              type="number"
-              min={1}
-              max={168}
-              required
-              value={library.guideHours}
-              onChange={(event) =>
+          <p className="settings-field-help">
+            Use the MAC address registered with your provider and a timezone
+            such as America/Toronto. Stop active playback before changing your
+            connection.
+          </p>
+          <Accordion type="single" collapsible className="settings-advanced">
+            <AccordionItem value="device-identity" variant="panel">
+              <AccordionTrigger
+                icon={<Fingerprint />}
+                description="Serial number and device IDs"
+              >
+                Device identity
+              </AccordionTrigger>
+              <AccordionContent>
+                <p className="settings-field-help">
+                  Only fill these in if your provider requires a registered
+                  device identity.
+                </p>
+                <div className="settings-fields">
+                  {providerInput("serialNumber", "Serial number")}
+                  {providerInput("deviceId", "Device ID")}
+                  {providerInput("deviceId2", "Secondary device ID")}
+                </div>
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
+        </SettingsSection>
+        <SettingsSection
+          id="settings-library"
+          title="Library & guide"
+          description="Choose how your library stays fresh and what appears around the app."
+        >
+          <div className="settings-fields">
+            <SettingsSelect
+              id="refresh-interval"
+              disabled={saving}
+              label="Refresh every"
+              value={String(library.refreshIntervalSeconds)}
+              options={refreshOptions
+                .sort((a, b) => a - b)
+                .map((value) => ({
+                  value: String(value),
+                  label: interval(value),
+                }))}
+              onChange={(value) =>
                 setLibrary({
                   ...library,
-                  guideHours: Number(event.target.value),
+                  refreshIntervalSeconds: Number(value),
                 })
               }
             />
-          </div>
-        </div>
-        <p className="settings-field-help">
-          Cached titles stay visible while updates arrive. Opening a show also
-          checks its seasons and episodes. Stop active playback before changing
-          guide coverage.
-        </p>
-        {categoryError && (
-          <AnimatedAlert variant="warning">{categoryError}</AnimatedAlert>
-        )}
-        <CategorySelector
-          id="home-categories"
-          label="Home categories"
-          categories={categories}
-          values={library.dashboardCategories}
-          onChange={(values) =>
-            setLibrary({ ...library, dashboardCategories: values })
-          }
-        />
-        <p className="settings-field-help">
-          Leave empty to include all categories on Home.
-        </p>
-        <CategorySelector
-          id="blocked-categories"
-          label="Blocked categories"
-          categories={categories}
-          values={library.blockedCategories}
-          onChange={(values) =>
-            setLibrary({ ...library, blockedCategories: values })
-          }
-        />
-        <p className="settings-field-help">
-          Blocked categories are hidden throughout the app and cannot be played.
-          Leave empty to allow all categories.
-        </p>
-      </SettingsForm>
-      <SettingsForm
-        id="settings-discovery"
-        title="Discovery"
-        description="Add TMDB to discover Trending titles available from your provider, with richer artwork."
-        action="Save discovery"
-        draftKey={JSON.stringify({ token, removeToken })}
-        disabled={!token.trim() && !removeToken}
-        save={async () => {
-          await onSave({
-            discovery: { tmdbReadAccessToken: removeToken ? "" : token.trim() },
-          });
-          setToken("");
-          setRemoveToken(false);
-          return JSON.stringify({ token: "", removeToken: false });
-        }}
-      >
-        <Label htmlFor="tmdb-token">TMDB read access token</Label>
-        <Input
-          id="tmdb-token"
-          type="password"
-          value={token}
-          autoComplete="new-password"
-          spellCheck={false}
-          onChange={(event) => {
-            setToken(event.target.value);
-            setRemoveToken(false);
-          }}
-        />
-        <div className="settings-token-state">
-          <span>
-            {removeToken
-              ? "Token will be removed when you save."
-              : settings.discovery.tmdbTokenConfigured
-                ? "A token is saved. Enter a new one to replace it."
-                : "Optional. Add a read access token to enable Trending."}
-          </span>
-          {settings.discovery.tmdbTokenConfigured && (
-            <button
-              type="button"
-              onClick={() => {
-                setRemoveToken(!removeToken);
-                setToken("");
-              }}
-            >
-              {removeToken ? "Keep token" : "Remove token"}
-            </button>
-          )}
-        </div>
-        <a
-          className="settings-inline-link"
-          href="https://www.themoviedb.org/settings/api"
-          target="_blank"
-          rel="noreferrer"
-        >
-          Get a TMDB read access token ↗
-        </a>
-      </SettingsForm>
-      <SettingsForm
-        id="settings-playback"
-        title="Playback"
-        description="Set the number of streams your provider allows at the same time."
-        action="Save playback"
-        draftKey={JSON.stringify(playback)}
-        save={async () => {
-          const next = await onSave({ playback });
-          setPlayback(next.playback);
-          return JSON.stringify(next.playback);
-        }}
-      >
-        <div className="settings-fields">
-          <div>
-            <Label htmlFor="maximum-streams">
-              Maximum simultaneous streams
-            </Label>
-            <Input
-              id="maximum-streams"
-              type="number"
-              min={1}
-              required
-              value={playback.maxStreams}
-              onChange={(event) =>
-                setPlayback({
-                  ...playback,
-                  maxStreams: Number(event.target.value),
-                })
-              }
-            />
-          </div>
-        </div>
-        <Accordion type="single" collapsible className="settings-advanced">
-          <AccordionItem value="advanced-playback">
-            <AccordionTrigger>Advanced playback</AccordionTrigger>
-            <AccordionContent>
-              <SettingsSelect
-                id="transcode-mode"
-                label="Playback processing"
-                value={playback.transcodeMode}
-                onChange={(value) =>
-                  setPlayback({
-                    ...playback,
-                    transcodeMode:
-                      value as AppSettings["playback"]["transcodeMode"],
+            <div>
+              <Label htmlFor="guide-hours">Guide coverage in hours</Label>
+              <Input
+                id="guide-hours"
+                type="number"
+                min={1}
+                max={168}
+                required
+                value={library.guideHours}
+                onChange={(event) =>
+                  setLibrary({
+                    ...library,
+                    guideHours: Number(event.target.value),
                   })
                 }
-                options={[
-                  { value: "auto", label: "Automatic" },
-                  { value: "copy", label: "Copy" },
-                  { value: "transcode", label: "Transcode" },
-                ]}
               />
-              <p className="settings-field-help">
-                Automatic adapts playback for your browser. Copy avoids video
-                encoding; Transcode always converts it.
-              </p>
-            </AccordionContent>
-          </AccordionItem>
-        </Accordion>
-      </SettingsForm>
-    </div>
+            </div>
+          </div>
+          <p className="settings-field-help">
+            Cached titles stay visible while updates arrive. Opening a show also
+            checks its seasons and episodes. Stop active playback before
+            changing guide coverage.
+          </p>
+          {categoryError && (
+            <AnimatedAlert variant="warning">{categoryError}</AnimatedAlert>
+          )}
+          <CategorySelector
+            id="home-categories"
+            label="Home categories"
+            categories={categories}
+            disabled={saving}
+            values={library.dashboardCategories}
+            onChange={(values) =>
+              setLibrary({ ...library, dashboardCategories: values })
+            }
+          />
+          <p className="settings-field-help">
+            Leave empty to include all categories on Home.
+          </p>
+          <CategorySelector
+            id="blocked-categories"
+            label="Blocked categories"
+            categories={categories}
+            disabled={saving}
+            values={library.blockedCategories}
+            onChange={(values) =>
+              setLibrary({ ...library, blockedCategories: values })
+            }
+          />
+          <p className="settings-field-help">
+            Blocked categories are hidden throughout the app and cannot be
+            played. Leave empty to allow all categories.
+          </p>
+        </SettingsSection>
+        <SettingsSection
+          id="settings-discovery"
+          title="Discovery"
+          description="Add TMDB to discover Trending titles available from your provider, with richer artwork."
+        >
+          <Label htmlFor="tmdb-token">TMDB read access token</Label>
+          <Input
+            id="tmdb-token"
+            type="password"
+            value={token}
+            autoComplete="new-password"
+            spellCheck={false}
+            onChange={(event) => {
+              setToken(event.target.value);
+              setRemoveToken(false);
+            }}
+          />
+          <div className="settings-token-state">
+            <span>
+              {removeToken
+                ? "Token will be removed when you save."
+                : settings.discovery.tmdbTokenConfigured
+                  ? "A token is saved. Enter a new one to replace it."
+                  : "Optional. Add a read access token to enable Trending."}
+            </span>
+            {settings.discovery.tmdbTokenConfigured && (
+              <Button
+                type="button"
+                variant="link"
+                size="sm"
+                onClick={() => {
+                  setRemoveToken(!removeToken);
+                  setToken("");
+                }}
+              >
+                {removeToken ? "Keep token" : "Remove token"}
+              </Button>
+            )}
+          </div>
+          <a
+            className="settings-inline-link"
+            href="https://www.themoviedb.org/settings/api"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Get a TMDB read access token ↗
+          </a>
+        </SettingsSection>
+        <SettingsSection
+          id="settings-playback"
+          title="Playback"
+          description="Set the number of streams your provider allows at the same time."
+        >
+          <div className="settings-fields">
+            <div>
+              <Label htmlFor="maximum-streams">
+                Maximum simultaneous streams
+              </Label>
+              <Input
+                id="maximum-streams"
+                type="number"
+                min={1}
+                required
+                value={playback.maxStreams}
+                onChange={(event) =>
+                  setPlayback({
+                    ...playback,
+                    maxStreams: Number(event.target.value),
+                  })
+                }
+              />
+            </div>
+          </div>
+          <Accordion type="single" collapsible className="settings-advanced">
+            <AccordionItem value="advanced-playback" variant="panel">
+              <AccordionTrigger
+                icon={<SlidersHorizontal />}
+                description="Video conversion settings"
+              >
+                Advanced playback
+              </AccordionTrigger>
+              <AccordionContent>
+                <SettingsSelect
+                  id="transcode-mode"
+                  disabled={saving}
+                  label="Playback processing"
+                  value={playback.transcodeMode}
+                  onChange={(value) =>
+                    setPlayback({
+                      ...playback,
+                      transcodeMode:
+                        value as AppSettings["playback"]["transcodeMode"],
+                    })
+                  }
+                  options={[
+                    { value: "auto", label: "Automatic" },
+                    { value: "copy", label: "Copy" },
+                    { value: "transcode", label: "Transcode" },
+                  ]}
+                />
+                <p className="settings-field-help">
+                  Automatic adapts playback for your browser. Copy avoids video
+                  encoding; Transcode always converts it.
+                </p>
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
+        </SettingsSection>
+      </fieldset>
+      {children}
+      <div className="settings-save-bar">
+        {currentFeedback?.error && (
+          <AnimatedAlert>{currentFeedback.error}</AnimatedAlert>
+        )}
+        <div className="settings-save-actions">
+          <span
+            className="settings-save-state"
+            role="status"
+            aria-live="polite"
+          >
+            {saving
+              ? "Saving changes…"
+              : dirty
+                ? "Unsaved changes"
+                : currentFeedback && !currentFeedback.error
+                  ? "All changes saved."
+                  : "No unsaved changes"}
+          </span>
+          <div className="settings-save-buttons">
+            <Button
+              type="button"
+              variant="outline"
+              aria-label="Discard changes"
+              disabled={!dirty || saving}
+              onClick={() => {
+                resetDrafts(settings);
+                setFeedback(null);
+              }}
+            >
+              Discard
+            </Button>
+            <LoadingButton
+              type="submit"
+              loading={saving}
+              loadingLabel="Saving…"
+              disabled={!dirty}
+            >
+              Save changes
+            </LoadingButton>
+          </div>
+        </div>
+      </div>
+    </form>
   );
 }

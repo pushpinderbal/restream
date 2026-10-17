@@ -9,6 +9,7 @@ import {
   useState,
   type RefObject,
 } from "react";
+import { useAuth } from "./auth";
 import type Hls from "hls.js";
 import hlsWorkerUrl from "hls.js/dist/hls.worker.js?url";
 import {
@@ -236,6 +237,7 @@ function normalizeSearch(text: string) {
 }
 
 function App() {
+  const { canAdmin, user } = useAuth();
   const [status, setStatus] = useState<Status | null>(null);
   const [statusError, setStatusError] = useState("");
   const statusLoaded = useRef(false);
@@ -266,7 +268,7 @@ function App() {
     pendingPlayback.current = null;
     setPlayerRetrying(false);
   }, []);
-  const watchHistory = useWatchHistory();
+  const watchHistory = useWatchHistory(user?.id);
   const historyEntries = useRef(watchHistory.entries);
   historyEntries.current = watchHistory.entries;
   const [liveItems, setLiveItems] = useState<Item[]>([]);
@@ -331,6 +333,7 @@ function App() {
   const searchContext = searchOpen || (playerOpen && playerSource.searchView);
   const discoveryContext =
     dashboardOpen || (playerOpen && playerContext === "dashboard");
+  const providerSetupRequired = status?.configured === false;
   const contentPolicy = useMemo(
     () => createContentPolicy(preferences, managedCategories),
     [preferences, managedCategories],
@@ -349,9 +352,12 @@ function App() {
     const controller = new AbortController();
     void Promise.all([
       request<Preferences>("/api/preferences", { signal: controller.signal }),
-      request<{ categories: Category[] }>("/api/categories?manage=1", {
-        signal: controller.signal,
-      }),
+      request<{ categories: Category[] }>(
+        canAdmin ? "/api/categories?manage=1" : "/api/categories",
+        {
+          signal: controller.signal,
+        },
+      ),
     ])
       .then(([next, all]) => {
         if (controller.signal.aborted) return;
@@ -362,7 +368,7 @@ function App() {
         // Do not expose local history before the server's category choices load.
       });
     return () => controller.abort();
-  }, [status?.preferencesUpdatedAt, status?.catalogUpdatedAt]);
+  }, [status?.preferencesUpdatedAt, status?.catalogUpdatedAt, canAdmin]);
   useEffect(() => {
     if (
       !playback ||
@@ -1412,14 +1418,33 @@ function App() {
         />
         <div className="library-layout">
           <main id="main-content" className="main-content">
+            {providerSetupRequired && !settingsOpen && (
+              <AnimatedAlert variant="info" aria-label="Provider setup">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <span>
+                    {canAdmin
+                      ? "Connect your provider to start watching."
+                      : "Ask an administrator to connect your provider to start watching."}
+                  </span>
+                  {canAdmin && (
+                    <Button
+                      size="sm"
+                      onClick={() => navigateSection("settings")}
+                    >
+                      Open settings
+                    </Button>
+                  )}
+                </div>
+              </AnimatedAlert>
+            )}
             <section
               className="player-page"
               aria-label="Watch workspace"
-              hidden={!playerOpen}
+              hidden={!playerOpen || providerSetupRequired}
             >
               <div className="watch-workspace-grid">
                 <AnimatePresence mode="wait" initial={false}>
-                  {playerOpen && playback && (
+                  {playerOpen && playback && !providerSetupRequired && (
                     <PlaybackPlayer
                       key={`${playback.item.kind}:${playback.item.id}:${playback.start || 0}`}
                       selection={playback}
@@ -1432,7 +1457,7 @@ function App() {
                     />
                   )}
                 </AnimatePresence>
-                {playerOpen && playback && (
+                {playerOpen && playback && !providerSetupRequired && (
                   <aside className="watch-sidebar" aria-label="Watch context">
                     <PlayerPage
                       key={`${playback.title.kind}:${playback.title.id}`}
@@ -1476,7 +1501,7 @@ function App() {
                   </aside>
                 )}
               </div>
-              {playerOpen && !playback && (
+              {playerOpen && !playback && !providerSetupRequired && (
                 <div
                   className="player-page-state"
                   role={
@@ -1507,24 +1532,11 @@ function App() {
                         Try again
                       </LoadingButton>
                     </AnimatedAlert>
-                  ) : status?.configured === false || !selectedId ? (
+                  ) : !selectedId ? (
                     <>
-                      <h2>
-                        {status?.configured === false
-                          ? "Provider not configured"
-                          : "No title selected"}
-                      </h2>
-                      <Button
-                        onClick={() =>
-                          navigateSection(
-                            status?.configured === false
-                              ? "settings"
-                              : "dashboard",
-                          )
-                        }
-                      >
-                        Open{" "}
-                        {status?.configured === false ? "Settings" : "Home"}
+                      <h2>No title selected</h2>
+                      <Button onClick={() => navigateSection("dashboard")}>
+                        Open Home
                       </Button>
                     </>
                   ) : (
@@ -1536,24 +1548,7 @@ function App() {
                 </div>
               )}
             </section>
-            {discoveryContext &&
-              status?.configured === false &&
-              !playerOpen && (
-                <div className="mb-6">
-                  <AnimatedAlert variant="info">
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <span>Connect your provider to start watching.</span>
-                      <Button
-                        size="sm"
-                        onClick={() => navigateSection("settings")}
-                      >
-                        Connect provider
-                      </Button>
-                    </div>
-                  </AnimatedAlert>
-                </div>
-              )}
-            {discoveryContext && (
+            {discoveryContext && !providerSetupRequired && (
               <Dashboard
                 key={status?.preferencesUpdatedAt || "default"}
                 refreshRevision={status?.libraryUpdatedAt}
@@ -1598,7 +1593,7 @@ function App() {
                 />
               </Suspense>
             )}
-            {searchContext && (
+            {searchContext && !providerSetupRequired && (
               <div hidden={playerOpen} className="search-page-container">
                 <SearchPage
                   value={search}
@@ -1640,7 +1635,7 @@ function App() {
                 />
               </div>
             )}
-            {!searchContext && (
+            {!searchContext && !providerSetupRequired && (
               <div
                 hidden={settingsOpen || discoveryContext}
                 className={`library-content${playerOpen ? " library-during-playback" : ""}${!searchContext && tab !== "live" && !playerOpen ? " library-vod" : ""}`}
@@ -1665,10 +1660,6 @@ function App() {
                       <Skeleton className="h-9 w-56" />
                       <Skeleton className="h-20 w-full" />
                       <Skeleton className="h-20 w-full" />
-                    </div>
-                  ) : !status?.configured && !error ? (
-                    <div className="state-card state-block" role="status">
-                      <h2>Provider not configured</h2>
                     </div>
                   ) : error ? (
                     <AnimatedAlert title="Couldn’t load the library">
@@ -2236,7 +2227,11 @@ function PlayerPage({
                   );
                 }}
               >
-                <SelectTrigger className="season-trigger" aria-label="Season">
+                <SelectTrigger
+                  variant={compact ? "inline" : "default"}
+                  className="season-trigger"
+                  aria-label="Season"
+                >
                   <SelectValue placeholder="Choose a season" />
                 </SelectTrigger>
                 <SelectContent className="season-menu" position="popper">

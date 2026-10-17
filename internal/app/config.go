@@ -8,6 +8,7 @@ import (
 )
 
 type Config struct {
+	Auth                                                                   AuthConfig
 	RequestTimeout                                                         time.Duration
 	EPGHours                                                               int
 	MaxResponseBytes                                                       int64
@@ -27,6 +28,11 @@ func LoadConfig() (Config, error) {
 		ListenAddr: env("LISTEN_ADDR", ":8080"), DataDir: "/data", WebDir: "/app/web",
 		Timezone: "UTC", UserAgent: os.Getenv("STALKER_USER_AGENT"),
 		TranscodeMode: "auto", MaxStreams: 1, EPGHours: 6, RefreshInterval: 24 * time.Hour,
+	}
+	var err error
+	c.Auth, err = loadAuthConfig()
+	if err != nil {
+		return c, err
 	}
 	c.providerEnvironment = map[string]string{}
 	for name, key := range map[string]string{"STALKER_PORTAL_URL": "portalUrl", "STALKER_MAC": "mac", "STALKER_TIMEZONE": "timezone", "STALKER_SERIAL_NUMBER": "serialNumber", "STALKER_DEVICE_ID": "deviceId", "STALKER_DEVICE_ID2": "deviceId2"} {
