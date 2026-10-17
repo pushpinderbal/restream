@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -221,6 +220,6 @@ func assertLocalMedia(t *testing.T, base, playlist, upstream string) {
 	defer res.Body.Close()
 	bytes, err := io.Copy(io.Discard, res.Body)
 	if err != nil || res.StatusCode != 200 || bytes < 188 {
-		t.Fatal(fmt.Sprintf("media response: %d %d %v", res.StatusCode, bytes, err))
+		t.Fatalf("media response: %d %d %v", res.StatusCode, bytes, err)
 	}
 }

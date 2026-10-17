@@ -362,14 +362,6 @@ func (s *Server) publishDiscovery(record discoveryRecord) error {
 	return err
 }
 
-func (s *Server) discoveryBrowse(ctx context.Context, kind, search string, revision time.Time) (model.BrowsePage, error) {
-	categories := s.discoveryCategories(kind)
-	if len(categories) == 0 {
-		return model.BrowsePage{Items: []model.Item{}, Page: 1}, nil
-	}
-	return s.discoveryBrowseCategory(ctx, kind, categories[0], search, revision)
-}
-
 func (s *Server) discoveryBrowseCategory(ctx context.Context, kind, categoryID, search string, revision time.Time) (model.BrowsePage, error) {
 	p, ok := s.provider.(model.BrowseProvider)
 	if !ok {

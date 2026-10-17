@@ -6,12 +6,10 @@ import * as React from "react";
 
 import { cn } from "@/lib/utils";
 
-export interface SkeletonRevealProps {
+interface SkeletonRevealProps {
   loading: boolean;
   skeleton: React.ReactNode;
   children: React.ReactNode;
-  pulseCount?: number;
-  pulseDuration?: number;
   revealDuration?: number;
   className?: string;
 }
@@ -20,8 +18,6 @@ export function SkeletonReveal({
   loading,
   skeleton,
   children,
-  pulseCount = 1,
-  pulseDuration = 1000,
   revealDuration = 400,
   className,
 }: SkeletonRevealProps) {
@@ -46,8 +42,8 @@ export function SkeletonReveal({
       aria-busy={loading || undefined}
       style={
         {
-          "--pulse-dur": `${pulseDuration}ms`,
-          "--pulse-count": pulseCount,
+          "--pulse-dur": "1000ms",
+          "--pulse-count": 1,
           "--pulse-min": 0.5,
           "--reveal-dur": `${revealDuration}ms`,
           "--reveal-blur": "2px",

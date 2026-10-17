@@ -13,7 +13,7 @@ import { Button } from "./components/ui/button";
 import { LoadingButton } from "./components/spectrumui/loading-button";
 import { AnimatedAlert } from "./components/spectrumui/animated-alert";
 
-export type AuthState = {
+type AuthState = {
   mode: "none" | "oidc";
   user: null | { id: string; name: string; role: "viewer" | "admin" };
 };

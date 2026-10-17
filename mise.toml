@@ -1,9 +1,9 @@
 [tools]
 air = "1.67.4"
-bun = "1.4.0"
+bun = "1.4.3"
 ffmpeg = "9.0.2"
-go = "1.27"
-node = "26.8.1"
+go = "1.27.2"
+node = "26.12.0"
 
 [tasks.dev]
 description = "Run the local Go API and Vite UI with automatic reloads"

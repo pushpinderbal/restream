@@ -9,19 +9,21 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
   build: {
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         // Keep the shared framework cache stable across application changes.
         // HLS and settings remain on-demand chunks through dynamic imports.
-        manualChunks(id) {
-          if (/node_modules\/(react|react-dom|scheduler)\//.test(id))
-            return "react";
-          if (
-            /node_modules\/(motion|framer-motion|motion-dom|motion-utils)\//.test(
-              id,
-            )
-          )
-            return "motion";
+        codeSplitting: {
+          groups: [
+            {
+              name: "react",
+              test: /node_modules\/(react|react-dom|scheduler)\//,
+            },
+            {
+              name: "motion",
+              test: /node_modules\/(motion|framer-motion|motion-dom|motion-utils)\//,
+            },
+          ],
         },
       },
     },

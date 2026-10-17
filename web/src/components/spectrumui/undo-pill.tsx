@@ -13,7 +13,7 @@ import {
 } from "motion/react";
 import { cn } from "@/lib/utils";
 
-export interface UndoPillProps {
+interface UndoPillProps {
   open: boolean;
   resetKey?: number;
   label?: string;

@@ -6,10 +6,7 @@ import type { ComponentProps } from "react";
 import { Loader2 } from "lucide-react";
 import { Button } from "../ui/button";
 
-export type LoadingButtonProps = Omit<
-  ComponentProps<typeof Button>,
-  "asChild"
-> & {
+type LoadingButtonProps = Omit<ComponentProps<typeof Button>, "asChild"> & {
   loading?: boolean;
   loadingLabel?: string;
 };

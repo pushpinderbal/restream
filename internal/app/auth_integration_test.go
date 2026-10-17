@@ -71,7 +71,7 @@ func newAuthTestProvider(t *testing.T) *authTestProvider {
 			http.Redirect(w, r, callback.String(), http.StatusFound)
 		case "/userinfo":
 			if r.Header.Get("Authorization") != "Bearer opaque-access-token" {
-				http.Error(w, "unauthorized", 401)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
 			c := map[string]any{"sub": "stable-user-id", "name": p.name, "restream_role": p.role}
@@ -89,7 +89,7 @@ func newAuthTestProvider(t *testing.T) *authTestProvider {
 				id, secret = r.Form.Get("client_id"), r.Form.Get("client_secret")
 			}
 			if id != "restream-test" || secret != "test-secret" {
-				http.Error(w, "client auth required", 401)
+				http.Error(w, "client auth required", http.StatusUnauthorized)
 				return
 			}
 			if r.Form.Get("grant_type") == "refresh_token" {

@@ -2,20 +2,18 @@
  * Adapted from Spectrum UI (https://github.com/arihantcodes/spectrum-ui).
  * Licensed under Apache-2.0.
  */
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { cn } from "@/lib/utils";
 import type { VariantProps } from "class-variance-authority";
 import { buttonVariants } from "../ui/button";
 
-export type MorphButtonState = "idle" | "loading" | "success" | "error";
+type MorphButtonState = "idle" | "loading" | "success" | "error";
 
-export interface MorphButtonProps {
+interface MorphButtonProps {
   children: React.ReactNode;
 
-  onAction?: () => Promise<void> | void;
-
-  state?: MorphButtonState;
+  state: MorphButtonState;
 
   onClick?: React.MouseEventHandler<HTMLButtonElement>;
 
@@ -24,8 +22,6 @@ export interface MorphButtonProps {
   successLabel?: string;
 
   errorLabel?: string;
-
-  resetDelay?: number;
 
   size?: "sm" | "md" | "lg";
 
@@ -54,8 +50,6 @@ const SHAKE_DURATION = 0.25;
 const SPINNER_ARC = 0.75;
 
 const SPINNER_RADIUS = 10;
-
-const DEFAULT_RESET_DELAY = 1800;
 
 const SIZES = {
   sm: { button: "sm", icon: 16 },
@@ -134,58 +128,27 @@ function DrawnIcon({
 
 export function MorphButton({
   children,
-  onAction,
-  state: stateProp,
+  state,
   onClick,
   loadingLabel,
   successLabel = "Done",
   errorLabel = "Failed",
-  resetDelay = DEFAULT_RESET_DELAY,
   size = "md",
   variant = "outline",
   disabled = false,
   className,
 }: MorphButtonProps) {
   const shouldReduceMotion = useReducedMotion();
-  const [internalState, setInternalState] = useState<MorphButtonState>("idle");
-  const mountedRef = useRef(true);
-
-  const isControlled = stateProp !== undefined;
-  const state = stateProp ?? internalState;
   const interactive = state === "idle" && !disabled;
   const { button: buttonSize, icon: iconSize } = SIZES[size];
   const buttonVariant = state === "error" ? "destructive" : variant;
 
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-
-  // Auto-reset the internal machine; cleanup clears the timer on unmount or
-  // when the state moves on before the delay elapses
-  useEffect(() => {
-    if (isControlled) return;
-    if (internalState !== "success" && internalState !== "error") return;
-    const timer = setTimeout(() => setInternalState("idle"), resetDelay);
-    return () => clearTimeout(timer);
-  }, [internalState, isControlled, resetDelay]);
-
   const handleClick = useCallback(
-    async (event: React.MouseEvent<HTMLButtonElement>) => {
+    (event: React.MouseEvent<HTMLButtonElement>) => {
       if (!interactive) return;
       onClick?.(event);
-      if (isControlled || !onAction) return;
-      setInternalState("loading");
-      try {
-        await onAction();
-        if (mountedRef.current) setInternalState("success");
-      } catch {
-        if (mountedRef.current) setInternalState("error");
-      }
     },
-    [interactive, isControlled, onAction, onClick],
+    [interactive, onClick],
   );
 
   const announcement =

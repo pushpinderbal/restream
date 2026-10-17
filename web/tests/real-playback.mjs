@@ -100,6 +100,15 @@ const navigateLibrary = async (kind) => {
       })
       .click();
 };
+const openSettings = async () => {
+  await page
+    .getByRole("button", { name: "Account", exact: true })
+    .filter({ visible: true })
+    .click();
+  const menu = page.getByRole("menu", { name: "Account", exact: true });
+  await menu.getByRole("menuitem", { name: "Settings", exact: true }).click();
+  await expect(menu).toHaveCount(0);
+};
 const checkReleasedPlayback = async () => {
   await checkReleasedMedia();
   await expect
@@ -258,6 +267,7 @@ async function checkNativePlayback() {
     );
     const window = await nativePage.locator("video").evaluate((video) => ({
       time: video.currentTime,
+      mediaError: window.__restreamNativeMediaError ?? null,
       seekable: Array.from({ length: video.seekable.length }, (_, i) => ({
         start: video.seekable.start(i),
         end: video.seekable.end(i),
@@ -268,30 +278,53 @@ async function checkNativePlayback() {
       })),
     }));
     console.log(`Native HLS media window: ${JSON.stringify(window)}`);
-    const range = [...window.seekable, ...window.buffered].find(
-      (range) => range.end - range.start > 1,
-    );
-    if (!range) throw new Error("Native HLS did not expose a media window");
-    const target = Math.ceil(range.start + 0.5);
-    if (target >= range.end - 0.25)
-      throw new Error("Native seekable window was too short");
+    if (window.mediaError)
+      throw new Error(
+        `Native playback failed: ${JSON.stringify(window.mediaError)}`,
+      );
+    // A native decoder can play EVENT playlists without exposing a seekable
+    // window. Only attempt a local slider seek when a distinct whole-second
+    // target exists; the server seek below remains required in every browser.
+    const target = window.seekable
+      .flatMap((range) =>
+        [Math.ceil(range.start), Math.floor(range.end - 0.251)].filter(
+          (value) => value >= range.start && value < range.end - 0.25,
+        ),
+      )
+      .sort((a, b) => Math.abs(b - window.time) - Math.abs(a - window.time))
+      .find((value) => Math.abs(value - window.time) > 0.5);
     const timeline = await nativePage.locator(".timeline").boundingBox();
     const thumb = await nativePage.locator(".timeline-thumb").boundingBox();
     if (!timeline || !thumb)
       throw new Error("Native HLS timeline was not visible");
-    await nativePage.mouse.click(
-      timeline.x +
-        thumb.width / 2 +
-        ((timeline.width - thumb.width) * target) / 60,
-      timeline.y + timeline.height / 2,
-    );
-    await expect
-      .poll(() =>
-        nativePage.locator("video").evaluate((video) => video.currentTime),
-      )
-      .toBeCloseTo(target, 0);
-    if (nativeSeeks || (await nativePage.evaluate(videoState)).src !== source)
-      throw new Error("Native in-window seek restarted the server stream");
+    if (target !== undefined) {
+      // Drag from the thumb: a nearby track click can hit the thumb without
+      // changing its value when the native buffer window is only a few seconds.
+      await nativePage.mouse.move(
+        thumb.x + thumb.width / 2,
+        thumb.y + thumb.height / 2,
+      );
+      await nativePage.mouse.down();
+      await nativePage.mouse.move(
+        timeline.x +
+          thumb.width / 2 +
+          ((timeline.width - thumb.width) * target) / 60,
+        timeline.y + timeline.height / 2,
+      );
+      await nativePage.mouse.up();
+      await expect
+        .poll(() =>
+          nativePage.locator("video").evaluate((video) => video.currentTime),
+        )
+        .toBeCloseTo(target, 0);
+      if (nativeSeeks || (await nativePage.evaluate(videoState)).src !== source)
+        throw new Error("Native in-window seek restarted the server stream");
+      console.log("Native in-window seek kept its HLS source");
+    } else {
+      console.log(
+        "Native decoder exposes no local slider seek target; local seeking remains covered by controlled workflow tests",
+      );
+    }
     await nativeArea.hover();
     await nativePage.getByRole("button", { name: "Play", exact: true }).click();
     await nativePage.waitForFunction(progressing, undefined, {
@@ -311,9 +344,28 @@ async function checkNativePlayback() {
       source,
       { timeout: 15000 },
     );
-    await nativePage.waitForFunction(progressing, undefined, {
-      timeout: 15000,
-    });
+    await nativePage
+      .waitForFunction(progressing, undefined, { timeout: 15000 })
+      .catch(async (error) => {
+        console.log(
+          "Native seek result:",
+          await nativePage.locator("video").evaluate((video) => ({
+            time: video.currentTime,
+            paused: video.paused,
+            ended: video.ended,
+            readyState: video.readyState,
+            networkState: video.networkState,
+            source: video.currentSrc,
+            error: window.__restreamNativeMediaError,
+            duration: video.duration,
+          })),
+        );
+        console.log(
+          "Native alerts:",
+          await nativePage.getByRole("alert").allTextContents(),
+        );
+        throw error;
+      });
     await nativePage.getByRole("button", { name: "Stop playback" }).click();
     await expect(nativePage.locator("video")).toHaveCount(0);
     await expect.poll(() => workers.size, { timeout: 5000 }).toBe(0);
@@ -323,7 +375,7 @@ async function checkNativePlayback() {
     );
     if (nativeErrors.length) throw new Error(nativeErrors.join("\n"));
     console.log(
-      `Native-only HLS decodes, pauses, seeks locally within its media window, resumes after a server seek, and releases playback`,
+      "Native-only HLS decodes, pauses, resumes after a server seek, and releases playback",
     );
   } finally {
     await nativePage.close();
@@ -506,7 +558,7 @@ try {
       throw new Error("Player overflows mobile viewport");
 
     const videoBeforeSettings = await page.locator("video").elementHandle();
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await openSettings();
     await page
       .getByRole("heading", { name: "Settings", exact: true })
       .waitFor();

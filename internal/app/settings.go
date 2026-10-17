@@ -65,9 +65,9 @@ func (s applicationSettings) response(environment map[string]string) settingsRes
 	return r
 }
 func (s applicationSettings) config(base Config) (Config, error) {
-	s.Provider = effectiveProvider(s.Provider, base.providerEnvironment)
-	base.PortalURL, base.MAC, base.Timezone = s.Provider.PortalURL, s.Provider.MAC, s.Provider.Timezone
-	base.SerialNumber, base.DeviceID, base.DeviceID2 = s.Provider.SerialNumber, s.Provider.DeviceID, s.Provider.DeviceID2
+	provider := effectiveProvider(s.Provider, base.providerEnvironment)
+	base.PortalURL, base.MAC, base.Timezone = provider.PortalURL, provider.MAC, provider.Timezone
+	base.SerialNumber, base.DeviceID, base.DeviceID2 = provider.SerialNumber, provider.DeviceID, provider.DeviceID2
 	base.RefreshInterval = time.Duration(s.Library.RefreshIntervalSeconds) * time.Second
 	base.EPGHours = s.Library.GuideHours
 	base.MaxStreams, base.TranscodeMode = s.Playback.MaxStreams, s.Playback.TranscodeMode
