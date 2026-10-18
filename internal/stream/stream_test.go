@@ -152,7 +152,17 @@ func TestFFmpegSessionLifecycle(t *testing.T) {
 }
 
 func TestFailureTTLAndMediaValidation(t *testing.T) {
-	m, err := New(Config{MaxStreams: 1, SessionTTL: 300 * time.Millisecond}, func(context.Context, model.Item) (model.Source, error) {
+	probing := make(chan struct{})
+	var once sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(probing) })
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+	m, err := New(Config{MaxStreams: 1, SessionTTL: time.Second}, func(_ context.Context, item model.Item) (model.Source, error) {
+		if item.ID == "abandoned" {
+			return model.Source{URL: upstream.URL + "/source.ts", Live: true}, nil
+		}
 		return model.Source{URL: "file:///etc/passwd"}, nil
 	})
 	if err != nil {
@@ -190,16 +200,40 @@ func TestFailureTTLAndMediaValidation(t *testing.T) {
 	if w.Code != 404 {
 		t.Fatalf("traversal status: %d", w.Code)
 	}
-	deadline = time.Now().Add(2 * time.Second)
-	for m.Active() != 0 && time.Now().Before(deadline) {
+	// Keep a valid HTTP source actively probing, then stop heartbeats and let
+	// the real sweeper expire it. A failed/stopped session cannot prove TTL.
+	abandoned, err := m.Start(context.Background(), model.Item{ID: "abandoned", Kind: "live"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-probing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active stream never reached upstream")
+	}
+	if err = m.Heartbeat(abandoned.ID); err != nil {
+		t.Fatal(err)
+	}
+	if m.Active() != 1 {
+		t.Fatal("abandoned stream was not active before expiry")
+	}
+	if _, err := m.Start(context.Background(), model.Item{Kind: "live"}, 0); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("active abandoned stream did not hold capacity: %v", err)
+	}
+	sessionDir := filepath.Join(m.dir, abandoned.ID)
+	if _, err := os.Stat(sessionDir); err != nil {
+		t.Fatalf("active session output directory missing: %v", err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, sessionErr := m.Get(abandoned.ID)
+		_, pathErr := os.Stat(sessionDir)
+		if errors.Is(sessionErr, ErrNotFound) && m.Active() == 0 && os.IsNotExist(pathErr) {
+			return
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if m.Active() != 0 {
-		t.Fatal("abandoned stream did not expire")
-	}
-	if _, err := os.Stat(filepath.Join(m.dir, s.ID)); !os.IsNotExist(err) {
-		t.Fatalf("session files remain: %v", err)
-	}
+	t.Fatal("abandoned stream did not expire, release capacity, and remove its files")
 }
 
 func TestStartupDiagnosticsDoNotExposeProviderData(t *testing.T) {

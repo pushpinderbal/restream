@@ -116,7 +116,7 @@ func TestDiscoveryUnconfiguredReturnsImmediatelyWarmsOnceAndPersists(t *testing.
 	if p.calls.Load() != 2 || len(result.ExploreMovies) != 1 || len(result.ExploreSeries) != 1 || len(result.TrendingMovies) != 0 {
 		t.Fatal("provider warming was not bounded/shared", p.calls.Load(), result)
 	}
-	if result.ExploreMovies[0].Poster != "/api/images/movie:1" {
+	if !strings.HasPrefix(result.ExploreMovies[0].Poster, "/api/images/movie:1?v=") {
 		t.Fatal("provider artwork was not local", result.ExploreMovies)
 	}
 	readDiscovery(t, ts)
@@ -216,7 +216,7 @@ func TestDiscoveryMatchesOnlyConfirmedTitlesAndProxiesKnownArtwork(t *testing.T)
 	}
 	pixel, _ := base64.StdEncoding.DecodeString("R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=")
 	var imageCalls atomic.Int32
-	s.discoveryService.imageClient.Transport = discoveryTransport(func(req *http.Request) (*http.Response, error) {
+	s.artwork.client.Transport = discoveryTransport(func(req *http.Request) (*http.Response, error) {
 		imageCalls.Add(1)
 		if req.URL.Scheme != "https" || req.URL.Host != "image.tmdb.org" || req.URL.Path != "/t/p/w500/poster.jpg" || req.Header.Get("Authorization") != "" || req.URL.Query().Get("api_key") != "" {
 			t.Error("unsafe image fetch or credential forwarding")
@@ -236,6 +236,17 @@ func TestDiscoveryMatchesOnlyConfirmedTitlesAndProxiesKnownArtwork(t *testing.T)
 		if image := getArtwork(t, ts.URL+path); image.status != 404 {
 			t.Fatal("unknown client-selected image accepted", path)
 		}
+	}
+	// Browse expiry must not discard the saved discovery rail or playback items.
+	if _, err := s.cache.db.Exec(`UPDATE pages SET fetched_at=? WHERE kind='movie'`, time.Now().Add(-25*time.Hour).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	cached := readDiscovery(t, ts)
+	if len(cached.TrendingMovies) != len(result.TrendingMovies) || len(cached.ExploreMovies) != len(result.ExploreMovies) || len(cached.TrendingSeries) != len(result.TrendingSeries) {
+		t.Fatal("page expiry discarded the saved rail", cached)
+	}
+	if _, exists := s.cache.item("movie:1"); !exists {
+		t.Fatal("expiry removed the existing playback record")
 	}
 	if err := s.cache.invalidateLibrary(); err != nil {
 		t.Fatal(err)
@@ -320,7 +331,7 @@ func TestDiscoveryShutdownCancelsHeldProviderAndRejectsMetadataRedirects(t *test
 	case <-time.After(time.Second):
 		t.Fatal("shutdown waited on discovery provider request")
 	}
-	// The fixture's cleanup would otherwise close a closed ristretto cache.
+	// Shutdown leaves the discovery service closed and rejects new work.
 	s.discoveryService.mu.Lock()
 	closed := s.discoveryService.closed
 	s.discoveryService.mu.Unlock()
@@ -332,24 +343,5 @@ func TestDiscoveryShutdownCancelsHeldProviderAndRejectsMetadataRedirects(t *test
 		if s.discoveryService.client.CheckRedirect(req, nil) == nil {
 			t.Fatal("metadata credential redirect accepted", uri)
 		}
-	}
-}
-
-func TestDiscoveryRetainsSavedRailWhenBrowsePagesExpire(t *testing.T) {
-	s, ts := discoveryTestServer(t, Config{TMDBReadAccessToken: "private-token"}, matchingDiscoveryProvider())
-	configureDiscoveryMetadata(t, s, nil)
-	warm := waitDiscovery(t, ts)
-	if len(warm.TrendingMovies) == 0 {
-		t.Fatal("fixture did not produce available trends")
-	}
-	if _, err := s.cache.db.Exec(`UPDATE pages SET fetched_at=? WHERE kind='movie'`, time.Now().Add(-25*time.Hour).UnixNano()); err != nil {
-		t.Fatal(err)
-	}
-	cold := readDiscovery(t, ts)
-	if len(cold.TrendingMovies) != len(warm.TrendingMovies) || len(cold.ExploreMovies) != len(warm.ExploreMovies) || len(cold.TrendingSeries) != 1 {
-		t.Fatal("page expiry discarded the saved rail", cold)
-	}
-	if _, exists := s.cache.item("movie:1"); !exists {
-		t.Fatal("expiry removed the existing playback record")
 	}
 }

@@ -209,7 +209,7 @@ func TestEpisodeCooldownIsIndependentOfLibraryCadence(t *testing.T) {
 			p.version = 1
 			p.mu.Unlock()
 			s.cache.mu.Lock()
-			s.cache.episodesAt["series:2"] = time.Now().Add(-20 * time.Minute)
+			s.cache.episodesAt["series:2"] = time.Now().Add(-10 * time.Minute)
 			s.cache.mu.Unlock()
 			for range 12 {
 				libraryItems(t, ts, "/api/series/series:2/episodes", 1)
@@ -220,7 +220,7 @@ func TestEpisodeCooldownIsIndependentOfLibraryCadence(t *testing.T) {
 			}
 			p.mu.Unlock()
 			s.cache.mu.Lock()
-			s.cache.episodesAt["series:2"] = time.Now().Add(-31 * time.Minute)
+			s.cache.episodesAt["series:2"] = time.Now().Add(-16 * time.Minute)
 			s.cache.mu.Unlock()
 			libraryItems(t, ts, "/api/series/series:2/episodes", 1)
 			waitForLibraryItems(t, ts, "/api/series/series:2/episodes", 2)
@@ -234,7 +234,7 @@ func TestEpisodeCooldownIsIndependentOfLibraryCadence(t *testing.T) {
 	}
 }
 
-func TestScheduledLibraryRefreshKeepsFreshLists(t *testing.T) {
+func TestScheduledLibraryRefreshMakesBrowseLazyAndKeepsEpisodeFreshness(t *testing.T) {
 	s, ts, p := newChangingLibrary(t, 24*time.Hour)
 	paths := []string{"/api/browse?kind=series&category=*&page=1", "/api/browse?kind=movie&category=*&page=1", "/api/series/series:2/episodes"}
 	for _, path := range paths {
@@ -246,15 +246,20 @@ func TestScheduledLibraryRefreshKeepsFreshLists(t *testing.T) {
 	if err := s.doRefresh(true, false); err != nil {
 		t.Fatal(err)
 	}
-	for range 8 {
-		for _, path := range paths {
-			libraryItems(t, ts, path, 1)
-		}
+	p.mu.Lock()
+	if p.browseCalls != 2 || p.episodeCalls != 1 {
+		t.Fatal("scheduled refresh eagerly fetched lists", p.browseCalls, p.episodeCalls)
 	}
+	p.mu.Unlock()
+	for _, path := range paths[:2] {
+		libraryItems(t, ts, path, 1)
+		waitForLibraryItems(t, ts, path, 2)
+	}
+	libraryItems(t, ts, paths[2], 1)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.browseCalls != 2 || p.episodeCalls != 1 {
-		t.Fatal("scheduled refresh refetched cached listings", p.browseCalls, p.episodeCalls)
+	if p.browseCalls != 4 || p.episodeCalls != 1 {
+		t.Fatal("browse pages did not refresh lazily or episodes were invalidated", p.browseCalls, p.episodeCalls)
 	}
 }
 

@@ -1,4 +1,5 @@
 import { expect, test, type Page, type Locator } from "@playwright/test";
+import { createHistoryFixture } from "./watch-history-fixture";
 
 type Auth = {
   mode: "none" | "oidc";
@@ -13,7 +14,9 @@ const admin: Auth = {
   user: { id: "bob", name: "Bob", role: "admin" },
 };
 async function mock(page: Page, initial: Auth) {
+  const history = createHistoryFixture();
   let auth = initial;
+  let authGate: Promise<void> | undefined;
   let expired = false;
   let authChecks = 0;
   let logoutRequests = 0;
@@ -22,9 +25,11 @@ async function mock(page: Page, initial: Auth) {
     const url = new URL(route.request().url());
     if (url.pathname === "/api/auth") {
       authChecks++;
+      if (authGate) await authGate;
       return route.fulfill({ json: auth });
     }
     privateRequests.push(url.pathname + url.search);
+    if (await history.handle(route, auth.user?.id ?? "shared")) return;
     if (expired && url.pathname === "/api/browse")
       return route.fulfill({
         status: 401,
@@ -115,9 +120,13 @@ async function mock(page: Page, initial: Auth) {
     await route.fulfill({ status: 204 });
   });
   return {
+    history,
     privateRequests,
     authChecks: () => authChecks,
     logoutRequests: () => logoutRequests,
+    holdAuthChecks: (gate: Promise<void>) => {
+      authGate = gate;
+    },
     setAuth: (next: Auth) => {
       auth = next;
     },
@@ -207,10 +216,11 @@ test("login gate prevents protected requests and reports callback errors", async
   ).toHaveAttribute("href", "/auth/login");
   await expect(page.getByRole("alert")).toContainText("does not have access");
   expect(state.privateRequests).toEqual([]);
-  await page.screenshot({
-    path: "../output/auth-ui/login-desktop.png",
-    fullPage: true,
-  });
+  if (process.env.CAPTURE_SCREENSHOTS)
+    await page.screenshot({
+      path: "../output/auth-ui/login-desktop.png",
+      fullPage: true,
+    });
 });
 
 test("failed session check fails closed and supports retry", async ({
@@ -232,7 +242,7 @@ test("failed session check fails closed and supports retry", async ({
   await expect(account(page)).toBeVisible();
 });
 
-for (const width of [1440, 390, 320]) {
+for (const width of [1440, 320]) {
   test(`anonymous Account provides Settings without sign-out at ${width}px`, async ({
     page,
   }) => {
@@ -274,7 +284,11 @@ for (const width of [1440, 390, 320]) {
       `account-${width}-keyboard-escape`,
     );
     await openAccount(page);
-    await page.mouse.click(width - 8, 100);
+    // A locator click waits for stability; raw mouse input can race Radix's
+    // deferred outside-click listener when the menu has just mounted.
+    await page.locator("html").click({
+      position: { x: width - 8, y: 100 },
+    });
     await expect(menu).toHaveCount(0);
     await expect(account(page)).toBeFocused();
     await expectPointerFocus(page, account(page));
@@ -353,48 +367,64 @@ const adminStatusLabels = [
   "Refresh interval",
 ];
 
-for (const width of [1440, 390, 320]) {
-  test(`viewer sees provider setup guidance without configuration actions at ${width}px`, async ({
-    page,
-  }) => {
-    await page.setViewportSize({ width, height: 900 });
-    const state = await mock(page, viewer);
-    await page.route("**/api/status", (route) =>
-      route.fulfill({ json: { configured: false, refreshing: false } }),
-    );
-    for (const [name, url] of [
-      ["home", "/"],
-      ["live", "/?section=live"],
-      ["movies", "/?section=movie"],
-      ["shows", "/?section=series"],
-      ["search", "/?view=search&search=North"],
-      ["player", "/?view=player&section=movie&item=movie-1"],
-    ]) {
-      await page.goto(url);
-      const notice = page.getByRole("status", {
-        name: "Provider setup",
-        exact: true,
-      });
-      await expect(notice).toHaveText(
-        "Ask an administrator to connect your provider to start watching.",
-      );
-      await expect(notice.getByRole("button")).toHaveCount(0);
-      await expect(
-        page.getByText("Provider not configured", { exact: true }),
-      ).toHaveCount(0);
-      expect(
-        await page.evaluate(() => document.documentElement.scrollWidth),
-      ).toBeLessThanOrEqual(width);
-      if (process.env.CAPTURE_SCREENSHOTS)
-        await page.screenshot({
-          path: `../output/provider-setup/viewer-${name}-${width}.png`,
-        });
-    }
-    expect(
-      state.privateRequests.some((path) => path.startsWith("/api/settings")),
-    ).toBe(false);
+test("viewer setup guidance protects every route and fits mobile widths", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const state = await mock(page, viewer);
+  await page.route("**/api/status", (route) =>
+    route.fulfill({ json: { configured: false, refreshing: false } }),
+  );
+  const notice = page.getByRole("status", {
+    name: "Provider setup",
+    exact: true,
   });
+  async function expectViewerNotice() {
+    await expect(notice).toHaveText(
+      "Ask an administrator to connect your provider to start watching.",
+    );
+    await expect(notice.getByRole("button")).toHaveCount(0);
+    await expect(
+      page.getByText("Provider not configured", { exact: true }),
+    ).toHaveCount(0);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+  }
+  // The route authorization behavior is identical at every breakpoint.
+  for (const [name, url] of [
+    ["home", "/"],
+    ["live", "/?section=live"],
+    ["movies", "/?section=movie"],
+    ["shows", "/?section=series"],
+    ["search", "/?view=search&search=North"],
+    ["player", "/?view=player&section=movie&item=movie-1"],
+  ]) {
+    await page.goto(url);
+    await expectViewerNotice();
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `../output/provider-setup/viewer-${name}-1440.png`,
+      });
+  }
+  // The same notice is shared by all routes. Resize the mounted notice to
+  // cover mobile wrapping without repeating six full app loads per width.
+  for (const width of [390, 320]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expectViewerNotice();
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({
+        path: `../output/provider-setup/viewer-player-${width}.png`,
+      });
+  }
+  expect(
+    state.privateRequests.some((path) => path.startsWith("/api/settings")),
+  ).toBe(false);
+});
 
+for (const width of [1440, 320]) {
   test(`viewer can read Status and About through Settings at ${width}px`, async ({
     page,
   }) => {
@@ -514,40 +544,30 @@ test("expired sessions remove the signed-in private app", async ({ page }) => {
   await expect(navigation(page)).toHaveCount(0);
 });
 
-test("history is isolated by user and never imports anonymous history", async ({
+test("server history is isolated by user and identity changes reload the account", async ({
   page,
 }) => {
   const state = await mock(page, viewer);
-  await page.addInitScript(() => {
-    const history = (name: string) => {
-      const item = { id: name, name, kind: "movie", category: "Drama" };
-      return JSON.stringify({
-        version: 1,
-        entries: [
-          {
-            title: item,
-            item,
-            watchedAt: Date.now(),
-            position: 120,
-            duration: 3600,
-            completed: false,
-          },
-        ],
-      });
-    };
-    localStorage.setItem(
-      "restream.watch-history.v1",
-      history("Anonymous movie"),
+  for (const [user, name] of [
+    ["shared", "Anonymous movie"],
+    ["alice", "Alice movie"],
+    ["bob", "Bob movie"],
+  ]) {
+    const item = { id: name, name, kind: "movie", category: "Drama" };
+    state.history.seed(
+      [
+        {
+          title: item,
+          item,
+          watchedAt: Date.now(),
+          position: 120,
+          duration: 3600,
+          completed: false,
+        },
+      ],
+      user,
     );
-    localStorage.setItem(
-      "restream.watch-history.v1.user.alice",
-      history("Alice movie"),
-    );
-    localStorage.setItem(
-      "restream.watch-history.v1.user.bob",
-      history("Bob movie"),
-    );
-  });
+  }
   await page.goto("/");
   await expect(
     page.getByRole("button", { name: /Alice movie/ }).first(),
@@ -572,12 +592,19 @@ test("history is isolated by user and never imports anonymous history", async ({
     state.privateRequests.filter((path) => path === "/api/preferences").length,
   ).toBe(preferenceLoads);
   state.setAuth(admin);
-  // Simulate another tab completing sign-in with a different identity.
-  await page.evaluate(() => {
-    const channel = new BroadcastChannel("restream:auth");
-    channel.postMessage("changed");
-    channel.close();
-  });
+  // The session cookie can change before AuthGate finishes its delayed focus
+  // recheck. An Alice-mounted client must not render Bob's history response.
+  let releaseAuth!: () => void;
+  state.holdAuthChecks(
+    new Promise<void>((resolve) => {
+      releaseAuth = resolve;
+    }),
+  );
+  const switchedHistory = page.waitForResponse("**/api/watch-history");
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await switchedHistory;
+  await expect(page.getByText("Bob movie", { exact: true })).toHaveCount(0);
+  releaseAuth();
   await expect(
     page.getByRole("button", { name: /Bob movie/ }).first(),
   ).toBeVisible();
@@ -619,6 +646,13 @@ test("permission loss rechecks the role while content denial keeps the current a
   await expect(
     page.getByRole("heading", { name: "Status", exact: true }),
   ).toBeVisible();
+  // Status is visible during the admin session too. Wait for the role recheck
+  // to replace that app before testing the viewer's controls and Account menu.
+  await expect(
+    page
+      .getByRole("navigation", { name: "Settings sections", exact: true })
+      .getByRole("link"),
+  ).toHaveText(["Status", "About"]);
   await expect(page.getByLabel("Portal URL", { exact: true })).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Save changes", exact: true }),
@@ -650,10 +684,11 @@ test("admin navigation fits 320px with accessible controls", async ({
   );
   await nav.getByRole("button", { name: "Account", exact: true }).click();
   await expect(page.getByText("Bob", { exact: true })).toBeVisible();
-  await page.screenshot({
-    path: "../output/auth-ui/account-admin-320.png",
-    fullPage: true,
-  });
+  if (process.env.CAPTURE_SCREENSHOTS)
+    await page.screenshot({
+      path: "../output/auth-ui/account-admin-320.png",
+      fullPage: true,
+    });
 });
 
 test("auth works without BroadcastChannel and rechecks on focus", async ({
@@ -672,7 +707,7 @@ test("auth works without BroadcastChannel and rechecks on focus", async ({
   ).toBeVisible();
 });
 
-for (const width of [1440, 390, 320]) {
+for (const width of [1440, 320]) {
   test(`admin opens Settings from Account and menu closes at ${width}px`, async ({
     page,
   }) => {

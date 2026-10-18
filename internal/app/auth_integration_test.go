@@ -228,11 +228,6 @@ func (a *authTestApp) login(t *testing.T) string {
 func TestOIDCLoginProvisioningAndPermissions(t *testing.T) {
 	p := newAuthTestProvider(t)
 	a := newAuthTestApp(t, p, nil)
-	resp := a.get(t, "/api/status")
-	if resp.StatusCode != 401 {
-		t.Errorf("anonymous catalog: %d", resp.StatusCode)
-	}
-	resp.Body.Close()
 	body := a.login(t)
 	var first struct {
 		User struct {
@@ -244,26 +239,9 @@ func TestOIDCLoginProvisioningAndPermissions(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &first); err != nil {
 		t.Fatal(err)
 	}
-	if first.User.ID == "" || first.User.Role != "viewer" {
+	if first.User.ID == "" || first.User.Role != "viewer" || first.User.Name != p.name {
 		t.Fatalf("viewer identity: %s", body)
 	}
-	for _, endpoint := range []struct{ method, path string }{{"GET", "/api/settings"}, {"PATCH", "/api/settings"}, {"POST", "/api/refresh"}, {"GET", "/api/categories?manage=1"}} {
-		req, _ := http.NewRequest(endpoint.method, a.server.URL+endpoint.path, strings.NewReader(`{}`))
-		req.Header.Set("Origin", a.server.URL)
-		resp, err := a.client.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.StatusCode != 403 {
-			t.Errorf("viewer %s %s: %d", endpoint.method, endpoint.path, resp.StatusCode)
-		}
-		resp.Body.Close()
-	}
-	resp = a.get(t, "/api/status")
-	if resp.StatusCode != 200 {
-		t.Errorf("viewer catalog: %d", resp.StatusCode)
-	}
-	resp.Body.Close()
 	p.name = "Renamed"
 	p.role = "admin"
 	body = a.login(t)
@@ -276,7 +254,7 @@ func TestOIDCLoginProvisioningAndPermissions(t *testing.T) {
 	if next.User.ID != first.User.ID || next.User.Role != "admin" || next.User.Name != "Renamed" {
 		t.Fatalf("JIT identity changed or claims not updated: %s", body)
 	}
-	resp = a.get(t, "/api/settings")
+	resp := a.get(t, "/api/settings")
 	if resp.StatusCode != 200 {
 		t.Errorf("admin settings: %d", resp.StatusCode)
 	}

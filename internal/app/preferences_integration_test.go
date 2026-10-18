@@ -239,7 +239,7 @@ func TestDefaultRefreshCadenceAndLegacyPreferenceView(t *testing.T) {
 	if code != 200 || json.Unmarshal([]byte(body), &value) != nil || value.RefreshIntervalSeconds != 86400 || len(value.Categories) != 0 || value.Configuration.DashboardCategories == nil || value.Configuration.BlockedCategories == nil {
 		t.Fatal(code, body)
 	}
-	if s.refreshInterval(true) != 24*time.Hour || s.refreshInterval(false) != time.Hour || s.episodeTTL() != 30*time.Minute || s.discoveryRefreshInterval() != 24*time.Hour {
+	if s.refreshInterval(true) != 24*time.Hour || s.refreshInterval(false) != 12*time.Hour || s.discoveryRefreshInterval() != 24*time.Hour {
 		t.Fatal("configured cadence did not drive derived freshness")
 	}
 	for _, data := range []string{`{"refreshIntervalSeconds":60,"categories":[]}`, `not valid JSON`} {
@@ -449,20 +449,20 @@ func TestConfiguredCadenceSchedulesWithoutExtraProviderRequests(t *testing.T) {
 	waitFor(t, func() bool {
 		s.stateMu.RLock()
 		defer s.stateMu.RUnlock()
-		return s.catalogSync.NextRefreshAt != nil && s.epgSync.NextRefreshAt != nil && time.Until(*s.catalogSync.NextRefreshAt) < 61*time.Minute && time.Until(*s.epgSync.NextRefreshAt) < 61*time.Minute
+		return s.catalogSync.NextRefreshAt != nil && s.epgSync.NextRefreshAt != nil && time.Until(*s.catalogSync.NextRefreshAt) < 61*time.Minute && time.Until(*s.epgSync.NextRefreshAt) < 13*time.Hour
 	})
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.catalogs != catalogs || p.epgs != epgs {
 		t.Fatal("saving cadence forced provider requests", p.catalogs, p.epgs)
 	}
-	if s.episodeTTL() != 30*time.Minute || s.discoveryRefreshInterval() != time.Hour {
+	if s.discoveryRefreshInterval() != time.Hour {
 		t.Fatal("adaptive caches did not follow saved cadence")
 	}
 	// Successful requests can still return expired provider data. That must
 	// not turn the one-hour preference into an implicit minute retry loop.
 	last := time.Now().UTC()
-	for _, end := range []time.Time{last.Add(-time.Minute), last.Add(2 * time.Minute)} {
+	for _, end := range []time.Time{last.Add(2 * time.Minute), last.Add(20 * time.Minute)} {
 		if err := s.cache.setEPG([]model.Program{{ChannelID: "live:1", Title: "Old guide", Start: last.Add(-time.Hour), End: end}}); err != nil {
 			t.Fatal(err)
 		}

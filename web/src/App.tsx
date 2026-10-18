@@ -343,9 +343,9 @@ function App() {
   const visibleHistory = useMemo(
     () =>
       preferences
-        ? watchHistory.entries.filter((entry) => dashboardItem(entry.title))
+        ? watchHistory.entries.filter((entry) => visibleItem(entry.title))
         : [],
-    [watchHistory.entries, preferences, dashboardItem],
+    [watchHistory.entries, preferences, visibleItem],
   );
 
   useEffect(() => {
@@ -365,7 +365,7 @@ function App() {
         setManagedCategories(all.categories || []);
       })
       .catch(() => {
-        // Do not expose local history before the server's category choices load.
+        // Do not expose history before the server's category choices load.
       });
     return () => controller.abort();
   }, [status?.preferencesUpdatedAt, status?.catalogUpdatedAt, canAdmin]);
@@ -2001,37 +2001,65 @@ function PlayerPage({
     };
     const cached = episodeCache.current.get(key);
     if (cached) apply(cached);
-    void (async () => {
-      const deadline = Date.now() + 180000;
-      for (;;) {
-        const result = await request<{
-          items: Item[];
-          seasons?: number[];
-          season?: number;
-          refreshing?: boolean;
-        }>(
-          `/api/series/${encodeURIComponent(item.id)}/episodes?season=${requestedSeason ?? "first"}`,
-          { signal: controller.signal },
-        );
-        if (controller.signal.aborted) return;
-        episodeCache.current.set(key, result);
-        if (result.season !== undefined)
-          episodeCache.current.set(
-            `${item.id}:${refreshRevision}:${result.season}`,
-            result,
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let loading = false;
+    const load = async () => {
+      if (loading || document.hidden || controller.signal.aborted) return;
+      clearTimeout(timer);
+      loading = true;
+      try {
+        const deadline = Date.now() + 180000;
+        for (;;) {
+          const result = await request<{
+            items: Item[];
+            seasons?: number[];
+            season?: number;
+            refreshing?: boolean;
+            stale?: boolean;
+            refreshAfterSeconds?: number;
+          }>(
+            `/api/series/${encodeURIComponent(item.id)}/episodes?season=${requestedSeason ?? "first"}`,
+            { signal: controller.signal },
           );
-        apply(result);
-        if (!result.refreshing || Date.now() >= deadline) return;
-        await waitForRefresh(controller.signal);
+          if (controller.signal.aborted) return;
+          episodeCache.current.set(key, result);
+          if (result.season !== undefined)
+            episodeCache.current.set(
+              `${item.id}:${refreshRevision}:${result.season}`,
+              result,
+            );
+          apply(result);
+          if (!result.refreshing || Date.now() >= deadline) {
+            const seconds = result.refreshAfterSeconds ?? 15 * 60;
+            if (seconds > 0) {
+              const delay = Math.max(result.stale ? 60 : 1, seconds);
+              timer = setTimeout(() => void load(), delay * 1000);
+            }
+            return;
+          }
+          await waitForRefresh(controller.signal);
+        }
+      } catch (cause) {
+        if (!controller.signal.aborted) {
+          setEpisodesError(message(cause));
+          setEpisodesLoading(false);
+        }
+      } finally {
+        loading = false;
       }
-    })().catch((cause) => {
-      if (!controller.signal.aborted) {
-        setEpisodesError(message(cause));
-        setEpisodesLoading(false);
-      }
-    });
+    };
+    const resume = () => {
+      if (document.hidden) clearTimeout(timer);
+      else void load();
+    };
+    void load();
+    window.addEventListener("focus", resume);
+    document.addEventListener("visibilitychange", resume);
     return () => {
       controller.abort();
+      clearTimeout(timer);
+      window.removeEventListener("focus", resume);
+      document.removeEventListener("visibilitychange", resume);
     };
   }, [item.id, item.kind, episodeRetry, refreshRevision, requestedSeason]);
 

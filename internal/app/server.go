@@ -3,9 +3,10 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -18,7 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dgraph-io/ristretto/v2"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/pushpinderbal/restream/internal/model"
@@ -53,10 +53,7 @@ type Server struct {
 	browseMu               sync.Mutex
 	browseWG               sync.WaitGroup
 	browseClosed           bool
-	imageClient            *http.Client
-	imageCache             *ristretto.Cache[string, imageData]
-	imageFlights           singleflight.Group
-	imageFailureTTL        time.Duration
+	artwork                *artworkCache
 	discoveryService       *discoveryService
 	preferencesService     *preferencesService
 	sessionItemsMu         sync.Mutex
@@ -73,22 +70,10 @@ type refreshState struct {
 	LastSuccessfulAt *time.Time `json:"lastSuccessfulAt,omitempty"`
 	IntervalSeconds  float64    `json:"intervalSeconds"`
 	Error            string     `json:"error,omitempty"`
+	Failures         int        `json:"failures"`
+	Paused           bool       `json:"paused"`
+	Configuration    string     `json:"-"`
 }
-
-type imageData struct {
-	data     []byte
-	mime     string
-	fallback bool
-}
-
-const imageCacheTTL = time.Hour
-const defaultImageFailureTTL = 5 * time.Minute
-
-// The artwork endpoint always has a usable image for a known item, including
-// channels whose portal does not publish a logo.
-const defaultArtwork = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" role="img" aria-label="Artwork unavailable"><rect width="320" height="180" fill="#172033"/><rect x="109" y="55" width="102" height="70" rx="14" fill="#27354d" stroke="#536a92" stroke-width="2"/><path d="m147 77 37 13-37 13z" fill="#aec3e8"/></svg>`
-
-var fallbackArtwork = imageData{data: []byte(defaultArtwork), mime: "image/svg+xml", fallback: true}
 
 func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) {
 	if cfg.RefreshInterval <= 0 {
@@ -98,22 +83,33 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	if err != nil {
 		return nil, err
 	}
-	imageCache, err := ristretto.NewCache(&ristretto.Config[string, imageData]{NumCounters: 1024, MaxCost: 32 << 20, BufferItems: 64})
-	if err != nil {
+	if err := initWatchHistory(cache.db); err != nil {
 		_ = cache.close()
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{cfg: cfg, provider: provider, streams: streams, cache: cache, ctx: ctx, cancel: cancel, imageClient: &http.Client{Timeout: 12 * time.Second}, imageCache: imageCache, imageFailureTTL: defaultImageFailureTTL}
+	artwork, err := newArtworkCache(ctx, cache.db)
+	if err != nil {
+		cancel()
+		_ = cache.close()
+		return nil, err
+	}
+	s := &Server{cfg: cfg, provider: provider, streams: streams, cache: cache, ctx: ctx, cancel: cancel, artwork: artwork}
 	if err := s.initPreferences(); err != nil {
 		cancel()
-		imageCache.Close()
+		artwork.close()
 		_ = cache.close()
 		return nil, err
 	}
 	if err := s.initDiscovery(); err != nil {
 		cancel()
-		imageCache.Close()
+		artwork.close()
+		_ = cache.close()
+		return nil, err
+	}
+	if err := s.initScheduledRefresh(); err != nil {
+		cancel()
+		artwork.close()
 		_ = cache.close()
 		return nil, err
 	}
@@ -143,6 +139,10 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok\n")) })
 	mux.HandleFunc("GET /api/status", s.status)
 	mux.HandleFunc("/api/preferences", s.getPreferences)
+	mux.HandleFunc("/api/watch-history", s.watchHistory)
+	mux.HandleFunc("POST /api/watch-history/record", s.recordWatchHistory)
+	mux.HandleFunc("PATCH /api/watch-history/progress", s.progressWatchHistory)
+	mux.HandleFunc("POST /api/watch-history/undo", s.undoWatchHistory)
 	mux.HandleFunc("POST /api/refresh", s.refresh)
 	mux.HandleFunc("GET /api/catalog", s.catalog)
 	mux.HandleFunc("GET /api/categories", s.categories)
@@ -169,6 +169,17 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	}))
 	s.handler = s.headers(guard.Handler(mux))
 	if provider != nil {
+		// A warm library may not be due for hours after a restart or a settings
+		// change. Repair due discovery now without waiting for a dashboard read.
+		cache.mu.RLock()
+		last := cache.catalogAt
+		if _, ok := provider.(model.BrowseProvider); ok && cache.categoriesAt.Before(last) {
+			last = cache.categoriesAt
+		}
+		cache.mu.RUnlock()
+		if s.tmdbConfigured() && s.nextScheduledRefresh(true, last, s.refreshInterval(true)).After(time.Now()) {
+			s.queueDiscovery(cache.libraryRevision())
+		}
 		s.wg.Add(1)
 		go s.scheduler(true)
 		s.wg.Add(1)
@@ -183,12 +194,15 @@ func (s *Server) Close() {
 	s.browseMu.Unlock()
 	s.discoveryService.mu.Lock()
 	s.discoveryService.closed = true
+	if s.discoveryService.retryTimer != nil {
+		s.discoveryService.retryTimer.Stop()
+	}
 	s.discoveryService.mu.Unlock()
 	s.cancel()
 	s.wg.Wait()
 	s.browseWG.Wait()
 	s.discoveryService.wg.Wait()
-	s.imageCache.Close()
+	s.artwork.close()
 	_ = s.cache.close()
 }
 func (s *Server) headers(next http.Handler) http.Handler {
@@ -292,6 +306,17 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	s.stateMu.RUnlock()
 	catSync.IntervalSeconds, epgSync.IntervalSeconds = s.refreshInterval(true).Seconds(), s.refreshInterval(false).Seconds()
 	catSync.Error, epgSync.Error = catErr, epgErr
+	s.discoveryService.mu.Lock()
+	discoveryRecord := s.discoveryService.record
+	discoverySync := refreshState{Running: s.discoveryService.refreshing, Queued: discoveryRecord.Pending && discoveryRecord.Error == "", Paused: discoveryRecord.Paused, Failures: discoveryRecord.Failures, Error: discoveryRecord.Error, IntervalSeconds: s.discoveryRefreshInterval().Seconds()}
+	if !discoveryRecord.UpdatedAt.IsZero() {
+		discoverySync.LastSuccessfulAt = &discoveryRecord.UpdatedAt
+	}
+	if !discoveryRecord.NextAttempt.IsZero() {
+		discoverySync.NextRefreshAt = &discoveryRecord.NextAttempt
+	}
+	s.discoveryService.mu.Unlock()
+	discoveryRefreshing := discoverySync.Running || discoverySync.Queued
 	if cooldown.After(time.Now()) {
 		for _, state := range []*refreshState{&catSync, &epgSync} {
 			if state.NextRefreshAt != nil && cooldown.After(*state.NextRefreshAt) {
@@ -305,7 +330,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	if epgSync.LastSuccessfulAt == nil && !epg.IsZero() {
 		epgSync.LastSuccessfulAt = &epg
 	}
-	busy := catSync.Queued || catSync.Running || epgSync.Queued || epgSync.Running
+	busy := catSync.Queued || catSync.Running || epgSync.Queued || epgSync.Running || discoveryRefreshing
 	out := map[string]any{"configured": s.provider != nil, "refreshing": busy, "library": library}
 	if updated := policy.updatedAt; !updated.IsZero() {
 		out["preferencesUpdatedAt"] = updated
@@ -334,7 +359,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		active = s.streams.Active()
 	}
 	out["activeStreams"], out["maxStreams"] = active, s.cfg.MaxStreams
-	out["sync"] = map[string]any{"catalog": catSync, "epg": epgSync}
+	out["sync"] = map[string]any{"catalog": catSync, "epg": epgSync, "discovery": discoverySync}
 	out["timezone"], out["guideHours"] = s.cfg.Timezone, s.cfg.EPGHours
 	out["playback"] = map[string]any{"transcodeMode": s.cfg.TranscodeMode, "sessionTimeoutSeconds": s.cfg.SessionTTL.Seconds()}
 	if cooldown.After(time.Now()) {
@@ -395,6 +420,19 @@ func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
 		}
 		if !state.Running && !state.Queued {
 			state.Queued = true
+			state.Failures, state.Paused, state.Error = 0, false, ""
+			now := time.Now().UTC()
+			state.NextRefreshAt = &now
+			kind := "epg"
+			if idx == 0 {
+				kind = "metadata"
+			}
+			if err := s.saveScheduledRefresh(kind, *state); err != nil {
+				state.Queued = false
+				s.stateMu.Unlock()
+				fail(w, 500, "cache", "Could not prepare the refresh.")
+				return
+			}
 			select {
 			case s.refreshWake[idx] <- struct{}{}:
 			default:
@@ -408,6 +446,10 @@ func publicItems(items []model.Item) []model.Item {
 	out := make([]model.Item, 0, len(items))
 	for _, i := range items {
 		i.Image = "/api/images/" + url.PathEscape(i.ID)
+		if i.Logo != "" {
+			version := sha256.Sum256([]byte(i.Logo))
+			i.Image += "?v=" + hex.EncodeToString(version[:8])
+		}
 		out = append(out, i)
 	}
 	return out
@@ -498,7 +540,7 @@ func (s *Server) episodes(w http.ResponseWriter, r *http.Request) {
 		blocked(w)
 		return
 	}
-	respond(w, 200, map[string]any{"items": publicItems(items), "refreshing": status.Refreshing, "stale": status.Stale})
+	respond(w, 200, map[string]any{"items": publicItems(items), "refreshing": status.Refreshing, "stale": status.Stale, "refreshAfterSeconds": status.RefreshAfterSeconds})
 }
 func safeEpisodeLogID(id string) string {
 	value, ok := strings.CutPrefix(id, "series:")
@@ -543,109 +585,13 @@ func (s *Server) refreshInterval(catalog bool) time.Duration {
 	if catalog {
 		return cadence
 	}
-	return time.Hour
-}
-func (s *Server) scheduler(catalog bool) {
-	defer s.wg.Done()
-	interval := s.refreshInterval(catalog)
-	kind, idx, state := "epg", 1, &s.epgSync
-	if catalog {
-		kind, idx, state = "metadata", 0, &s.catalogSync
-	}
-	s.cache.mu.RLock()
-	last := s.cache.epgAt
-	if catalog {
-		last = s.cache.catalogAt
-		if _, ok := s.provider.(model.BrowseProvider); ok && s.cache.categoriesAt.Before(last) {
-			last = s.cache.categoriesAt
-		}
-	}
-	cooldown := s.cache.portalCooldownUntil
-	s.cache.mu.RUnlock()
-	next := s.nextScheduledRefresh(catalog, last, interval)
-	if cooldown.After(next) {
-		next = cooldown
-	}
-	failures := 0
-	for {
-		s.stateMu.Lock()
-		nextAt := next
-		state.NextRefreshAt = &nextAt
-		s.stateMu.Unlock()
-		timer := time.NewTimer(max(0, time.Until(next)))
-		select {
-		case <-s.ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		case <-s.refreshWake[idx]:
-			timer.Stop()
-		}
-		// A different worker can discover a shared provider cooldown while this
-		// scheduler is waiting. Recheck it before any provider request.
-		s.cache.mu.RLock()
-		cooldown = s.cache.portalCooldownUntil
-		s.cache.mu.RUnlock()
-		if cooldown.After(time.Now()) {
-			next = cooldown
-			s.stateMu.Lock()
-			select {
-			case <-s.refreshWake[idx]:
-			default:
-			}
-			state.Queued = false
-			s.stateMu.Unlock()
-			continue
-		}
-		s.stateMu.Lock()
-		// If the timer and a manual request arrived together, consume the wake
-		// here so it cannot trigger another refresh after this one completes.
-		select {
-		case <-s.refreshWake[idx]:
-		default:
-		}
-		started := time.Now().UTC()
-		state.Queued, state.Running, state.StartedAt = false, true, &started
-		state.NextRefreshAt = nil
-		s.stateMu.Unlock()
-		err := s.doRefresh(catalog, !catalog)
-		s.stateMu.Lock()
-		finished := time.Now().UTC()
-		state.Running, state.FinishedAt = false, &finished
-		if err == nil {
-			state.LastSuccessfulAt = &finished
-		}
-		s.stateMu.Unlock()
-		if s.ctx.Err() != nil {
-			return
-		}
-		if err != nil {
-			failures++
-			next = time.Now().Add(retryCooldown(err, failures))
-			var limited interface{ RetryDelay() time.Duration }
-			if errors.As(err, &limited) && limited.RetryDelay() > 0 {
-				_ = s.cache.setPortalCooldown(next)
-			}
-			slog.Info("Refresh retry scheduled", "kind", kind, "nextAt", next, "failures", failures)
-		} else {
-			failures = 0
-			last = finished
-			next = s.nextScheduledRefresh(catalog, last, s.refreshInterval(catalog))
-		}
-	}
-}
-func retryCooldown(err error, failures int) time.Duration {
-	var limited interface{ RetryDelay() time.Duration }
-	if errors.As(err, &limited) && limited.RetryDelay() > 0 {
-		return limited.RetryDelay()
-	}
-	return min(time.Minute<<min(max(failures-1, 0), 5), 30*time.Minute)
+	return guideRefreshInterval
 }
 func (s *Server) doRefresh(catalog, epg bool) error {
 	var refreshErr error
 	if catalog {
 		started := time.Now()
-		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Minute)
+		ctx, cancel := context.WithTimeout(s.ctx, refreshAttemptTimeout)
 		items, err := s.provider.Catalog(ctx)
 		if err == nil {
 			err = s.cache.setCatalog(items)
@@ -677,12 +623,25 @@ func (s *Server) doRefresh(catalog, epg bool) error {
 		s.stateMu.Lock()
 		s.catalogError = message
 		s.stateMu.Unlock()
+		if err == nil && s.tmdbConfigured() {
+			if _, ok := s.provider.(model.BrowseProvider); ok {
+				if discoveryErr := s.refreshDiscoveryAfterLibrary(s.cache.libraryRevision()); discoveryErr != nil && s.ctx.Err() == nil {
+					slog.Warn("Trending refresh did not finish; saved titles remain available")
+				}
+			}
+		}
 	}
 	if epg && s.ctx.Err() == nil {
 		started := time.Now()
-		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Minute)
+		ctx, cancel := context.WithTimeout(s.ctx, refreshAttemptTimeout)
 		programs, err := s.provider.EPG(ctx)
 		cancel()
+		if err == nil {
+			programs = usableGuide(programs, time.Now())
+			if len(programs) == 0 {
+				err = guideUnavailableError{}
+			}
+		}
 		message := ""
 		if err != nil {
 			if s.ctx.Err() != nil {
@@ -932,80 +891,10 @@ func (s *Server) image(w http.ResponseWriter, r *http.Request) {
 		blocked(w)
 		return
 	}
-	if item.Logo == "" {
-		writeImage(w, fallbackArtwork, s.imageFailureTTL)
-		return
-	}
-	u, err := url.Parse(item.Logo)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
-		writeImage(w, fallbackArtwork, s.imageFailureTTL)
-		return
-	}
-	key := u.String()
-	if cached, ok := s.imageCache.Get(key); ok {
-		writeImage(w, cached, s.imageFailureTTL)
-		return
-	}
-	value, err, _ := s.imageFlights.Do(key, func() (any, error) {
-		if cached, ok := s.imageCache.Get(key); ok {
-			return cached, nil
-		}
-		image, err := s.fetchImage(key)
-		ttl := imageCacheTTL
-		if err != nil {
-			image = fallbackArtwork
-			ttl = s.imageFailureTTL
-		}
-		s.imageCache.SetWithTTL(key, image, int64(len(image.data)), ttl)
-		s.imageCache.Wait()
-		return image, nil
-	})
+	result := s.artwork.get(r.Context(), item.Logo)
 	if s.blockedItem(item) {
 		blocked(w)
 		return
 	}
-	if err != nil {
-		writeImage(w, fallbackArtwork, s.imageFailureTTL)
-		return
-	}
-	writeImage(w, value.(imageData), s.imageFailureTTL)
-}
-func (s *Server) fetchImage(rawURL string) (imageData, error) {
-	req, err := http.NewRequestWithContext(s.ctx, "GET", rawURL, nil)
-	if err != nil {
-		return imageData{}, err
-	}
-	req.Header.Set("User-Agent", "Restream/1.0")
-	res, err := s.imageClient.Do(req)
-	if err != nil {
-		return imageData{}, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return imageData{}, fmt.Errorf("image upstream returned %d", res.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(res.Body, (5<<20)+1))
-	if err != nil {
-		return imageData{}, fmt.Errorf("image unreadable: %w", err)
-	}
-	if len(data) > 5<<20 {
-		return imageData{}, errors.New("image too large")
-	}
-	mime := http.DetectContentType(data)
-	switch mime {
-	case "image/jpeg", "image/png", "image/gif", "image/webp", "image/avif":
-	default:
-		return imageData{}, fmt.Errorf("invalid image type: %s", mime)
-	}
-	return imageData{data: data, mime: mime}, nil
-}
-func writeImage(w http.ResponseWriter, image imageData, failureTTL time.Duration) {
-	w.Header().Set("Content-Type", image.mime)
-	w.Header().Set("Content-Length", fmt.Sprint(len(image.data)))
-	ttl := imageCacheTTL
-	if image.fallback {
-		ttl = failureTTL
-	}
-	w.Header().Set("Cache-Control", fmt.Sprintf("private, max-age=%d", int(ttl.Seconds())))
-	w.Write(image.data)
+	writeArtwork(w, result)
 }

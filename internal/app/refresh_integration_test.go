@@ -46,7 +46,7 @@ func TestSettingsManualRefreshLifecycle(t *testing.T) {
 		return !out.Refreshing && out.Sync["catalog"].LastSuccessfulAt != nil && out.Sync["epg"].LastSuccessfulAt != nil && out.Sync["catalog"].NextRefreshAt != nil && out.Sync["epg"].NextRefreshAt != nil
 	})
 	initial := readStatus()
-	if initial.Sync["catalog"].IntervalSeconds != 3600 || initial.Sync["epg"].IntervalSeconds != 3600 || initial.Library["liveChannels"] != float64(1) || initial.Library["categories"] != float64(2) || initial.Timezone != cfg.Timezone {
+	if initial.Sync["catalog"].IntervalSeconds != 3600 || initial.Sync["epg"].IntervalSeconds != 43200 || initial.Library["liveChannels"] != float64(1) || initial.Library["categories"] != float64(2) || initial.Timezone != cfg.Timezone {
 		t.Fatal(initial)
 	}
 	gate := make(chan struct{})

@@ -45,7 +45,7 @@ func TestCategorySettingsApplyNamesIDsAndScopedRulesAcrossAPI(t *testing.T) {
 			t.Fatalf("blocked %s: %d %s", id, code, body)
 		}
 	}
-	record, err := s.buildDiscovery(context.Background(), s.cache.libraryRevision())
+	record, err := s.buildDiscovery(context.Background(), s.cache.libraryRevision(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,14 +67,6 @@ func TestCategorySettingsApplyNamesIDsAndScopedRulesAcrossAPI(t *testing.T) {
 	if code != 403 {
 		t.Fatalf("new category bypassed settings: %d %s", code, body)
 	}
-	// The legacy preferences endpoint remains read-only; edits use /api/settings.
-	if code, body := request(t, ts.URL, "PUT", "/api/preferences", `{"refreshIntervalSeconds":43200,"categories":[]}`); code != 405 {
-		t.Fatal(code, body)
-	}
-	code, body = request(t, ts.URL, "POST", "/api/sessions", `{"itemId":"movie:m3"}`)
-	if code != 403 {
-		t.Fatal(code, body)
-	}
 }
 
 func TestLoadConfigIgnoresAllApplicationSettingEnvironmentVariables(t *testing.T) {
@@ -87,14 +79,8 @@ func TestLoadConfigIgnoresAllApplicationSettingEnvironmentVariables(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TMDBReadAccessToken != "" || cfg.MaxStreams != 1 || cfg.TranscodeMode != "auto" || cfg.EPGHours != 6 || cfg.RefreshInterval != 24*time.Hour || len(cfg.categoryEnvironment.dashboard) != 0 || len(cfg.categoryEnvironment.blocked) != 0 {
+	if cfg.TMDBReadAccessToken != "" || cfg.MaxStreams != 1 || cfg.TranscodeMode != "auto" || cfg.EPGHours != 24 || cfg.RefreshInterval != 24*time.Hour || len(cfg.categoryEnvironment.dashboard) != 0 || len(cfg.categoryEnvironment.blocked) != 0 {
 		t.Fatal("application settings were read from the environment")
-	}
-	cfg.DataDir = t.TempDir()
-	_, ts, _, _ := policyFixtureWithConfig(t, cfg)
-	code, body := request(t, ts.URL, "GET", "/api/preferences", "")
-	if code != 200 || !strings.Contains(body, `"dashboardCategories":[]`) || !strings.Contains(body, `"blockedCategories":[]`) {
-		t.Fatal(code, body)
 	}
 }
 

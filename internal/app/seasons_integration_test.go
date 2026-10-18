@@ -140,7 +140,7 @@ func TestSeasonNavigationAndSelectedEpisodesRevalidateIndependently(t *testing.T
 	p.newSeason, p.gate = true, gate
 	p.seasonMu.Unlock()
 	s.cache.mu.Lock()
-	s.cache.episodesAt["series:2#seasons"] = time.Now().Add(-31 * time.Minute)
+	s.cache.episodesAt["series:2#seasons"] = time.Now().Add(-16 * time.Minute)
 	s.cache.mu.Unlock()
 	for range 12 {
 		libraryItems(t, ts, path, 1)
@@ -157,7 +157,7 @@ func TestSeasonNavigationAndSelectedEpisodesRevalidateIndependently(t *testing.T
 		return strings.Contains(body, `"seasons":[1,5,6]`)
 	})
 	s.cache.mu.Lock()
-	s.cache.episodesAt["series:2#season:season:2:11"] = time.Now().Add(-31 * time.Minute)
+	s.cache.episodesAt["series:2#season:season:2:11"] = time.Now().Add(-25 * time.Hour)
 	s.cache.mu.Unlock()
 	libraryItems(t, ts, path, 1)
 	waitFor(t, func() bool { p.seasonMu.Lock(); defer p.seasonMu.Unlock(); return len(p.loaded) == 2 })
@@ -168,5 +168,47 @@ func TestSeasonNavigationAndSelectedEpisodesRevalidateIndependently(t *testing.T
 	defer p.seasonMu.Unlock()
 	if p.navigation != 2 || len(p.loaded) != 2 || p.loaded[0] != 1 || p.loaded[1] != 1 {
 		t.Fatal("cooldowns repeated work or eagerly loaded other seasons", p.navigation, p.loaded)
+	}
+}
+
+func TestLatestSeasonRefreshesBeforeOlderSeasonWithoutPollingUnusedShows(t *testing.T) {
+	p := &seasonFixture{}
+	s, err := New(Config{DataDir: t.TempDir(), WebDir: t.TempDir(), RefreshInterval: 24 * time.Hour}, p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
+	t.Cleanup(func() { ts.Close(); s.Close() })
+	waitFor(t, func() bool { return !s.cache.libraryRevision().IsZero() })
+	libraryItems(t, ts, "/api/browse?kind=series&category=7&page=1", 1)
+	for _, season := range []string{"1", "5"} {
+		libraryItems(t, ts, "/api/series/series:2/episodes?season="+season, 1)
+	}
+	s.cache.mu.Lock()
+	s.cache.episodesAt["series:2#seasons"] = time.Now().Add(-10 * time.Minute)
+	s.cache.episodesAt["series:2#season:season:2:11"] = time.Now().Add(-20 * time.Minute)
+	s.cache.episodesAt["series:2#season:season:2:55"] = time.Now().Add(-20 * time.Minute)
+	s.cache.mu.Unlock()
+	for range 5 {
+		libraryItems(t, ts, "/api/series/series:2/episodes?season=1", 1)
+	}
+	p.seasonMu.Lock()
+	if len(p.loaded) != 2 {
+		t.Error("older season was fetched before its 24-hour deadline", p.loaded)
+	}
+	p.seasonMu.Unlock()
+	libraryItems(t, ts, "/api/series/series:2/episodes?season=5", 1)
+	waitFor(t, func() bool { p.seasonMu.Lock(); defer p.seasonMu.Unlock(); return len(p.loaded) == 3 })
+	code, body := request(t, ts.URL, "GET", "/api/series/series:2/episodes?season=5", "")
+	var data struct {
+		RefreshAfterSeconds int `json:"refreshAfterSeconds"`
+	}
+	if code != 200 || json.Unmarshal([]byte(body), &data) != nil || data.RefreshAfterSeconds < 1 || data.RefreshAfterSeconds > 15*60 {
+		t.Fatal("missing next freshness check", code, body)
+	}
+	p.seasonMu.Lock()
+	defer p.seasonMu.Unlock()
+	if p.navigation != 1 || p.loaded[2] != 5 {
+		t.Fatal("latest-season refresh fetched unrelated data", p.navigation, p.loaded)
 	}
 }

@@ -344,10 +344,6 @@ func (s *Server) policyMedia(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) episodeTTL() time.Duration {
-	return 30 * time.Minute
-}
-
 func (s *Server) discoveryRefreshInterval() time.Duration {
 	return s.refreshInterval(true)
 }
@@ -361,19 +357,11 @@ func (s *Server) nextScheduledRefresh(catalog bool, last time.Time, interval tim
 		return next
 	}
 	s.cache.mu.RLock()
-	var coverage time.Time
-	for _, program := range s.cache.programs {
-		if program.End.After(coverage) {
-			coverage = program.End
-		}
-	}
+	programs := append([]model.Program(nil), s.cache.programs...)
 	s.cache.mu.RUnlock()
-	headroom := min(interval, 15*time.Minute)
-	if coverage.After(last.Add(headroom)) {
-		beforeExpiry := maxTime(last.Add(headroom), coverage.Add(-15*time.Minute))
-		if beforeExpiry.Before(next) {
-			next = beforeExpiry
-		}
+	coverage := guideCoverageEnd(programs, last)
+	if !coverage.IsZero() {
+		next = minTime(next, maxTime(last.Add(guideMinimumRefreshInterval), coverage.Add(-guideCoverageMargin)))
 	}
 	return next
 }

@@ -726,7 +726,10 @@ func TestRootRedirectAndPortalVariants(t *testing.T) {
 		case "series/get_ordered_list":
 			http.Error(w, "unsupported", http.StatusNotFound)
 		case "itv/get_epg_info":
-			if q.Get("period") == "6" {
+			if q.Get("period") != "24" {
+				t.Errorf("guide request missing requested coverage: %v", q)
+			}
+			if q.Get("ch_id") == "" {
 				send([]any{})
 				return
 			}
@@ -914,6 +917,10 @@ func TestPlaintextAuthorizationRecovery(t *testing.T) {
 			if tc.persistent && (!strings.Contains(e.Error(), "authorization failed") || handshakes != 2 || denials != 2) {
 				t.Fatalf("persistent denial did not stop once: %v, handshakes=%d denials=%d", e, handshakes, denials)
 			}
+			var permanent interface{ Permanent() bool }
+			if tc.persistent && (!errors.As(e, &permanent) || !permanent.Permanent()) {
+				t.Fatalf("persistent denial must pause background retries: %v", e)
+			}
 			if tc.html && (handshakes != 1 || denials != 1 || !strings.Contains(e.Error(), "invalid data")) {
 				t.Fatalf("HTML triggered auth retry: %v, handshakes=%d denials=%d", e, handshakes, denials)
 			}
@@ -956,7 +963,7 @@ func TestBulkEPGFailuresDoNotFanOut(t *testing.T) {
 						send([]any{})
 						return
 					}
-					if q.Get("period") != "6" {
+					if q.Get("period") != "24" {
 						t.Errorf("unexpected EPG period: %v", q)
 					}
 					bulkCalls.Add(1)
@@ -992,7 +999,7 @@ func TestBulkEPGFailuresDoNotFanOut(t *testing.T) {
 		})
 	}
 	c, e := New(Config{PortalURL: "https://example.test/server/load.php", MAC: "aa:bb"})
-	if e != nil || c.cfg.EPGHours != 6 || c.http.Timeout != time.Minute {
+	if e != nil || c.cfg.EPGHours != 24 || c.http.Timeout != time.Minute {
 		t.Fatalf("defaults: %+v %v", c, e)
 	}
 	custom := &http.Client{Timeout: 2 * time.Second}

@@ -12,26 +12,57 @@ import (
 	"github.com/pushpinderbal/restream/internal/model"
 )
 
+const (
+	episodeListFreshness = 15 * time.Minute
+	olderSeasonFreshness = 24 * time.Hour
+)
+
 // Navigation and each selected season have independent shared cooldowns.
 func (s *Server) loadEpisodeList(r *http.Request, series model.Item, key string, revision time.Time, load func(context.Context) ([]model.Item, error)) ([]model.Item, cacheStatus, error) {
-	items, cached, fresh := s.cache.episodeSnapshot(key, s.episodeTTL())
+	return s.loadEpisodeListWithTTL(r, series, key, revision, episodeListFreshness, load)
+}
+
+func (s *Server) episodeCacheStatus(key string, ttl time.Duration) cacheStatus {
+	s.cache.mu.RLock()
+	at := s.cache.episodesAt[key]
+	s.cache.mu.RUnlock()
+	seconds := int(time.Until(at.Add(ttl)).Seconds())
+	return cacheStatus{RefreshAfterSeconds: max(1, seconds)}
+}
+
+func (s *Server) loadEpisodeListWithTTL(r *http.Request, series model.Item, key string, revision time.Time, ttl time.Duration, load func(context.Context) ([]model.Item, error)) ([]model.Item, cacheStatus, error) {
+	items, cached, fresh := s.cache.episodeSnapshot(key, ttl)
 	if fresh {
-		return items, cacheStatus{}, nil
+		return items, s.episodeCacheStatus(key, ttl), nil
 	}
-	status := cacheStatus{Stale: true}
+	status := cacheStatus{Stale: true, RefreshAfterSeconds: 15}
 	entry := "episodes:" + key
 	eligible, err := s.cacheEligible(entry)
 	if err != nil {
+		if cached {
+			return items, status, nil
+		}
 		return items, status, err
 	}
 	if !eligible {
+		retry, err := s.cache.cacheRetry(entry)
+		if err != nil {
+			return items, status, err
+		}
+		s.cache.mu.RLock()
+		cooldown := s.cache.portalCooldownUntil
+		s.cache.mu.RUnlock()
+		status.RefreshAfterSeconds = max(1, int(time.Until(maxTime(retry.next, cooldown)).Seconds())+1)
+		if retry.paused {
+			status.RefreshAfterSeconds = 0
+		}
 		if cached {
 			return items, status, nil
 		}
 		return nil, status, errCacheRetry
 	}
 	result := s.cacheFlight(&s.episodeFlights, entry+"\x00"+revision.Format(time.RFC3339Nano), func() (any, error) {
-		if saved, fresh := s.cache.getEpisodes(key, s.episodeTTL()); fresh {
+		if saved, fresh := s.cache.getEpisodes(key, ttl); fresh {
 			return saved, nil
 		}
 		eligible, err := s.cacheEligible(entry)
@@ -55,9 +86,9 @@ func (s *Server) loadEpisodeList(r *http.Request, series model.Item, key string,
 			return nil, err
 		}
 		if err = s.cache.setEpisodeListAtRevision(series.ID, key, loaded, revision); err != nil {
-			return nil, err
-		}
-		if _, err = s.cache.db.Exec(`DELETE FROM cache_retries WHERE entry=?`, entry); err != nil {
+			if saveErr := s.cache.cacheFailed(entry, err); saveErr != nil {
+				return nil, saveErr
+			}
 			return nil, err
 		}
 		return loaded, nil
@@ -70,7 +101,7 @@ func (s *Server) loadEpisodeList(r *http.Request, series model.Item, key string,
 	if err != nil {
 		return nil, status, err
 	}
-	return value.([]model.Item), cacheStatus{}, nil
+	return value.([]model.Item), s.episodeCacheStatus(key, ttl), nil
 }
 
 func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series model.Item) {
@@ -125,11 +156,18 @@ func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series m
 		if row.Kind == "season" && supportsSeasons {
 			key := series.ID + "#season:" + row.ID
 			var episodeStatus cacheStatus
-			items, episodeStatus, err = s.loadEpisodeList(r, series, key, revision, func(ctx context.Context) ([]model.Item, error) {
+			ttl := episodeListFreshness
+			// A known later season makes this an older season. Missing or
+			// ambiguous numbering keeps the conservative current-season TTL.
+			if number > 0 && len(seasons) > 0 && seasons[len(seasons)-1] > number {
+				ttl = olderSeasonFreshness
+			}
+			items, episodeStatus, err = s.loadEpisodeListWithTTL(r, series, key, revision, ttl, func(ctx context.Context) ([]model.Item, error) {
 				return provider.SeasonEpisodes(ctx, series, row)
 			})
 			status.Stale = status.Stale || episodeStatus.Stale
 			status.Refreshing = status.Refreshing || episodeStatus.Refreshing
+			status.RefreshAfterSeconds = min(status.RefreshAfterSeconds, episodeStatus.RefreshAfterSeconds)
 			if err != nil {
 				seasonFailure(w, err)
 				return
@@ -149,7 +187,7 @@ func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series m
 		blocked(w)
 		return
 	}
-	respond(w, 200, map[string]any{"items": publicItems(items), "seasons": seasons, "season": number, "refreshing": status.Refreshing, "stale": status.Stale})
+	respond(w, 200, map[string]any{"items": publicItems(items), "seasons": seasons, "season": number, "refreshing": status.Refreshing, "stale": status.Stale, "refreshAfterSeconds": status.RefreshAfterSeconds})
 }
 
 func seasonFailure(w http.ResponseWriter, err error) {

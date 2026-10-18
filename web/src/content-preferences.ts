@@ -58,7 +58,7 @@ export function createContentPolicy(
   const byName = new Map<string, CategoryPreference>();
   const priority = (rule: CategoryPreference) =>
     rule.visibility === "block" ? 2 : !rule.dashboard ? 1 : 0;
-  // Older local history may have a category name without its provider ID.
+  // History entries may have a category name without its provider ID.
   for (const category of categories) {
     const rule = configuration
       ? environmentRule(category.kind, category.id, category.name)

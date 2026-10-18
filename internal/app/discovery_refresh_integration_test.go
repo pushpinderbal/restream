@@ -38,6 +38,71 @@ func stagedMetadata(s *Server, movies []tmdbTitle) *atomic.Int32 {
 	return calls
 }
 
+func TestDiscoveryGlobalSearchFiltersHomeCategoriesAndRechecksOldMiss(t *testing.T) {
+	allowed := model.Item{ID: "series:allowed", Kind: "series", Name: "New Show", Year: 2025, CategoryID: "1"}
+	excluded := model.Item{ID: "series:excluded", Kind: "series", Name: "New Show", Year: 2025, CategoryID: "2"}
+	queries := make(chan model.BrowseQuery, 8)
+	p := &stagedDiscoveryProvider{browse: func(_ context.Context, q model.BrowseQuery) (model.BrowsePage, error) {
+		queries <- q
+		page := model.BrowsePage{Items: []model.Item{}, Page: 1}
+		if q.Search == "New Show" {
+			page.Items = []model.Item{excluded, allowed}
+			page.Total = len(page.Items)
+		}
+		return page, nil
+	}}
+	s, ts := discoveryTestServer(t, Config{TMDBReadAccessToken: "private-token"}, p)
+	if err := s.cache.setCategories([]model.Category{
+		{ID: "1", Kind: "series", Name: "Home shows", SourceType: "vod"},
+		{ID: "2", Kind: "series", Name: "Other shows", SourceType: "vod"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deployTestConfiguration(t, s, 21600, CategoryPreference{Kind: "series", ID: "2", Visibility: "show", Dashboard: false})
+	s.discoveryService.client.Transport = discoveryTransport(func(*http.Request) (*http.Response, error) {
+		t.Error("fresh metadata should have been reused")
+		return nil, nil
+	})
+	title := tmdbTitle{ID: 123, Name: "New Show", FirstAirDate: "2025-01-01"}
+	policy := s.preferencesSnapshot().updatedAt
+	s.discoveryService.mu.Lock()
+	s.discoveryService.record = discoveryRecord{
+		Version: 1, Revision: s.cache.libraryRevision(), PreferencesUpdatedAt: policy,
+		HadMetadata: true, UpdatedAt: time.Now().Add(-time.Hour), NextAttempt: time.Now().Add(time.Hour),
+		Metadata: map[string]discoveryMetadata{"series": {Titles: []tmdbTitle{title}, FetchedAt: time.Now()}},
+		Matches: map[string]discoveryMatch{discoveryMatchKey("series", title.ID): {
+			CheckedAt: time.Now(), Revision: s.cache.libraryRevision(), Policy: policy,
+		}},
+	}
+	s.discoveryService.mu.Unlock()
+
+	result := waitDiscovery(t, ts)
+	if len(result.TrendingSeries) != 1 || result.TrendingSeries[0].Item.ID != allowed.ID {
+		t.Fatal("provider-wide match escaped Home policy or old miss was reused", result.TrendingSeries)
+	}
+	searches := 0
+	for len(queries) > 0 {
+		q := <-queries
+		if q.Search == "" {
+			if q.Category != "1" {
+				t.Fatal("unfiltered discovery fetched an excluded category", q)
+			}
+			continue
+		}
+		searches++
+		if q.Category != "*" || q.Kind != "series" || q.SourceType != "vod" || q.Search != title.name() {
+			t.Fatal("search was not provider-wide", q)
+		}
+	}
+	if searches != 1 {
+		t.Fatal("expected one provider-wide search", searches)
+	}
+	readDiscovery(t, ts)
+	if len(queries) != 0 {
+		t.Fatal("saved discovery searched again before its refresh deadline")
+	}
+}
+
 func TestDiscoveryPublishesMatchesBeforeSlowSearchAndResumesAfterRestart(t *testing.T) {
 	first := model.Item{ID: "movie:first", Kind: "movie", Name: "First film", Year: 2025}
 	second := model.Item{ID: "movie:second", Kind: "movie", Name: "Second film", Year: 2025}
@@ -112,7 +177,7 @@ func TestDiscoveryKeepsCachedRailAndArtworkUntilRemovalIsConfirmed(t *testing.T)
 	}}
 	s, ts := discoveryTestServer(t, Config{TMDBReadAccessToken: "private-token"}, p)
 	metadata := stagedMetadata(s, []tmdbTitle{{ID: 1, Title: film.Name, ReleaseDate: "2025-01-01", Poster: "/poster.jpg"}})
-	s.discoveryService.imageClient.Transport = discoveryTransport(func(*http.Request) (*http.Response, error) {
+	s.artwork.client.Transport = discoveryTransport(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("GIF89a"))}, nil
 	})
 	warm := waitDiscovery(t, ts)

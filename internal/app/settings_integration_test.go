@@ -211,7 +211,7 @@ func TestApplicationSettingsTokenChangeRetainsRailAndRetriesMetadata(t *testing.
 	if w := settingsRequest(t, runtime, "PATCH", `{"discovery":{"tmdbReadAccessToken":"old-token"}}`); w.Code != 200 {
 		t.Fatal(w.Body)
 	}
-	record := discoveryRecord{Version: 1, HadMetadata: true, NextAttempt: time.Now().Add(time.Hour), Metadata: map[string]discoveryMetadata{"movie": {FetchedAt: time.Now()}}, Movies: []DiscoveryTitle{{Name: "Saved movie"}}}
+	record := discoveryRecord{Version: 1, HadMetadata: true, Failures: discoveryRetryLimit + 1, NextAttempt: time.Now().Add(time.Hour), Metadata: map[string]discoveryMetadata{"movie": {FetchedAt: time.Now()}}, Movies: []DiscoveryTitle{{Name: "Saved movie"}}}
 	data, _ := json.Marshal(record)
 	if _, err = runtime.server.cache.db.Exec(`INSERT INTO discovery(id,data) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`, data); err != nil {
 		t.Fatal(err)
@@ -221,8 +221,43 @@ func TestApplicationSettingsTokenChangeRetainsRailAndRetriesMetadata(t *testing.
 		t.Fatal(w.Body)
 	}
 	got := runtime.server.discoveryService.record
-	if !got.NextAttempt.IsZero() || len(got.Metadata) != 0 || len(got.Movies) != 1 {
+	if !got.NextAttempt.IsZero() || got.Failures != 0 || len(got.Metadata) != 0 || len(got.Movies) != 1 {
 		t.Fatalf("token change did not invalidate metadata while retaining saved rail: %+v", got)
+	}
+}
+
+func TestProviderIdentityChangeClearsListingAuthenticationPause(t *testing.T) {
+	for _, patch := range []string{
+		`{"provider":{"timezone":"Europe/London"}}`,
+		`{"provider":{"serialNumber":"new-serial"}}`,
+		`{"provider":{"deviceId":"new-device"}}`,
+		`{"provider":{"deviceId2":"new-device-2"}}`,
+	} {
+		t.Run(patch, func(t *testing.T) {
+			runtime, err := NewRuntime(Config{DataDir: t.TempDir(), WebDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer runtime.Close()
+			if _, err := runtime.db.Exec(`INSERT INTO cache_retries(entry,failures,retry_at,paused) VALUES('episodes:series:1',1,0,1)`); err != nil {
+				t.Fatal(err)
+			}
+			runtime.server.cache.rememberCacheRetry("episodes:series:1", cacheRetryState{paused: true})
+			if response := settingsRequest(t, runtime, "PATCH", `{"playback":{"maxStreams":2}}`); response.Code != 200 {
+				t.Fatal(response.Code, response.Body)
+			}
+			state, err := runtime.server.cache.cacheRetry("episodes:series:1")
+			if err != nil || !state.paused {
+				t.Fatal("unrelated settings cleared authentication pause", state, err)
+			}
+			if response := settingsRequest(t, runtime, "PATCH", patch); response.Code != 200 {
+				t.Fatal(response.Code, response.Body)
+			}
+			state, err = runtime.server.cache.cacheRetry("episodes:series:1")
+			if err != nil || state.paused || state.failures != 0 {
+				t.Fatal("provider identity retained old retry state", state, err)
+			}
+		})
 	}
 }
 

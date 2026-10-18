@@ -77,6 +77,7 @@ type store struct {
 	libraryRefreshedAt                                 time.Time
 	libraryInvalidatedAt                               time.Time
 	portalCooldownUntil                                time.Time
+	retryFallback                                      map[string]cacheRetryState
 	catalogJSON, epgJSON                               []byte
 	catalogETag, epgETag                               string
 }
@@ -118,7 +119,8 @@ func openStore(dir, portal, mac string) (*store, error) {
  CREATE TABLE IF NOT EXISTS epg(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL);
  CREATE TABLE IF NOT EXISTS discovery(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL);
  CREATE TABLE IF NOT EXISTS listing_revisions(listing TEXT PRIMARY KEY,revision INTEGER NOT NULL);
- CREATE TABLE IF NOT EXISTS cache_retries(entry TEXT PRIMARY KEY,failures INTEGER NOT NULL,retry_at INTEGER NOT NULL);`); err != nil {
+ CREATE TABLE IF NOT EXISTS scheduled_refresh(kind TEXT PRIMARY KEY,data BLOB NOT NULL);
+ CREATE TABLE IF NOT EXISTS cache_retries(entry TEXT PRIMARY KEY,failures INTEGER NOT NULL,retry_at INTEGER NOT NULL,paused INTEGER NOT NULL DEFAULT 0);`); err != nil {
 		return fail(err)
 	}
 	if err = os.Chmod(path, 0600); err != nil {
@@ -283,7 +285,7 @@ func (s *store) clearForProvider() error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"items", "pages", "categories", "episodes", "epg", "discovery", "listing_revisions", "cache_retries", "meta"} {
+	for _, table := range []string{"items", "pages", "categories", "episodes", "epg", "discovery", "listing_revisions", "cache_retries", "scheduled_refresh", "meta"} {
 		if _, err = tx.Exec("DELETE FROM " + table); err != nil {
 			return err
 		}
@@ -618,6 +620,9 @@ func (s *store) invalidateLibrary() error {
 	if _, err = tx.Exec(`UPDATE episodes SET fetched_at=0`); err != nil {
 		return err
 	}
+	if _, err = tx.Exec(`DELETE FROM cache_retries`); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	if err = putMeta(tx, "library_invalidated_at", now.Format(time.RFC3339Nano)); err != nil {
 		return err
@@ -633,19 +638,35 @@ func (s *store) invalidateLibrary() error {
 	}
 	s.libraryRefreshedAt = now
 	s.libraryInvalidatedAt = now
+	s.retryFallback = nil
 	return nil
 }
 
-// Scheduled metadata refreshes publish a revision without expiring useful lists.
+// A successful metadata refresh makes saved browse pages due without fetching
+// the catalogue. Episode freshness is independent of the library schedule.
 func (s *store) publishLibrary() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	_, err := s.db.Exec(`INSERT INTO meta(key,value) VALUES('library_refreshed_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, now.Format(time.RFC3339Nano))
-	if err == nil {
-		s.libraryRefreshedAt = now
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-	return err
+	defer tx.Rollback()
+	if _, err = tx.Exec(`UPDATE pages SET fetched_at=0 WHERE kind IN ('movie','series')`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE listing_revisions SET revision=revision+1`); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if err = putMeta(tx, "library_refreshed_at", now.Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.libraryRefreshedAt = now
+	return nil
 }
 
 func (s *store) cacheRevision() time.Time {
@@ -735,11 +756,15 @@ func (s *store) setEpisodeListAtRevision(seriesID, key string, items []model.Ite
 			return err
 		}
 	}
+	if _, err = tx.Exec(`DELETE FROM cache_retries WHERE entry=?`, "episodes:"+key); err != nil {
+		return err
+	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
 	s.episodes[key] = items
 	s.episodesAt[key] = time.Now()
+	delete(s.retryFallback, "episodes:"+key)
 	for _, i := range items {
 		if i.Kind == "season" {
 			continue

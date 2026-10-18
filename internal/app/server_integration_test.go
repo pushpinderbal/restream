@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/pushpinderbal/restream/internal/stream"
@@ -25,14 +24,13 @@ type fixtureProvider struct {
 	categoryCalls                int
 	browseGate                   <-chan struct{}
 	fail                         bool
-	imageURL                     string
 	catalogGate                  <-chan struct{}
 }
 
 func (p *fixtureProvider) Catalog(ctx context.Context) ([]model.Item, error) {
 	p.mu.Lock()
 	p.catalogs++
-	fail, imageURL, gate := p.fail, p.imageURL, p.catalogGate
+	fail, gate := p.fail, p.catalogGate
 	p.mu.Unlock()
 	if gate != nil {
 		select {
@@ -44,10 +42,7 @@ func (p *fixtureProvider) Catalog(ctx context.Context) ([]model.Item, error) {
 	if fail {
 		return nil, fmt.Errorf("unavailable")
 	}
-	if imageURL == "" {
-		imageURL = "http://provider.invalid/secret-logo"
-	}
-	return []model.Item{{ID: "live:1", Kind: "live", Name: "News", Category: "General", Command: "secret-command", ProviderID: "1", Logo: imageURL}}, nil
+	return []model.Item{{ID: "live:1", Kind: "live", Name: "News", Category: "General", Command: "secret-command", ProviderID: "1", Logo: "http://provider.invalid/secret-logo"}}, nil
 }
 func (p *fixtureProvider) EPG(ctx context.Context) ([]model.Program, error) {
 	p.mu.Lock()
@@ -219,13 +214,21 @@ func TestHTTPUnconfiguredAndValidation(t *testing.T) {
 
 func TestCatalogETag(t *testing.T) {
 	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", RefreshInterval: time.Hour}
-	s, err := New(cfg, &fixtureProvider{}, nil)
+	gate := make(chan struct{})
+	p := &fixtureProvider{catalogGate: gate}
+	s, err := New(cfg, p, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 	ts := httptest.NewServer(s)
 	defer ts.Close()
+	waitFor(t, func() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.catalogs == 1 })
+	_, statusBody := request(t, ts.URL, "GET", "/api/status", "")
+	if !strings.Contains(statusBody, `"refreshing":true`) {
+		t.Fatal("startup refresh state not visible", statusBody)
+	}
+	close(gate)
 	waitFor(t, func() bool { _, ok := s.cache.item("live:1"); return ok })
 	res, err := http.Get(ts.URL + "/api/catalog")
 	if err != nil {
@@ -247,57 +250,7 @@ func TestCatalogETag(t *testing.T) {
 		t.Fatal(res.StatusCode)
 	}
 }
-func TestImageSharedAcrossBrowsersAndRefreshStatus(t *testing.T) {
-	imageBytes, err := base64.StdEncoding.DecodeString("R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var mu sync.Mutex
-	imageCalls := 0
-	imageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		imageCalls++
-		mu.Unlock()
-		w.Header().Set("Content-Type", "image/gif")
-		w.Write(imageBytes)
-	}))
-	defer imageServer.Close()
-	gate := make(chan struct{})
-	p := &fixtureProvider{imageURL: imageServer.URL + "/logo", catalogGate: gate}
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), PortalURL: "http://provider.invalid", MAC: "00:11:22:33:44:55", RefreshInterval: time.Hour}
-	s, err := New(cfg, p, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	ts := httptest.NewServer(s)
-	defer ts.Close()
-	waitFor(t, func() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.catalogs == 1 })
-	_, statusBody := request(t, ts.URL, "GET", "/api/status", "")
-	if !strings.Contains(statusBody, `"refreshing":true`) {
-		t.Fatal("refresh state not visible", statusBody)
-	}
-	close(gate)
-	waitFor(t, func() bool { _, ok := s.cache.item("live:1"); return ok })
-	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			status, _ := request(t, ts.URL, "GET", "/api/images/live:1", "")
-			if status != 200 {
-				t.Errorf("image HTTP status: %d", status)
-			}
-		}()
-	}
-	wg.Wait()
-	mu.Lock()
-	calls := imageCalls
-	mu.Unlock()
-	if calls != 1 {
-		t.Fatalf("shared image triggered %d upstream requests", calls)
-	}
-}
+
 func request(t *testing.T, base, method, path, body string) (int, string) {
 	t.Helper()
 	req, err := http.NewRequest(method, base+path, strings.NewReader(body))
