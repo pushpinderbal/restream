@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -169,6 +170,7 @@ func newAuth(cfg AuthConfig, db *sql.DB) (*authManager, error) {
 	}
 	a.sessions.Cookie.Persist = true
 	a.sessions.ErrorFunc = func(w http.ResponseWriter, r *http.Request, err error) {
+		slog.Error("Authentication session unavailable", "stage", "session_store")
 		authResponseHeaders(w)
 		fail(w, 500, "auth", "Authentication is temporarily unavailable.")
 	}
@@ -267,29 +269,32 @@ func (a *authManager) middleware(next http.Handler) http.Handler {
 func (a *authManager) login(w http.ResponseWriter, r *http.Request) {
 	// Replacing this transaction also invalidates a previous login attempt in this browser.
 	if err := a.sessions.RenewToken(r.Context()); err != nil {
-		a.loginError(w, r, false)
+		a.loginError(w, r, false, "session_renewal")
 		return
 	}
 	state, nonce, verifier := oauth2.GenerateVerifier(), oauth2.GenerateVerifier(), oauth2.GenerateVerifier()
 	if _, err := a.db.ExecContext(r.Context(), `DELETE FROM auth_login_transactions WHERE expires < ?`, time.Now().Unix()); err != nil {
-		a.loginError(w, r, false)
+		a.loginError(w, r, false, "transaction_cleanup")
 		return
 	}
 	if _, err := a.db.ExecContext(r.Context(), `INSERT INTO auth_login_transactions(state,expires) VALUES(?,?)`, state, time.Now().Add(10*time.Minute).Unix()); err != nil {
-		a.loginError(w, r, false)
+		a.loginError(w, r, false, "transaction_save")
 		return
 	}
 	a.sessions.Put(r.Context(), "login_state", state)
 	a.sessions.Put(r.Context(), "login_nonce", nonce)
 	a.sessions.Put(r.Context(), "login_verifier", verifier)
 	a.sessions.Put(r.Context(), "login_started", time.Now().Unix())
+	slog.Info("Sign-in started")
 	http.Redirect(w, r, a.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
 }
-func (a *authManager) loginError(w http.ResponseWriter, r *http.Request, denied bool) {
+func (a *authManager) loginError(w http.ResponseWriter, r *http.Request, denied bool, stage string) {
 	code := "login_failed"
 	if denied {
 		code = "access_denied"
 	}
+	// Provider errors, callback queries and tokens can contain credentials.
+	slog.Warn("Sign-in failed", "stage", stage, "reason", code)
 	http.Redirect(w, r, "/?auth_error="+code, http.StatusSeeOther)
 }
 func (a *authManager) callback(w http.ResponseWriter, r *http.Request) {
@@ -300,33 +305,33 @@ func (a *authManager) callback(w http.ResponseWriter, r *http.Request) {
 	started := a.sessions.GetInt64(ctx, "login_started")
 	a.sessions.Remove(ctx, "login_started")
 	if state == "" || nonce == "" || verifier == "" || started <= 0 || time.Now().Unix()-started > 600 || started > time.Now().Unix() || subtle.ConstantTimeCompare([]byte(state), []byte(r.URL.Query().Get("state"))) != 1 || r.URL.Query().Get("error") != "" || r.URL.Query().Get("code") == "" {
-		a.loginError(w, r, false)
+		a.loginError(w, r, false, "callback_validation")
 		return
 	}
 	var expires int64
 	if err := a.db.QueryRowContext(ctx, `DELETE FROM auth_login_transactions WHERE state=? RETURNING expires`, state).Scan(&expires); err != nil || expires < time.Now().Unix() {
-		a.loginError(w, r, false)
+		a.loginError(w, r, false, "transaction_validation")
 		return
 	}
 	token, err := a.oauth.Exchange(a.context(ctx), r.URL.Query().Get("code"), oauth2.VerifierOption(verifier))
 	if err != nil {
-		a.loginError(w, r, false)
+		a.loginError(w, r, false, "token_exchange")
 		return
 	}
 	raw, _ := token.Extra("id_token").(string)
 	id, err := a.verifier.Verify(a.context(ctx), raw)
 	if err != nil || id.Subject == "" || subtle.ConstantTimeCompare([]byte(id.Nonce), []byte(nonce)) != 1 {
-		a.loginError(w, r, false)
+		a.loginError(w, r, false, "token_verification")
 		return
 	}
 	var claims authClaims
 	if id.Claims(&claims) != nil || !claims.valid() || claims.AuthorizedParty != "" && claims.AuthorizedParty != a.cfg.ClientID || len(id.Audience) > 1 && claims.AuthorizedParty != a.cfg.ClientID {
-		a.loginError(w, r, true)
+		a.loginError(w, r, true, "claims_validation")
 		return
 	}
 	data, err := json.Marshal(token)
 	if err != nil {
-		a.loginError(w, r, false)
+		a.loginError(w, r, false, "token_storage")
 		return
 	}
 	unlock := a.lockIdentity(id.Issuer, id.Subject)
@@ -335,22 +340,28 @@ func (a *authManager) callback(w http.ResponseWriter, r *http.Request) {
 	err = a.db.QueryRowContext(ctx, `INSERT INTO auth_users(id,issuer,subject,name,role,checked_at,provider_token) VALUES(?,?,?,?,?,?,?) ON CONFLICT(issuer,subject) DO UPDATE SET name=excluded.name,role=excluded.role,checked_at=excluded.checked_at,provider_token=excluded.provider_token RETURNING id,session_version`, oauth2.GenerateVerifier(), id.Issuer, id.Subject, claims.name(), claims.Role, time.Now().Unix(), data).Scan(&userID, &version)
 	unlock()
 	if err != nil {
-		a.loginError(w, r, false)
+		a.loginError(w, r, false, "user_save")
 		return
 	}
 	if err = a.sessions.RenewToken(ctx); err != nil {
-		a.loginError(w, r, false)
+		a.loginError(w, r, false, "session_renewal")
 		return
 	}
 	a.sessions.Clear(ctx)
 	a.sessions.Put(ctx, "user_id", userID)
 	a.sessions.Put(ctx, "user_version", version)
+	slog.Info("User signed in", "user_id", userID, "role", claims.Role)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 func (a *authManager) logout(w http.ResponseWriter, r *http.Request) {
+	userID := a.sessions.GetString(r.Context(), "user_id")
 	if err := a.sessions.Destroy(r.Context()); err != nil {
+		slog.Error("Sign-out failed", "stage", "session_destroy", "user_id", userID)
 		fail(w, 500, "auth", "Unable to sign out.")
 		return
+	}
+	if userID != "" {
+		slog.Info("User signed out", "user_id", userID)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -390,20 +401,21 @@ func (a *authManager) user(r *http.Request) *AuthUser {
 	// Complete rotating credentials even when the initiating browser navigates away.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 20*time.Second)
 	defer cancel()
-	revoke := func() *AuthUser {
+	revoke := func(reason string) *AuthUser {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
 		defer cancel()
 		_, _ = a.db.ExecContext(ctx, `UPDATE auth_users SET role='',checked_at=0,session_version=session_version+1 WHERE id=?`, id)
+		slog.Warn("User access revoked", "user_id", id, "stage", "session_revalidation", "reason", reason)
 		return nil
 	}
 	var token oauth2.Token
 	if json.Unmarshal(data, &token) != nil {
-		return revoke()
+		return revoke("invalid_stored_token")
 	}
 	// Force refresh even while an access token is valid, so account/client-access revocations
 	// are checked at the same bounded interval as role changes.
 	if token.RefreshToken == "" {
-		return revoke()
+		return revoke("missing_refresh_token")
 	}
 	token.Expiry = time.Now().Add(-time.Hour)
 	refreshed, err := a.oauth.TokenSource(a.context(ctx), &token).Token()
@@ -419,16 +431,22 @@ func (a *authManager) user(r *http.Request) *AuthUser {
 			}
 		}
 	}
-	if err != nil || !claims.valid() {
-		return revoke()
+	if err != nil {
+		return revoke("provider_revalidation_failed")
+	}
+	if !claims.valid() {
+		return revoke("invalid_role")
 	}
 	data, err = json.Marshal(refreshed)
 	if err != nil {
-		return revoke()
+		return revoke("token_storage_failed")
 	}
 	_, err = a.db.ExecContext(ctx, `UPDATE auth_users SET name=?,role=?,checked_at=?,provider_token=? WHERE id=?`, claims.name(), claims.Role, time.Now().Unix(), data, id)
 	if err != nil {
-		return revoke()
+		return revoke("user_save_failed")
+	}
+	if u.Role != claims.Role {
+		slog.Info("User role changed", "user_id", id, "previous_role", u.Role, "role", claims.Role)
 	}
 	u.Name, u.Role = claims.name(), claims.Role
 	return &u

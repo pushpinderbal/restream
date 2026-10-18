@@ -726,7 +726,7 @@ func TestRootRedirectAndPortalVariants(t *testing.T) {
 		case "series/get_ordered_list":
 			http.Error(w, "unsupported", http.StatusNotFound)
 		case "itv/get_epg_info":
-			if q.Get("period") != "24" {
+			if q.Get("period") != "6" {
 				t.Errorf("guide request missing requested coverage: %v", q)
 			}
 			if q.Get("ch_id") == "" {
@@ -795,8 +795,8 @@ func TestRootRedirectAndPortalVariants(t *testing.T) {
 
 func TestLargeCatalogResponseLimit(t *testing.T) {
 	// A portal can return tens of thousands of channels. Padding outside js
-	// keeps the fixture small while exercising the full response envelope.
-	large := []byte(`{"js":{"data":[{"id":"1","name":"Large Channel","cmd":"http://example.test/live"}]},"padding":"` + strings.Repeat("x", 17<<20) + `"}`)
+	// exercises a response above the default 64 MiB limit with just one channel.
+	large := []byte(`{"js":{"data":[{"id":"1","name":"Large Channel","cmd":"http://example.test/live"}]},"padding":"` + strings.Repeat("x", 65<<20) + `"}`)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		key := q.Get("type") + "/" + q.Get("action")
@@ -828,7 +828,8 @@ func TestLargeCatalogResponseLimit(t *testing.T) {
 		max  int64
 		ok   bool
 	}{
-		{"default above 16 MiB", 0, true},
+		{"default rejects above 64 MiB", 0, false},
+		{"larger configured limit", 128 << 20, true},
 		{"exact boundary", int64(len(large)), true},
 		{"one byte below", int64(len(large) - 1), false},
 		{"small configured limit", 1 << 20, false},
@@ -841,7 +842,11 @@ func TestLargeCatalogResponseLimit(t *testing.T) {
 				}
 				return
 			}
-			if e == nil || !strings.Contains(e.Error(), "size limit") || !strings.Contains(e.Error(), "STALKER_MAX_RESPONSE_MB") || !strings.Contains(e.Error(), fmt.Sprint(tc.max)) || strings.Contains(e.Error(), server.URL) {
+			limit := tc.max
+			if limit == 0 {
+				limit = 64 << 20
+			}
+			if e == nil || !strings.Contains(e.Error(), "size limit") || !strings.Contains(e.Error(), "STALKER_MAX_RESPONSE_MB") || !strings.Contains(e.Error(), fmt.Sprint(limit)) || strings.Contains(e.Error(), server.URL) {
 				t.Fatalf("expected safe size limit error: %+v %v", items, e)
 			}
 		})
@@ -963,7 +968,7 @@ func TestBulkEPGFailuresDoNotFanOut(t *testing.T) {
 						send([]any{})
 						return
 					}
-					if q.Get("period") != "24" {
+					if q.Get("period") != "6" {
 						t.Errorf("unexpected EPG period: %v", q)
 					}
 					bulkCalls.Add(1)
@@ -999,7 +1004,7 @@ func TestBulkEPGFailuresDoNotFanOut(t *testing.T) {
 		})
 	}
 	c, e := New(Config{PortalURL: "https://example.test/server/load.php", MAC: "aa:bb"})
-	if e != nil || c.cfg.EPGHours != 24 || c.http.Timeout != time.Minute {
+	if e != nil || c.cfg.EPGHours != 6 || c.http.Timeout != time.Minute {
 		t.Fatalf("defaults: %+v %v", c, e)
 	}
 	custom := &http.Client{Timeout: 2 * time.Second}

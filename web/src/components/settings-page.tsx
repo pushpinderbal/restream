@@ -713,7 +713,7 @@ function SettingsForms({
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{
     draft: string;
-    error?: string;
+    error: string;
   } | null>(null);
   const patch: SettingsUpdate = {};
   const providerChanges = Object.fromEntries(
@@ -754,15 +754,6 @@ function SettingsForms({
     try {
       const next = await onSave(patch);
       resetDrafts(next);
-      setFeedback({
-        draft: JSON.stringify({
-          provider: next.provider,
-          library: next.library,
-          playback: next.playback,
-          token: "",
-          removeToken: false,
-        }),
-      });
     } catch (cause) {
       setFeedback({
         draft: draftKey,
@@ -786,6 +777,8 @@ function SettingsForms({
           id={`provider-${key}`}
           type={type}
           value={managed ? "" : provider[key]}
+          placeholder={managed ? "Managed by environment" : undefined}
+          variant={managed ? "status" : "default"}
           disabled={managed}
           readOnly={managed}
           aria-describedby={managed ? `provider-${key}-source` : undefined}
@@ -796,7 +789,7 @@ function SettingsForms({
           }
         />
         {managed && (
-          <span id={`provider-${key}-source`} className="settings-managed-note">
+          <span id={`provider-${key}-source`} className="sr-only">
             Managed by environment
           </span>
         )}
@@ -906,8 +899,8 @@ function SettingsForms({
           </div>
           <p className="settings-field-help">
             Cached titles stay visible while updates arrive. The guide normally
-            updates every 12 hours, or sooner when coverage runs low. Stop
-            active playback before changing guide coverage.
+            updates every 4 hours, or sooner when coverage runs low. Stop active
+            playback before changing guide coverage.
           </p>
           {categoryError && (
             <AnimatedAlert variant="warning">{categoryError}</AnimatedAlert>
@@ -952,6 +945,19 @@ function SettingsForms({
             id="tmdb-token"
             type="password"
             value={token}
+            placeholder={
+              removeToken
+                ? "Token will be removed"
+                : settings.discovery.tmdbTokenConfigured
+                  ? "•••••••• — Token saved"
+                  : "Enter a TMDB read access token"
+            }
+            variant={
+              !token && settings.discovery.tmdbTokenConfigured
+                ? "status"
+                : "default"
+            }
+            aria-describedby="tmdb-token-help"
             autoComplete="new-password"
             spellCheck={false}
             onChange={(event) => {
@@ -960,11 +966,11 @@ function SettingsForms({
             }}
           />
           <div className="settings-token-state">
-            <span>
+            <span id="tmdb-token-help">
               {removeToken
                 ? "Token will be removed when you save."
                 : settings.discovery.tmdbTokenConfigured
-                  ? "A token is saved. Enter a new one to replace it."
+                  ? "Enter a new token to replace the saved one."
                   : "Optional. Add a read access token to enable Trending."}
             </span>
             {settings.discovery.tmdbTokenConfigured && (
@@ -1052,48 +1058,44 @@ function SettingsForms({
         </SettingsSection>
       </fieldset>
       {children}
-      <div className="settings-save-bar">
-        {currentFeedback?.error && (
-          <AnimatedAlert>{currentFeedback.error}</AnimatedAlert>
-        )}
-        <div className="settings-save-actions">
-          <span
-            className="settings-save-state"
-            role="status"
-            aria-live="polite"
-          >
-            {saving
-              ? "Saving changes…"
-              : dirty
-                ? "Unsaved changes"
-                : currentFeedback && !currentFeedback.error
-                  ? "All changes saved."
-                  : "No unsaved changes"}
-          </span>
-          <div className="settings-save-buttons">
-            <Button
-              type="button"
-              variant="outline"
-              aria-label="Discard changes"
-              disabled={!dirty || saving}
-              onClick={() => {
-                resetDrafts(settings);
-                setFeedback(null);
-              }}
+      {(dirty || saving) && (
+        <div className="settings-save-bar">
+          {currentFeedback?.error && (
+            <AnimatedAlert>{currentFeedback.error}</AnimatedAlert>
+          )}
+          <div className="settings-save-actions">
+            <span
+              className="settings-save-state"
+              role="status"
+              aria-live="polite"
             >
-              Discard
-            </Button>
-            <LoadingButton
-              type="submit"
-              loading={saving}
-              loadingLabel="Saving…"
-              disabled={!dirty}
-            >
-              Save changes
-            </LoadingButton>
+              {saving ? "Saving changes…" : "Unsaved changes"}
+            </span>
+            <div className="settings-save-buttons">
+              <Button
+                type="button"
+                variant="outline"
+                aria-label="Discard changes"
+                disabled={!dirty || saving}
+                onClick={() => {
+                  resetDrafts(settings);
+                  setFeedback(null);
+                }}
+              >
+                Discard
+              </Button>
+              <LoadingButton
+                type="submit"
+                loading={saving}
+                loadingLabel="Saving…"
+                disabled={!dirty}
+              >
+                Save changes
+              </LoadingButton>
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </form>
   );
 }

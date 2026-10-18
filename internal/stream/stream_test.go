@@ -45,6 +45,14 @@ func TestFFmpegSessionLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not installed")
 	}
+	logs, err := os.CreateTemp(t.TempDir(), "stream-logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logs.Close()
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	defer slog.SetDefault(previous)
 	encoderList, err := exec.Command("ffmpeg", "-hide_banner", "-encoders").Output()
 	if err != nil {
 		t.Skip("cannot inspect ffmpeg encoders")
@@ -145,6 +153,15 @@ func TestFFmpegSessionLifecycle(t *testing.T) {
 	}
 	if _, err = m.Get(s.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("get after stop: %v", err)
+	}
+	output, err := os.ReadFile(logs.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"Stream ready", "processing=copy", "Stream processing completed", "Stream stopped", "reason=requested", "session_id=" + s.ID} {
+		if !strings.Contains(string(output), expected) {
+			t.Fatalf("missing %q in stream lifecycle logs: %s", expected, output)
+		}
 	}
 	if _, err = m.Start(context.Background(), item, 0); err != nil {
 		t.Fatalf("slot not reusable: %v", err)

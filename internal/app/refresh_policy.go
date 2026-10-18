@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	guideRefreshInterval        = 12 * time.Hour
+	guideRefreshInterval        = 4 * time.Hour
 	guideCoverageMargin         = time.Hour
 	guideMinimumRefreshInterval = 15 * time.Minute
 	refreshAttemptTimeout       = 5 * time.Minute

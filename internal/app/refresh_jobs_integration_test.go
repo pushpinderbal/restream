@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func (p *authFailureProvider) Catalog(context.Context) ([]model.Item, error) {
 }
 
 func TestScheduledAuthenticationPauseAndExplicitRetry(t *testing.T) {
+	logs := captureActivityLogs(t)
 	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), RefreshInterval: 24 * time.Hour}
 	s, err := New(cfg, &authFailureProvider{}, nil)
 	if err != nil {
@@ -64,6 +66,10 @@ func TestScheduledAuthenticationPauseAndExplicitRetry(t *testing.T) {
 		defer s.stateMu.RUnlock()
 		return s.catalogSync.Paused && !s.epgSync.Running && s.epgSync.LastSuccessfulAt != nil
 	})
+	output := logs()
+	if !strings.Contains(output, "reason=authorization") || !strings.Contains(output, "paused=true") || !strings.Contains(output, "Check provider credentials") {
+		t.Fatal("provider authentication failure has no useful log", output)
+	}
 	s.Close()
 	p := &fixtureProvider{}
 	s, err = New(cfg, p, nil)
@@ -110,7 +116,8 @@ func TestGuideScheduleUsesContiguousChannelCoverage(t *testing.T) {
 		programs []model.Program
 		wait     time.Duration
 	}{
-		{"full day", []model.Program{{ChannelID: "a", Start: now, End: now.Add(24 * time.Hour)}}, 12 * time.Hour},
+		{"full day", []model.Program{{ChannelID: "a", Start: now, End: now.Add(24 * time.Hour)}}, 4 * time.Hour},
+		{"six hours", []model.Program{{ChannelID: "a", Start: now, End: now.Add(6 * time.Hour)}}, 4 * time.Hour},
 		{"short channel", []model.Program{{ChannelID: "a", Start: now, End: now.Add(24 * time.Hour)}, {ChannelID: "b", Start: now, End: now.Add(5 * time.Hour)}}, 4 * time.Hour},
 		{"gap", []model.Program{{ChannelID: "a", Start: now, End: now.Add(3 * time.Hour)}, {ChannelID: "a", Start: now.Add(4 * time.Hour), End: now.Add(24 * time.Hour)}}, 2 * time.Hour},
 		{"little coverage", []model.Program{{ChannelID: "a", Start: now, End: now.Add(20 * time.Minute)}}, 15 * time.Minute},

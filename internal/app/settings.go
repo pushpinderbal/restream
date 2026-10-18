@@ -51,7 +51,7 @@ type settingsResponse struct {
 }
 
 func defaultSettings() applicationSettings {
-	return applicationSettings{Provider: ProviderSettings{Timezone: "UTC"}, Library: LibrarySettings{RefreshIntervalSeconds: 86400, DashboardCategories: []string{}, BlockedCategories: []string{}, GuideHours: 24}, Playback: PlaybackSettings{MaxStreams: 1, TranscodeMode: "auto"}}
+	return applicationSettings{Provider: ProviderSettings{Timezone: "UTC"}, Library: LibrarySettings{RefreshIntervalSeconds: 86400, DashboardCategories: []string{}, BlockedCategories: []string{}, GuideHours: 6}, Playback: PlaybackSettings{MaxStreams: 1, TranscodeMode: "auto"}}
 }
 func (s applicationSettings) response(environment map[string]string) settingsResponse {
 	r := settingsResponse{Provider: s.Provider, Library: s.Library, Playback: s.Playback, UpdatedAt: s.UpdatedAt}

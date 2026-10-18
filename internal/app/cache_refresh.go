@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -261,8 +262,12 @@ func (s *Server) refreshBrowsePage(ctx context.Context, provider model.BrowsePro
 		if !s.browseCategoryAllowed(q.Kind, q.Category) {
 			return nil, nil
 		}
+		started := time.Now()
 		page, err := provider.Browse(requestCtx, q)
 		if err != nil {
+			if s.ctx.Err() == nil {
+				slog.Warn("Library page load failed", append(refreshFailureAttrs(err), "kind", q.Kind, "page", q.Page, "elapsed", time.Since(started).Round(time.Millisecond))...)
+			}
 			if saveErr := s.cache.cacheFailed(key, err); saveErr != nil {
 				return nil, saveErr
 			}

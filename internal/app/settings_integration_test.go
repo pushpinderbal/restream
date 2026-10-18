@@ -39,6 +39,10 @@ func TestApplicationSettingsPersistenceAndRedaction(t *testing.T) {
 	if response.Code != 200 || strings.Contains(response.Body.String(), "ignored") {
 		t.Fatalf("initial settings: %d %s", response.Code, response.Body)
 	}
+	var initial settingsResponse
+	if err = json.Unmarshal(response.Body.Bytes(), &initial); err != nil || initial.Library.GuideHours != 6 || runtime.server.cfg.EPGHours != 6 {
+		t.Fatalf("initial guide coverage: %+v %v", initial, err)
+	}
 	patch := `{"provider":{"timezone":"Europe/London"},"library":{"refreshIntervalSeconds":7200,"dashboardCategories":["movie:1"],"blockedCategories":["series:2"],"guideHours":12},"discovery":{"tmdbReadAccessToken":"private-token"},"playback":{"maxStreams":3,"transcodeMode":"copy"}}`
 	response = settingsRequest(t, runtime, "PATCH", patch)
 	if response.Code != 200 {

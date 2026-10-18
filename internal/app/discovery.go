@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/url"
@@ -362,6 +363,12 @@ func (s *Server) startDiscovery(revision time.Time, refreshMetadata bool) (*disc
 		}()
 		ctx, cancel := context.WithTimeout(s.ctx, 3*time.Minute)
 		defer cancel()
+		started := time.Now()
+		if record.Pending && !refreshMetadata && current {
+			slog.Debug("Discovery refresh continuing")
+		} else {
+			slog.Info("Discovery refresh started", "tmdb_enabled", s.tmdbConfigured())
+		}
 		loaded, err := s.buildDiscovery(ctx, revision, refreshMetadata)
 		run.err = err
 		if !s.cache.libraryRevision().Equal(revision) || !loaded.PreferencesUpdatedAt.Equal(s.preferencesSnapshot().updatedAt) || s.ctx.Err() != nil {
@@ -384,6 +391,7 @@ func (s *Server) startDiscovery(revision time.Time, refreshMetadata bool) (*disc
 				}
 			}
 		}
+		stage := "build"
 		if publishErr := s.publishDiscovery(loaded); publishErr != nil {
 			run.err = publishErr
 			if !errors.Is(publishErr, errCacheChanged) && !errors.Is(publishErr, context.Canceled) {
@@ -396,7 +404,24 @@ func (s *Server) startDiscovery(revision time.Time, refreshMetadata bool) (*disc
 				}
 				s.markDiscoveryFailure(&loaded, errors.Join(err, publishErr), max(loaded.Failures, priorFailures+1))
 				s.rememberDiscoveryFailure(loaded)
+				err = errors.Join(err, publishErr)
+				stage = "cache_save"
+			} else {
+				return
 			}
+		}
+		attrs := []any{"elapsed", time.Since(started).Round(time.Millisecond)}
+		if err != nil {
+			attrs = append(attrs, refreshFailureAttrs(err)...)
+			attrs = append(attrs, "stage", stage, "failures", loaded.Failures, "paused", loaded.Paused)
+			if !loaded.NextAttempt.IsZero() {
+				attrs = append(attrs, "next_retry_at", loaded.NextAttempt)
+			}
+			slog.Warn("Discovery refresh failed; showing saved titles", attrs...)
+		} else if !loaded.Pending {
+			slog.Info("Discovery refresh completed", append(attrs, "trending_movies", len(loaded.Movies), "trending_series", len(loaded.Series), "explore_movies", len(loaded.ExploreMovies), "explore_series", len(loaded.ExploreSeries))...)
+		} else {
+			slog.Debug("Discovery refresh saved progress", append(attrs, "next_attempt_at", loaded.NextAttempt)...)
 		}
 	}()
 	return run, true
@@ -597,9 +622,13 @@ func (m tmdbTitle) year() int {
 type discoveryMetadataError struct {
 	status  int
 	retryAt time.Time
+	reason  string
 }
 
 func (e discoveryMetadataError) Error() string {
+	if e.status == 0 {
+		return "metadata " + e.reason
+	}
 	return fmt.Sprintf("metadata service returned HTTP %d", e.status)
 }
 
@@ -616,7 +645,7 @@ func (s *Server) tmdbList(ctx context.Context, path string, query url.Values) ([
 	query.Set("language", "en-US")
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.themoviedb.org/3/"+path+"?"+query.Encode(), nil)
 	if err != nil {
-		return nil, errors.New("metadata request could not be created")
+		return nil, discoveryMetadataError{reason: "invalid_request"}
 	}
 	req.Header.Set("Authorization", "Bearer "+s.cfg.TMDBReadAccessToken)
 	req.Header.Set("Accept", "application/json")
@@ -624,7 +653,11 @@ func (s *Server) tmdbList(ctx context.Context, path string, query url.Values) ([
 	if err != nil {
 		// HTTP transport errors can contain sensitive request details. Never
 		// retain or expose that error text.
-		return nil, errors.New("metadata request failed")
+		reason := "request_failed"
+		if errors.Is(err, context.DeadlineExceeded) {
+			reason = "timeout"
+		}
+		return nil, discoveryMetadataError{reason: reason}
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
@@ -643,7 +676,7 @@ func (s *Server) tmdbList(ctx context.Context, path string, query url.Values) ([
 	}
 	decoder := json.NewDecoder(io.LimitReader(res.Body, 2<<20))
 	if decoder.Decode(&result) != nil {
-		return nil, errors.New("metadata response was invalid")
+		return nil, discoveryMetadataError{reason: "invalid_response"}
 	}
 	return result.Results, nil
 }
