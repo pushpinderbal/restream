@@ -17,8 +17,9 @@ var errCacheChanged = errors.New("listing changed during refresh")
 var errCacheRetry = errors.New("cached request is cooling down")
 
 type cacheStatus struct {
-	Stale      bool
-	Refreshing bool
+	Stale               bool
+	Refreshing          bool
+	RefreshAfterSeconds int
 }
 
 func listingKey(q model.BrowseQuery) string {
@@ -130,39 +131,71 @@ func (s *store) setBrowsePage(q model.BrowseQuery, p model.BrowsePage, library t
 	if err = tx.Commit(); err != nil {
 		return err
 	}
+	delete(s.retryFallback, pageKey(q))
 	for _, item := range p.Items {
 		s.byID[item.ID] = item
 	}
 	return nil
 }
 
-func (s *store) cacheRetry(key string) (time.Time, error) {
-	var at int64
-	err := s.db.QueryRow(`SELECT retry_at FROM cache_retries WHERE entry=?`, key).Scan(&at)
-	if errors.Is(err, sql.ErrNoRows) {
-		return time.Time{}, nil
+type cacheRetryState struct {
+	failures int
+	next     time.Time
+	paused   bool
+}
+
+func (s *store) cacheRetry(key string) (cacheRetryState, error) {
+	s.mu.RLock()
+	fallback, found := s.retryFallback[key]
+	s.mu.RUnlock()
+	if found {
+		return fallback, nil
 	}
-	return time.Unix(0, at), err
+	var state cacheRetryState
+	var at int64
+	err := s.db.QueryRow(`SELECT failures,retry_at,paused FROM cache_retries WHERE entry=?`, key).Scan(&state.failures, &at, &state.paused)
+	if errors.Is(err, sql.ErrNoRows) {
+		return state, nil
+	}
+	state.next = time.Unix(0, at)
+	return state, err
 }
 func (s *store) cacheFailed(key string, failure error) error {
-	if errors.Is(failure, context.Canceled) || errors.Is(failure, errCacheChanged) || errors.Is(failure, errCacheRetry) {
+	if errors.Is(failure, context.Canceled) || errors.Is(failure, errCacheChanged) || errors.Is(failure, errCacheRetry) || errors.Is(failure, errSeriesRemoved) {
 		return nil
 	}
-	var failures int
-	err := s.db.QueryRow(`SELECT failures FROM cache_retries WHERE entry=?`, key).Scan(&failures)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	state, err := s.cacheRetry(key)
+	if err != nil {
 		return err
 	}
-	failures++
-	next := time.Now().Add(retryCooldown(failure, failures))
+	state.failures++
+	state.next = time.Now().Add(retryCooldown(failure, state.failures))
+	state.paused = retryPaused(failure)
 	var limited interface{ RetryDelay() time.Duration }
 	if errors.As(failure, &limited) && limited.RetryDelay() > 0 {
-		if err = s.setPortalCooldown(next); err != nil {
+		if err = s.setPortalCooldown(state.next); err != nil {
+			s.rememberCacheRetry(key, state)
 			return err
 		}
 	}
-	_, err = s.db.Exec(`INSERT INTO cache_retries(entry,failures,retry_at) VALUES(?,?,?) ON CONFLICT(entry) DO UPDATE SET failures=excluded.failures,retry_at=excluded.retry_at`, key, failures, next.UnixNano())
+	_, err = s.db.Exec(`INSERT INTO cache_retries(entry,failures,retry_at,paused) VALUES(?,?,?,?) ON CONFLICT(entry) DO UPDATE SET failures=excluded.failures,retry_at=excluded.retry_at,paused=excluded.paused`, key, state.failures, state.next.UnixNano(), state.paused)
+	if err != nil {
+		// A disk error must not turn each browser request into another fetch.
+		s.rememberCacheRetry(key, state)
+	} else {
+		s.mu.Lock()
+		delete(s.retryFallback, key)
+		s.mu.Unlock()
+	}
 	return err
+}
+func (s *store) rememberCacheRetry(key string, state cacheRetryState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.retryFallback == nil {
+		s.retryFallback = map[string]cacheRetryState{}
+	}
+	s.retryFallback[key] = state
 }
 func (s *Server) cacheEligible(key string) (bool, error) {
 	retry, err := s.cache.cacheRetry(key)
@@ -172,7 +205,7 @@ func (s *Server) cacheEligible(key string) (bool, error) {
 	s.cache.mu.RLock()
 	cooldown := s.cache.portalCooldownUntil
 	s.cache.mu.RUnlock()
-	return !time.Now().Before(maxTime(retry, cooldown)), nil
+	return !retry.paused && !time.Now().Before(maxTime(retry.next, cooldown)), nil
 }
 
 // Register before spawning so shutdown waits for every server-owned refresh.
@@ -251,7 +284,13 @@ func (s *Server) refreshBrowsePage(ctx context.Context, provider model.BrowsePro
 				page.Items[i].Category = name
 			}
 		}
-		return nil, s.cache.setBrowsePage(q, page, library, generation)
+		if err := s.cache.setBrowsePage(q, page, library, generation); err != nil {
+			if saveErr := s.cache.cacheFailed(key, err); saveErr != nil {
+				return nil, saveErr
+			}
+			return nil, err
+		}
+		return nil, nil
 	}))
 	return err
 }

@@ -462,17 +462,17 @@ try {
     const controls = page.locator(".video-controls");
     await page.mouse.move(1, 1);
     await area.hover();
-    await page.waitForTimeout(3100);
-    if ((await controls.getAttribute("data-visible")) !== "false")
-      throw new Error("Playing controls did not auto-hide");
+    await expect(controls).toHaveAttribute("data-visible", "false", {
+      timeout: 5000,
+    });
     await area.hover({ position: { x: 30, y: 30 } });
     await page
       .getByRole("button", { name: "Full screen", exact: true })
       .click();
     await page.mouse.move(100, 100);
-    await page.waitForTimeout(3100);
-    if ((await controls.getAttribute("data-visible")) !== "false")
-      throw new Error("Fullscreen controls did not auto-hide");
+    await expect(controls).toHaveAttribute("data-visible", "false", {
+      timeout: 5000,
+    });
     await page.mouse.move(200, 120);
     await page.getByRole("button", { name: "Exit full screen" }).click();
     await area.hover({ position: { x: 40, y: 40 } });
@@ -488,7 +488,6 @@ try {
         timeout: 5000,
       },
     );
-    await page.waitForTimeout(1200);
     const sourceBeforeResume = (await page.evaluate(videoState)).src;
     await page.keyboard.press("m");
     if (!(await page.evaluate(() => document.querySelector("video")?.muted)))

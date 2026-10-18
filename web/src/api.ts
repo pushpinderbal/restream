@@ -115,7 +115,7 @@ export type Status = {
   error?: string;
   activeStreams?: number;
   maxStreams?: number;
-  sync?: { catalog: RefreshState; epg: RefreshState };
+  sync?: { catalog: RefreshState; epg: RefreshState; discovery?: RefreshState };
   portalCooldownUntil?: string;
   timezone?: string;
   guideHours?: number;
@@ -139,6 +139,8 @@ export type RefreshState = {
   lastSuccessfulAt?: string;
   intervalSeconds: number;
   error?: string;
+  paused?: boolean;
+  failures?: number;
 };
 export type Session = {
   id: string;

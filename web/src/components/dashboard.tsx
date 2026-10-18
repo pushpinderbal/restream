@@ -59,6 +59,32 @@ function releaseLabel(title: DiscoveryTitle) {
   return title.year ? String(title.year) : "";
 }
 
+function interleaveTitles(
+  movies: DiscoveryTitle[],
+  series: DiscoveryTitle[],
+  seen = new Set<string>(),
+) {
+  const unique = (values: DiscoveryTitle[]) =>
+    values.filter((title) => {
+      const key = `${title.item.kind}:${title.item.id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  const uniqueMovies = unique(movies);
+  const uniqueSeries = unique(series);
+  const titles: DiscoveryTitle[] = [];
+  for (
+    let index = 0;
+    index < Math.max(uniqueMovies.length, uniqueSeries.length);
+    index++
+  ) {
+    if (uniqueMovies[index]) titles.push(uniqueMovies[index]);
+    if (uniqueSeries[index]) titles.push(uniqueSeries[index]);
+  }
+  return titles;
+}
+
 function ContentRail({
   label,
   className,
@@ -378,19 +404,37 @@ export function Dashboard({
   const trendingSeries = (discovery?.trendingSeries || []).filter((title) =>
     isDashboardAllowed(title.item),
   );
-  const hasTrending = trendingMovies.length > 0 || trendingSeries.length > 0;
   const exploreMovies = (discovery?.exploreMovies || []).filter((title) =>
     isDashboardAllowed(title.item),
   );
   const exploreSeries = (discovery?.exploreSeries || []).filter((title) =>
     isDashboardAllowed(title.item),
   );
-  const movies = hasTrending ? trendingMovies : exploreMovies;
-  const series = hasTrending ? trendingSeries : exploreSeries;
-  const titles: DiscoveryTitle[] = [];
-  for (let index = 0; index < Math.max(movies.length, series.length); index++) {
-    if (movies[index]) titles.push(movies[index]);
-    if (series[index]) titles.push(series[index]);
+  const trendingTitles = interleaveTitles(trendingMovies, trendingSeries);
+  const exploreTitles = interleaveTitles(
+    exploreMovies,
+    exploreSeries,
+    new Set(
+      trendingTitles.map((title) => `${title.item.kind}:${title.item.id}`),
+    ),
+  );
+  // Keep the hero and in-player rail's existing Trending-first fallback.
+  const titles = trendingTitles.length ? trendingTitles : exploreTitles;
+  const recommendationRails = playbackActive
+    ? [{ label: "Explore", titles }]
+    : [
+        ...(trendingTitles.length
+          ? [{ label: "Trending now", titles: trendingTitles }]
+          : []),
+        ...(exploreTitles.length
+          ? [{ label: "Explore", titles: exploreTitles }]
+          : []),
+      ];
+  if (
+    recommendationRails.length === 0 &&
+    (discoveryLoading || discovery?.refreshing)
+  ) {
+    recommendationRails.push({ label: "Explore", titles: [] });
   }
 
   const featureCandidates = [
@@ -663,29 +707,15 @@ export function Dashboard({
         </>
       )}
 
-      {(playbackActive ||
-        titles.length > 0 ||
-        discoveryLoading ||
-        discovery?.refreshing) && (
+      {recommendationRails.map(({ label, titles: railTitles }) => (
         <section
+          key={label}
           className="discovery-section discovery-picks"
-          aria-label={
-            playbackActive
-              ? "Explore"
-              : hasTrending
-                ? "Trending now"
-                : "Explore"
-          }
+          aria-label={label}
         >
           <div className="discovery-section-heading">
             <div>
-              <h2>
-                {playbackActive
-                  ? "Explore"
-                  : hasTrending
-                    ? "Trending now"
-                    : "Explore"}
-              </h2>
+              <h2>{label}</h2>
             </div>
           </div>
           {playbackActive && (
@@ -701,15 +731,15 @@ export function Dashboard({
               )}
             </>
           )}
-          {titles.length > 0 ? (
+          {railTitles.length > 0 ? (
             <ContentRail
               label="Titles"
               className="discovery-poster-grid"
               overlay
             >
-              {titles.map((title) => (
+              {railTitles.map((title) => (
                 <button
-                  key={title.item.id}
+                  key={`${title.item.kind}:${title.item.id}`}
                   type="button"
                   className="discovery-poster-card"
                   aria-label={`Open ${title.name}`}
@@ -758,8 +788,13 @@ export function Dashboard({
             <p className="discovery-explore-empty">No titles</p>
           )}
         </section>
-      )}
+      ))}
 
+      {!playbackActive && !persistent && (
+        <AnimatedAlert variant="warning" className="discovery-history-note">
+          Watch history couldn’t sync. Changes may not be saved.
+        </AnimatedAlert>
+      )}
       {!playbackActive && (
         <div
           className={`discovery-bottom${entries.length === 0 || liveNow.length === 0 ? " discovery-bottom-single" : ""}`}
@@ -813,14 +848,6 @@ export function Dashboard({
                   Clear history
                 </Button>
               </div>
-              {!persistent && (
-                <AnimatedAlert
-                  variant="warning"
-                  className="discovery-history-note"
-                >
-                  History isn’t saved.
-                </AnimatedAlert>
-              )}
               <ContentRail
                 label="Recently played"
                 className="discovery-recent-grid"

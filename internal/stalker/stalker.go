@@ -21,8 +21,6 @@ import (
 	"time"
 	"unicode"
 
-	"golang.org/x/sync/semaphore"
-
 	"github.com/pushpinderbal/restream/internal/model"
 )
 
@@ -40,7 +38,7 @@ type Client struct {
 	endpoint        *url.URL
 	http            *http.Client
 	loc             *time.Location
-	mu              *semaphore.Weighted
+	mu              *requestGate
 	token           string
 	channels        []model.Item
 	epgIDs          map[string]string
@@ -82,13 +80,20 @@ func (e *RateLimitError) RetryDelay() time.Duration { return e.RetryAfter }
 // ConfigureCooldown restores a saved portal deadline and installs its persistence
 // callback. Call it once during startup, before issuing portal requests.
 func (c *Client) ConfigureCooldown(until time.Time, save func(time.Time) error) {
-	_ = c.mu.Acquire(context.Background(), 1)
-	defer c.mu.Release(1)
+	_ = c.mu.acquire(context.Background())
+	defer c.mu.release()
 	if until.After(c.nextRequest) {
 		c.nextRequest = until
 	}
 	c.saveCooldown = save
 }
+
+// PermanentError requires credentials or configuration to change before an
+// automatic background attempt is useful. No provider identity is retained.
+type PermanentError struct{ Message string }
+
+func (e *PermanentError) Error() string   { return e.Message }
+func (e *PermanentError) Permanent() bool { return true }
 
 type portalHTTPError struct {
 	action string
@@ -105,6 +110,14 @@ func (e *portalUnsupportedError) Error() string {
 
 func (e *portalHTTPError) Error() string {
 	return fmt.Sprintf("portal %s failed: HTTP %d", e.action, e.status)
+}
+
+func (e *portalHTTPError) Permanent() bool {
+	switch e.status {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
 }
 
 func unsupported(err error) bool {
@@ -133,7 +146,7 @@ func New(cfg Config) (*Client, error) {
 		return nil, errors.New("invalid EPG hours")
 	}
 	if cfg.EPGHours == 0 {
-		cfg.EPGHours = 6
+		cfg.EPGHours = 24
 	}
 	if cfg.MaxResponseBytes < 0 || cfg.MaxResponseBytes > maxAllowedResponseBytes {
 		return nil, errors.New("invalid maximum portal response size")
@@ -176,7 +189,7 @@ func New(cfg Config) (*Client, error) {
 	if h == nil {
 		h = &http.Client{Timeout: cfg.RequestTimeout}
 	}
-	c := &Client{cfg: cfg, endpoint: u, http: h, loc: loc, mu: semaphore.NewWeighted(1), currentInterval: cfg.RequestInterval, retryBackoff: jitterBackoff}
+	c := &Client{cfg: cfg, endpoint: u, http: h, loc: loc, mu: newRequestGate(), currentInterval: cfg.RequestInterval, retryBackoff: jitterBackoff}
 	if rootURL.Path == "" || rootURL.Path == "/" {
 		c.discovery = &rootURL
 	}
@@ -187,7 +200,7 @@ func (c *Client) request(ctx context.Context, typ, action string, q url.Values) 
 	if e := c.lock(ctx); e != nil {
 		return nil, e
 	}
-	defer c.mu.Release(1)
+	defer c.mu.release()
 	if c.token == "" {
 		if e := c.login(ctx); e != nil {
 			return nil, e
@@ -209,13 +222,13 @@ func (c *Client) request(ctx context.Context, typ, action string, q url.Values) 
 		return nil, e
 	}
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		return nil, fmt.Errorf("portal %s/%s authorization failed", typ, action)
+		return nil, &PermanentError{Message: fmt.Sprintf("portal %s/%s authorization failed", typ, action)}
 	}
 	if status < 200 || status >= 300 {
 		return nil, &portalHTTPError{action: action, status: status}
 	}
 	if invalidResponse(js) {
-		return nil, fmt.Errorf("portal %s/%s authorization expired", typ, action)
+		return nil, &PermanentError{Message: fmt.Sprintf("portal %s/%s authorization expired", typ, action)}
 	}
 	return js, nil
 }
@@ -226,7 +239,7 @@ func nullOrFalse(js json.RawMessage) bool {
 }
 
 func (c *Client) lock(ctx context.Context) error {
-	return c.mu.Acquire(ctx, 1)
+	return c.mu.acquire(ctx)
 }
 
 func (c *Client) login(ctx context.Context) error {
@@ -242,7 +255,10 @@ func (c *Client) login(ctx context.Context) error {
 		return e
 	}
 	if status < 200 || status >= 300 {
-		return errors.New("portal handshake failed")
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			return &PermanentError{Message: "portal handshake authorization failed"}
+		}
+		return &portalHTTPError{action: "handshake", status: status}
 	}
 	var v map[string]json.RawMessage
 	if json.Unmarshal(js, &v) != nil {
@@ -250,15 +266,18 @@ func (c *Client) login(ctx context.Context) error {
 	}
 	token := str(v, "token")
 	if token == "" {
-		return errors.New("portal handshake returned no token")
+		return &PermanentError{Message: "portal handshake returned no token"}
 	}
 	q = url.Values{"hd": {"1"}, "stb_type": {"MAG250"}, "auth_second_step": {"1"}, "sn": {c.cfg.SerialNumber}, "device_id": {c.cfg.DeviceID}, "device_id2": {c.cfg.DeviceID2}}
 	profile, status, e := c.call(ctx, "stb", "get_profile", q, token)
 	if e != nil {
 		return e
 	}
-	if status < 200 || status >= 300 || invalidToken(profile) {
-		return errors.New("portal stb/get_profile authorization failed")
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || (status >= 200 && status < 300 && invalidToken(profile)) {
+		return &PermanentError{Message: "portal stb/get_profile authorization failed"}
+	}
+	if status < 200 || status >= 300 {
+		return &portalHTTPError{action: "get_profile", status: status}
 	}
 	c.token = token
 	return nil
@@ -340,7 +359,7 @@ func (c *Client) call(ctx context.Context, typ, action string, q url.Values, tok
 		return nil, resp.StatusCode, fmt.Errorf("portal %s response failed", action)
 	}
 	if int64(len(b)) > c.cfg.MaxResponseBytes {
-		return nil, resp.StatusCode, fmt.Errorf("portal %s response exceeds configured size limit (%d bytes; set STALKER_MAX_RESPONSE_MB)", action, c.cfg.MaxResponseBytes)
+		return nil, resp.StatusCode, &PermanentError{Message: fmt.Sprintf("portal %s response exceeds configured size limit (%d bytes; set STALKER_MAX_RESPONSE_MB)", action, c.cfg.MaxResponseBytes)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, resp.StatusCode, nil
@@ -416,7 +435,7 @@ func (c *Client) doRateLimited(ctx context.Context, req *http.Request, action st
 	return nil, errors.New("portal retry limit exceeded")
 }
 
-// The request semaphore also guards the adaptive interval and streak.
+// The request gate also guards the adaptive interval and streak.
 func (c *Client) increaseInterval() {
 	c.successStreak = 0
 	ceiling := max(maxAdaptiveInterval, c.cfg.RequestInterval)
@@ -644,7 +663,7 @@ func (c *Client) Categories(ctx context.Context) ([]model.Category, error) {
 		return nil, err
 	}
 	c.seriesSource = seriesSource
-	c.mu.Release(1)
+	c.mu.release()
 	out := make([]model.Category, 0, len(genres)+2*len(vod)+len(series))
 	for _, pair := range withoutAll(genres) {
 		out = append(out, model.Category{ID: pair[0], Name: pair[1], Kind: "live", SourceType: "itv"})
@@ -691,7 +710,7 @@ func (c *Client) Browse(ctx context.Context, query model.BrowseQuery) (model.Bro
 				return model.BrowsePage{}, err
 			}
 			typ = c.seriesSource
-			c.mu.Release(1)
+			c.mu.release()
 			if typ == "" {
 				typ = "series"
 			}
@@ -707,7 +726,7 @@ func (c *Client) Browse(ctx context.Context, query model.BrowseQuery) (model.Bro
 		if c.seriesSource == "vod" {
 			typ = "vod"
 		}
-		c.mu.Release(1)
+		c.mu.release()
 	}
 	category := query.Category
 	if category == "" {
@@ -727,7 +746,7 @@ func (c *Client) Browse(ctx context.Context, query model.BrowseQuery) (model.Bro
 				return model.BrowsePage{}, lockErr
 			}
 			c.seriesSource = "vod"
-			c.mu.Release(1)
+			c.mu.release()
 		}
 	}
 	if err != nil {
@@ -973,7 +992,7 @@ func (c *Client) live(ctx context.Context) ([]model.Item, error) {
 	}
 	c.channels = append([]model.Item(nil), out...)
 	c.epgIDs = epgIDs
-	c.mu.Release(1)
+	c.mu.release()
 	return out, nil
 }
 func (c *Client) genreCategories(ctx context.Context) ([][2]string, error) {
@@ -1322,7 +1341,7 @@ func (c *Client) EPG(ctx context.Context) ([]model.Program, error) {
 	}
 	channels := append([]model.Item(nil), c.channels...)
 	epgIDs := c.epgIDs
-	c.mu.Release(1)
+	c.mu.release()
 	if len(channels) == 0 {
 		var e error
 		channels, e = c.live(ctx)
@@ -1333,7 +1352,7 @@ func (c *Client) EPG(ctx context.Context) ([]model.Program, error) {
 			return nil, e
 		}
 		epgIDs = c.epgIDs
-		c.mu.Release(1)
+		c.mu.release()
 	}
 	channelByEPG := map[string]string{}
 	for _, ch := range channels {
@@ -1374,7 +1393,7 @@ func (c *Client) EPG(ctx context.Context) ([]model.Program, error) {
 		if epgID == "" {
 			epgID = ch.ProviderID
 		}
-		js, e := c.request(ctx, "itv", "get_epg_info", url.Values{"ch_id": {epgID}})
+		js, e := c.request(ctx, "itv", "get_epg_info", url.Values{"ch_id": {epgID}, "period": {strconv.Itoa(c.cfg.EPGHours)}})
 		if e != nil {
 			return nil, e
 		}
@@ -1429,6 +1448,7 @@ func (c *Client) Resolve(ctx context.Context, it model.Item) (model.Source, erro
 	if it.Kind != "live" && it.Kind != "movie" && it.Kind != "episode" {
 		return model.Source{}, errors.New("item is not playable")
 	}
+	ctx = context.WithValue(ctx, playbackRequestKey{}, true)
 	cmd := strings.TrimSpace(it.Command)
 	if it.Kind == "movie" {
 		movieID := strings.TrimPrefix(it.ID, "movie:")
@@ -1537,7 +1557,7 @@ func (c *Client) Resolve(ctx context.Context, it model.Item) (model.Source, erro
 			return model.Source{}, e
 		}
 		token := c.token
-		c.mu.Release(1)
+		c.mu.release()
 		headers["Cookie"] = "mac=" + url.QueryEscape(c.cfg.MAC) + "; stb_lang=en; timezone=" + url.QueryEscape(c.cfg.Timezone)
 		if token != "" {
 			headers["Authorization"] = "Bearer " + token

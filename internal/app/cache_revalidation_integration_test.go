@@ -110,6 +110,7 @@ type pagedLibraryProvider struct {
 	fixtureProvider
 	pageMu   sync.Mutex
 	failed   bool
+	failure  error
 	inserted bool
 	calls    map[int]int
 	gatePage int
@@ -123,9 +124,12 @@ func (p *pagedLibraryProvider) Browse(ctx context.Context, q model.BrowseQuery) 
 		p.calls = map[int]int{}
 	}
 	p.calls[q.Page]++
-	inserted, gate, gatePage, failed := p.inserted, p.gate, p.gatePage, p.failed
+	inserted, gate, gatePage, failed, failure := p.inserted, p.gate, p.gatePage, p.failed, p.failure
 	p.pageMu.Unlock()
 	if failed {
+		if failure != nil {
+			return model.BrowsePage{}, failure
+		}
 		return model.BrowsePage{}, errors.New("private provider failure token=secret")
 	}
 	if gate != nil && q.Page == gatePage && !inserted {
@@ -314,6 +318,98 @@ func TestFailedBrowseRefreshKeepsSavedDataAndRetryDeadlineAfterRestart(t *testin
 	defer p.pageMu.Unlock()
 	if p.calls[1] != 3 {
 		t.Fatal("successful refresh was not shared", p.calls)
+	}
+}
+
+type permanentCacheFailure struct{}
+
+func (permanentCacheFailure) Error() string   { return "provider authentication rejected" }
+func (permanentCacheFailure) Permanent() bool { return true }
+
+func TestBrowseAuthenticationPauseSurvivesRestartUntilManualRefresh(t *testing.T) {
+	p := &pagedLibraryProvider{}
+	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), RefreshInterval: 24 * time.Hour}
+	s, err := New(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.provider = p
+	categories, _ := p.Categories(context.Background())
+	if err := s.cache.setCategories(categories); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
+	path := "/api/browse?kind=movie&category=8&page=1"
+	libraryItems(t, ts, path, 3)
+	if _, err := s.cache.db.Exec(`UPDATE pages SET fetched_at=0`); err != nil {
+		t.Fatal(err)
+	}
+	p.pageMu.Lock()
+	p.failed, p.failure = true, permanentCacheFailure{}
+	p.pageMu.Unlock()
+	libraryItems(t, ts, path, 3)
+	waitFor(t, func() bool {
+		state, err := s.cache.cacheRetry(pageKey(model.BrowseQuery{Kind: "movie", Category: "8", Page: 1}))
+		return err == nil && state.paused
+	})
+	ts.Close()
+	s.Close()
+	s, err = New(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.provider = p
+	ts = httptest.NewServer(s)
+	t.Cleanup(func() { ts.Close(); s.Close() })
+	// An expired timestamp cannot bypass a permanent authentication pause.
+	if _, err := s.cache.db.Exec(`UPDATE cache_retries SET retry_at=0`); err != nil {
+		t.Fatal(err)
+	}
+	for range 8 {
+		libraryItems(t, ts, path, 3)
+	}
+	p.pageMu.Lock()
+	if p.calls[1] != 2 {
+		t.Error("restart lost authentication pause", p.calls)
+	}
+	p.failed = false
+	p.pageMu.Unlock()
+	if err := s.cache.invalidateLibrary(); err != nil {
+		t.Fatal(err)
+	}
+	libraryItems(t, ts, path, 3)
+	waitFor(t, func() bool { p.pageMu.Lock(); defer p.pageMu.Unlock(); return p.calls[1] == 3 })
+}
+
+func TestBrowsePersistenceFailureDoesNotRepeatedlyFetchProvider(t *testing.T) {
+	p := &pagedLibraryProvider{}
+	s, err := New(Config{DataDir: t.TempDir(), WebDir: t.TempDir()}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.provider = p
+	categories, _ := p.Categories(context.Background())
+	if err := s.cache.setCategories(categories); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
+	t.Cleanup(func() { ts.Close(); s.Close() })
+	path := "/api/browse?kind=movie&category=8&page=1"
+	libraryItems(t, ts, path, 3)
+	if _, err := s.cache.db.Exec(`UPDATE pages SET fetched_at=0;
+ CREATE TRIGGER reject_page_save BEFORE INSERT ON pages BEGIN SELECT RAISE(FAIL,'simulated storage failure'); END;
+ CREATE TRIGGER reject_retry_save BEFORE INSERT ON cache_retries BEGIN SELECT RAISE(FAIL,'simulated storage failure'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	libraryItems(t, ts, path, 3)
+	waitFor(t, func() bool { s.cache.mu.RLock(); defer s.cache.mu.RUnlock(); return len(s.cache.retryFallback) == 1 })
+	for range 12 {
+		libraryItems(t, ts, path, 3)
+	}
+	p.pageMu.Lock()
+	defer p.pageMu.Unlock()
+	if p.calls[1] != 2 {
+		t.Fatal("storage error caused repeated provider calls", p.calls)
 	}
 }
 

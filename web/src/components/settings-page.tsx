@@ -91,6 +91,7 @@ function refreshState(state?: RefreshState) {
   if (!state) return "—";
   if (state.running) return "Running";
   if (state.queued) return "Queued";
+  if (state.paused) return "Paused";
   if (state.error) return "Failed";
   return "Idle";
 }
@@ -273,7 +274,9 @@ export function SettingsPage({
     canAdmin &&
     !!status?.portalCooldownUntil &&
     Date.parse(status.portalCooldownUntil) > Date.now();
-  const syncStates = canAdmin ? [status?.sync?.catalog, status?.sync?.epg] : [];
+  const syncStates = canAdmin
+    ? [status?.sync?.catalog, status?.sync?.epg, status?.sync?.discovery]
+    : [];
   const busy =
     refreshing ||
     !!status?.refreshing ||
@@ -430,6 +433,13 @@ export function SettingsPage({
                   "Next guide refresh",
                   status?.sync?.epg?.nextRefreshAt
                     ? timestamp(status.sync.epg.nextRefreshAt)
+                    : "Not scheduled",
+                ],
+                ["Trending refresh", refreshState(status?.sync?.discovery)],
+                [
+                  "Next Trending refresh",
+                  status?.sync?.discovery?.nextRefreshAt
+                    ? timestamp(status.sync.discovery.nextRefreshAt)
                     : "Not scheduled",
                 ],
                 [
@@ -895,9 +905,9 @@ function SettingsForms({
             </div>
           </div>
           <p className="settings-field-help">
-            Cached titles stay visible while updates arrive. Opening a show also
-            checks its seasons and episodes. Stop active playback before
-            changing guide coverage.
+            Cached titles stay visible while updates arrive. The guide normally
+            updates every 12 hours, or sooner when coverage runs low. Stop
+            active playback before changing guide coverage.
           </p>
           {categoryError && (
             <AnimatedAlert variant="warning">{categoryError}</AnimatedAlert>
@@ -913,7 +923,9 @@ function SettingsForms({
             }
           />
           <p className="settings-field-help">
-            Leave empty to include all categories on Home.
+            Filters Home recommendations, including Trending and Explore. Leave
+            empty for all categories. Watch history uses all unblocked
+            categories.
           </p>
           <CategorySelector
             id="blocked-categories"

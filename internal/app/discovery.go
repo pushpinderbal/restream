@@ -27,6 +27,8 @@ import (
 const discoveryLimit = 18
 const discoveryTrendCandidates = 12
 const discoverySearchBudget = 18
+const discoverySearchVersion = 2
+const discoveryRetryLimit = 3
 
 // DiscoveryTitle always refers to a confirmed listing in this provider. The
 // metadata identity is separate from its playback identity.
@@ -61,9 +63,14 @@ type discoveryAsset struct {
 
 type discoveryRecord struct {
 	Version              int                          `json:"version"`
+	SearchVersion        int                          `json:"searchVersion,omitempty"`
 	Revision             time.Time                    `json:"revision"`
 	UpdatedAt            time.Time                    `json:"updatedAt"`
 	NextAttempt          time.Time                    `json:"nextAttempt"`
+	Failures             int                          `json:"failures,omitempty"`
+	Paused               bool                         `json:"paused,omitempty"`
+	Pending              bool                         `json:"pending,omitempty"`
+	Cursors              map[string]int               `json:"cursors,omitempty"`
 	Error                string                       `json:"error,omitempty"`
 	HadMetadata          bool                         `json:"hadMetadata"`
 	Movies               []DiscoveryTitle             `json:"movies"`
@@ -90,11 +97,18 @@ type discoveryMatch struct {
 }
 
 type discoveryService struct {
-	mu                  sync.Mutex
-	wg                  sync.WaitGroup
-	closed, refreshing  bool
-	record              discoveryRecord
-	client, imageClient *http.Client
+	mu                 sync.Mutex
+	wg                 sync.WaitGroup
+	closed, refreshing bool
+	active             *discoveryRefresh
+	retryTimer         *time.Timer
+	record             discoveryRecord
+	client             *http.Client
+}
+
+type discoveryRefresh struct {
+	done chan struct{}
+	err  error
 }
 
 func (s *Server) initDiscovery() error {
@@ -103,14 +117,6 @@ func (s *Server) initDiscovery() error {
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 || req.URL.Scheme != "https" || req.URL.Host != "api.themoviedb.org" {
 				return errors.New("invalid metadata redirect")
-			}
-			return nil
-		},
-	}, imageClient: &http.Client{
-		Timeout: 12 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 3 || req.URL.Scheme != "https" || req.URL.Host != "image.tmdb.org" || !strings.HasPrefix(req.URL.Path, "/t/p/") {
-				return errors.New("invalid metadata image redirect")
 			}
 			return nil
 		},
@@ -143,7 +149,7 @@ func (s *Server) discover(w http.ResponseWriter, r *http.Request) {
 	saved, refreshing := d.record, d.refreshing
 	d.mu.Unlock()
 	result := discoveryResponse{
-		Configured: s.tmdbConfigured(), Refreshing: refreshing,
+		Configured: s.tmdbConfigured(), Refreshing: refreshing || saved.Pending && saved.Error == "",
 		TrendingMovies: []DiscoveryTitle{}, TrendingSeries: []DiscoveryTitle{},
 		ExploreMovies: []DiscoveryTitle{}, ExploreSeries: []DiscoveryTitle{},
 	}
@@ -281,20 +287,67 @@ func (s *Server) discoveryCandidates() ([]model.Item, error) {
 }
 
 func (s *Server) queueDiscovery(revision time.Time) {
-	if s.provider == nil {
+	// The library job refreshes Trending after publishing its new revision.
+	// Dashboard reads must not start an older rebuild in the middle of that job.
+	s.stateMu.RLock()
+	libraryRefreshing := s.catalogSync.Running || s.catalogSync.Queued
+	s.stateMu.RUnlock()
+	if libraryRefreshing {
+		d := s.discoveryService
+		d.mu.Lock()
+		// Keep a retry pending if its deadline passes during a library job.
+		s.scheduleDiscoveryRetryLocked(time.Now().Add(time.Minute))
+		d.mu.Unlock()
 		return
+	}
+	s.startDiscovery(revision, false)
+}
+
+// Library refreshes fetch a fresh TMDB list and wait for linking to finish.
+// An older in-flight rebuild must finish before the new revision can publish.
+func (s *Server) refreshDiscoveryAfterLibrary(revision time.Time) error {
+	for {
+		run, started := s.startDiscovery(revision, true)
+		if run == nil {
+			return nil
+		}
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case <-run.done:
+		}
+		if started {
+			return run.err
+		}
+	}
+}
+
+func (s *Server) startDiscovery(revision time.Time, refreshMetadata bool) (*discoveryRefresh, bool) {
+	if s.provider == nil {
+		return nil, false
 	}
 	policy := s.preferencesSnapshot().updatedAt
 	d := s.discoveryService
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closed || d.refreshing {
-		return
+	if d.closed {
+		return nil, false
+	}
+	if d.refreshing {
+		return d.active, false
 	}
 	record := d.record
-	if record.Version == 1 && record.Revision.Equal(revision) && record.PreferencesUpdatedAt.Equal(policy) && record.HadMetadata == s.tmdbConfigured() && time.Now().Before(record.NextAttempt) {
-		return
+	current := record.Version == 1 && record.SearchVersion == discoverySearchVersion && record.Revision.Equal(revision) && record.PreferencesUpdatedAt.Equal(policy) && record.HadMetadata == s.tmdbConfigured()
+	if !refreshMetadata && current && (record.Paused || record.Failures > discoveryRetryLimit || time.Now().Before(record.NextAttempt)) {
+		s.scheduleDiscoveryRetryLocked(time.Time{})
+		return nil, false
 	}
+	if d.retryTimer != nil {
+		d.retryTimer.Stop()
+		d.retryTimer = nil
+	}
+	run := &discoveryRefresh{done: make(chan struct{})}
+	d.active = run
 	d.refreshing = true
 	d.wg.Add(1)
 	go func() {
@@ -302,28 +355,106 @@ func (s *Server) queueDiscovery(revision time.Time) {
 		defer func() {
 			d.mu.Lock()
 			d.refreshing = false
+			d.active = nil
+			s.scheduleDiscoveryRetryLocked(time.Time{})
+			close(run.done)
 			d.mu.Unlock()
 		}()
 		ctx, cancel := context.WithTimeout(s.ctx, 3*time.Minute)
 		defer cancel()
-		loaded, err := s.buildDiscovery(ctx, revision)
+		loaded, err := s.buildDiscovery(ctx, revision, refreshMetadata)
+		run.err = err
 		if !s.cache.libraryRevision().Equal(revision) || !loaded.PreferencesUpdatedAt.Equal(s.preferencesSnapshot().updatedAt) || s.ctx.Err() != nil {
 			return
 		}
 		if err != nil {
-			loaded.Error = "Discovery refresh could not finish. Showing saved available titles."
-			loaded.NextAttempt = time.Now().Add(5 * time.Minute)
+			s.markDiscoveryFailure(&loaded, err, loaded.Failures+1)
 		} else {
-			loaded.UpdatedAt = time.Now().UTC()
-			loaded.NextAttempt = time.Now().Add(s.discoveryRefreshInterval())
-			for kind, metadata := range loaded.Metadata {
-				if s.tmdbConfigured() && len(s.discoveryCategories(kind)) > 0 {
-					loaded.NextAttempt = minTime(loaded.NextAttempt, metadata.FetchedAt.Add(s.discoveryRefreshInterval()))
+			loaded.Failures = 0
+			loaded.Paused = false
+			if loaded.Pending {
+				loaded.NextAttempt = time.Now().Add(time.Minute)
+			} else {
+				loaded.UpdatedAt = time.Now().UTC()
+				loaded.NextAttempt = time.Now().Add(s.discoveryRefreshInterval())
+				for kind, metadata := range loaded.Metadata {
+					if s.tmdbConfigured() && len(s.discoveryCategories(kind)) > 0 {
+						loaded.NextAttempt = minTime(loaded.NextAttempt, metadata.FetchedAt.Add(s.discoveryRefreshInterval()))
+					}
 				}
 			}
 		}
-		_ = s.publishDiscovery(loaded)
+		if publishErr := s.publishDiscovery(loaded); publishErr != nil {
+			run.err = publishErr
+			if !errors.Is(publishErr, errCacheChanged) && !errors.Is(publishErr, context.Canceled) {
+				// A storage outage cannot persist its own retry. Retain the
+				// bounded retry in memory so recovery needs no browser request.
+				loaded.UpdatedAt = record.UpdatedAt
+				priorFailures := record.Failures
+				if refreshMetadata || !current {
+					priorFailures = 0
+				}
+				s.markDiscoveryFailure(&loaded, errors.Join(err, publishErr), max(loaded.Failures, priorFailures+1))
+				s.rememberDiscoveryFailure(loaded)
+			}
+		}
 	}()
+	return run, true
+}
+
+func (s *Server) markDiscoveryFailure(record *discoveryRecord, err error, failures int) {
+	record.Failures = failures
+	record.Paused = retryPaused(err) || failures > discoveryRetryLimit
+	record.Error = "Discovery refresh could not finish. Showing saved available titles."
+	record.NextAttempt = time.Time{}
+	if record.Paused {
+		record.Error = "Discovery refresh paused after repeated failures. Showing saved titles until the next library refresh."
+		if retryPaused(err) {
+			record.Error = "Discovery refresh paused. Check metadata or provider credentials, then refresh again."
+		}
+		return
+	}
+	s.cache.mu.RLock()
+	cooldown := s.cache.portalCooldownUntil
+	s.cache.mu.RUnlock()
+	record.NextAttempt = maxTime(time.Now().Add(retryBackoff(err, failures, 5*time.Minute, 20*time.Minute)), cooldown)
+}
+
+func (s *Server) rememberDiscoveryFailure(record discoveryRecord) {
+	policy := s.preferencesSnapshot().updatedAt
+	s.cache.mu.RLock()
+	defer s.cache.mu.RUnlock()
+	if !record.Revision.Equal(s.cache.libraryRefreshedAt) || !record.PreferencesUpdatedAt.Equal(policy) || s.ctx.Err() != nil {
+		return
+	}
+	d := s.discoveryService
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.closed {
+		d.record = record
+	}
+}
+
+// Failed refreshes retry without requiring anyone to open the dashboard.
+// Caller holds discoveryService.mu; shutdown stops the timer before waiting.
+func (s *Server) scheduleDiscoveryRetryLocked(notBefore time.Time) {
+	d := s.discoveryService
+	if d.closed || d.record.Paused || d.record.Error == "" && !d.record.Pending || d.record.Failures > discoveryRetryLimit || d.record.NextAttempt.IsZero() || d.retryTimer != nil {
+		return
+	}
+	delay := max(0, time.Until(maxTime(d.record.NextAttempt, notBefore)))
+	var timer *time.Timer
+	timer = time.AfterFunc(delay, func() {
+		d.mu.Lock()
+		if d.retryTimer != timer {
+			d.mu.Unlock()
+			return
+		}
+		d.retryTimer = nil
+		d.mu.Unlock()
+		s.queueDiscovery(s.cache.libraryRevision())
+	})
+	d.retryTimer = timer
 }
 
 func minTime(a, b time.Time) time.Time {
@@ -339,6 +470,7 @@ func (s *Server) publishDiscovery(record discoveryRecord) error {
 	record.Movies, record.Series = slices.Clone(record.Movies), slices.Clone(record.Series)
 	record.Assets = maps.Clone(record.Assets)
 	record.Metadata, record.Matches = maps.Clone(record.Metadata), maps.Clone(record.Matches)
+	record.Cursors = maps.Clone(record.Cursors)
 	pruneDiscoveryAssets(&record)
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -367,9 +499,17 @@ func (s *Server) discoveryBrowseCategory(ctx context.Context, kind, categoryID, 
 	if !ok {
 		return model.BrowsePage{}, errors.New("provider has no browse API")
 	}
-	policy := s.categoryPolicy(kind, categoryID)
-	if policy.Visibility != "show" || !policy.Dashboard || categoryID == "*" && !containsCategory(s.discoveryCategories(kind), "*") {
+	categories := s.discoveryCategories(kind)
+	if len(categories) == 0 {
 		return model.BrowsePage{Items: []model.Item{}, Page: 1}, nil
+	}
+	// Search the provider once across all categories, then apply Home policy to
+	// each returned item. Unfiltered pages still use only selected categories.
+	if categoryID != "*" || search == "" {
+		policy := s.categoryPolicy(kind, categoryID)
+		if policy.Visibility != "show" || !policy.Dashboard || categoryID == "*" && !containsCategory(categories, "*") {
+			return model.BrowsePage{Items: []model.Item{}, Page: 1}, nil
+		}
 	}
 	q := model.BrowseQuery{Kind: kind, Category: categoryID, Search: search, Page: 1}
 	s.cache.mu.RLock()
@@ -454,6 +594,21 @@ func (m tmdbTitle) year() int {
 	return year
 }
 
+type discoveryMetadataError struct {
+	status  int
+	retryAt time.Time
+}
+
+func (e discoveryMetadataError) Error() string {
+	return fmt.Sprintf("metadata service returned HTTP %d", e.status)
+}
+
+func (e discoveryMetadataError) RetryDelay() time.Duration { return max(0, time.Until(e.retryAt)) }
+
+func (e discoveryMetadataError) Permanent() bool {
+	return e.status == http.StatusUnauthorized || e.status == http.StatusForbidden
+}
+
 func (s *Server) tmdbList(ctx context.Context, path string, query url.Values) ([]tmdbTitle, error) {
 	if query == nil {
 		query = url.Values{}
@@ -473,7 +628,15 @@ func (s *Server) tmdbList(ctx context.Context, path string, query url.Values) ([
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return nil, fmt.Errorf("metadata service returned HTTP %d", res.StatusCode)
+		retryAt := time.Time{}
+		if res.StatusCode == http.StatusTooManyRequests || res.StatusCode == http.StatusServiceUnavailable {
+			if seconds, err := strconv.ParseUint(strings.TrimSpace(res.Header.Get("Retry-After")), 10, 32); err == nil {
+				retryAt = time.Now().Add(time.Duration(seconds) * time.Second)
+			} else if deadline, err := http.ParseTime(res.Header.Get("Retry-After")); err == nil {
+				retryAt = deadline
+			}
+		}
+		return nil, discoveryMetadataError{status: res.StatusCode, retryAt: retryAt}
 	}
 	var result struct {
 		Results []tmdbTitle `json:"results"`
@@ -485,18 +648,42 @@ func (s *Server) tmdbList(ctx context.Context, path string, query url.Values) ([
 	return result.Results, nil
 }
 
-func (s *Server) buildDiscovery(ctx context.Context, revision time.Time) (discoveryRecord, error) {
+func (s *Server) buildDiscovery(ctx context.Context, revision time.Time, refreshMetadata bool) (discoveryRecord, error) {
 	d := s.discoveryService
 	d.mu.Lock()
 	record := d.record
 	d.mu.Unlock()
 	previous := record
-	record.Version, record.Revision, record.HadMetadata = 1, revision, s.tmdbConfigured()
+	record.Version, record.SearchVersion, record.Revision, record.HadMetadata = 1, discoverySearchVersion, revision, s.tmdbConfigured()
 	record.PreferencesUpdatedAt = s.preferencesSnapshot().updatedAt
 	record.Error, record.NextAttempt = "", time.Time{}
 	record.Movies, record.Series = slices.Clone(record.Movies), slices.Clone(record.Series)
 	record.Assets = cloneDiscoveryMap(record.Assets)
 	record.Metadata, record.Matches = cloneDiscoveryMap(record.Metadata), cloneDiscoveryMap(record.Matches)
+	record.Cursors = cloneDiscoveryMap(record.Cursors)
+	if refreshMetadata || previous.SearchVersion != discoverySearchVersion || !previous.Revision.Equal(revision) || !previous.PreferencesUpdatedAt.Equal(record.PreferencesUpdatedAt) || previous.HadMetadata != record.HadMetadata {
+		record.Failures = 0
+		record.Paused = false
+		record.Pending = false
+		record.Cursors = make(map[string]int)
+	}
+	if refreshMetadata {
+		// Keep the saved lists until each replacement arrives. Mark them due so
+		// a failed forced refresh also refetches metadata on its background retry.
+		for kind, metadata := range record.Metadata {
+			metadata.FetchedAt = time.Time{}
+			record.Metadata[kind] = metadata
+		}
+	}
+	if previous.SearchVersion != discoverySearchVersion {
+		// Misses from category-scoped searches do not rule out a match from a
+		// provider-wide search. Recheck them without refetching fresh TMDB lists.
+		for key, match := range record.Matches {
+			if match.ItemID == "" {
+				delete(record.Matches, key)
+			}
+		}
+	}
 	s.restoreDiscoveryMatches(&record, previous)
 	if !record.HadMetadata {
 		record.Movies, record.Series = nil, nil
@@ -536,6 +723,8 @@ func (s *Server) buildDiscovery(ctx context.Context, revision time.Time) (discov
 		fresh[item.ID] = item
 	}
 	budget := discoverySearchBudget
+	pending := false
+	continuing := record.Pending
 	for _, kind := range []string{"movie", "series"} {
 		categories := s.discoveryCategories(kind)
 		if len(categories) == 0 {
@@ -546,7 +735,7 @@ func (s *Server) buildDiscovery(ctx context.Context, revision time.Time) (discov
 		if kind == "series" {
 			mediaType = "tv"
 		}
-		trends, err := s.discoveryTrends(ctx, &record, kind, mediaType)
+		trends, err := s.discoveryTrends(ctx, &record, kind, mediaType, continuing)
 		if err != nil {
 			return record, err
 		}
@@ -558,13 +747,15 @@ func (s *Server) buildDiscovery(ctx context.Context, revision time.Time) (discov
 		if err = s.publishDiscovery(record); err != nil {
 			return record, err
 		}
-		for _, title := range trends {
+		for index := min(record.Cursors[kind], len(trends)); index < len(trends); index++ {
+			title := trends[index]
 			if ctx.Err() != nil || !s.cache.libraryRevision().Equal(revision) {
 				return record, errCacheChanged
 			}
 			key := discoveryMatchKey(kind, title.ID)
 			link, known := record.Matches[key]
 			if known && link.ItemID == "" && link.Revision.Equal(revision) && link.Policy.Equal(record.PreferencesUpdatedAt) && time.Since(link.CheckedAt) < s.discoveryRefreshInterval() {
+				record.Cursors[kind] = index + 1
 				continue
 			}
 			matches := []model.Item{}
@@ -574,41 +765,36 @@ func (s *Server) buildDiscovery(ctx context.Context, revision time.Time) (discov
 			if len(matches) == 0 {
 				matches = discoveryMatches(items, kind, title)
 			}
-			searched, exhaustive := 0, true
-			if len(matches) == 0 {
-				for _, category := range categories {
-					if kindBudget <= 0 || budget <= 0 {
-						exhaustive = false
-						break
-					}
-					kindBudget--
-					budget--
-					page, err := s.discoveryBrowseCategory(ctx, kind, category, title.name(), revision)
-					if err != nil {
-						return record, err
-					}
-					searched++
-					exhaustive = exhaustive && !page.HasMore
-					items = append(items, page.Items...)
-					for _, item := range page.Items {
-						fresh[item.ID] = item
-					}
-					matches = discoveryMatches(items, kind, title)
-					if len(matches) > 0 {
-						break
-					}
+			searched, exhaustive := false, false
+			if len(matches) == 0 && (kindBudget <= 0 || budget <= 0) {
+				pending, record.Pending = true, true
+				break
+			}
+			if len(matches) == 0 && kindBudget > 0 && budget > 0 {
+				kindBudget--
+				budget--
+				page, err := s.discoveryBrowseCategory(ctx, kind, "*", title.name(), revision)
+				if err != nil {
+					return record, err
 				}
+				searched, exhaustive = true, !page.HasMore
+				items = append(items, page.Items...)
+				for _, item := range page.Items {
+					fresh[item.ID] = item
+				}
+				matches = discoveryMatches(items, kind, title)
 			}
 			if len(matches) == 0 {
+				record.Cursors[kind] = index + 1
 				// An incomplete or skipped search cannot prove a cached title gone.
-				if exhaustive && searched == len(categories) {
+				if exhaustive && searched {
 					record.Matches[key] = discoveryMatch{CheckedAt: time.Now(), Revision: revision, Policy: record.PreferencesUpdatedAt}
 					*values = slices.DeleteFunc(*values, func(v DiscoveryTitle) bool { return v.TMDBID == title.ID })
 					record.ExploreMovies = removeDiscoveryItem(record.ExploreMovies, link.ItemID)
 					record.ExploreSeries = removeDiscoveryItem(record.ExploreSeries, link.ItemID)
-					if err = s.publishDiscovery(record); err != nil {
-						return record, err
-					}
+				}
+				if err = s.publishDiscovery(record); err != nil {
+					return record, err
 				}
 				continue
 			}
@@ -619,23 +805,31 @@ func (s *Server) buildDiscovery(ctx context.Context, revision time.Time) (discov
 					return record, err
 				}
 				if !uniqueDiscoveryIdentity(title, identities) {
+					record.Cursors[kind] = index + 1
 					record.Matches[key] = discoveryMatch{CheckedAt: time.Now(), Revision: revision, Policy: record.PreferencesUpdatedAt}
 					*values = slices.DeleteFunc(*values, func(v DiscoveryTitle) bool { return v.TMDBID == title.ID })
+					if err = s.publishDiscovery(record); err != nil {
+						return record, err
+					}
 					continue
 				}
 			}
 			record.Matches[key] = newDiscoveryMatch(matches[0], time.Now(), revision, record.PreferencesUpdatedAt)
+			record.Cursors[kind] = index + 1
 			value := record.metadataTitle(matches[0], title)
 			*values = progressiveDiscovery(append(slices.DeleteFunc(*values, func(v DiscoveryTitle) bool { return v.TMDBID == title.ID }), value), trends)
 			if err = s.publishDiscovery(record); err != nil {
 				return record, err
 			}
 		}
-		*values = rankedDiscovery(*values, trends)
+		if record.Cursors[kind] >= len(trends) {
+			*values = rankedDiscovery(*values, trends)
+		}
 		if err = s.publishDiscovery(record); err != nil {
 			return record, err
 		}
 	}
+	record.Pending = pending
 	pruneDiscoveryMatches(&record)
 	return record, firstErr
 }
@@ -816,23 +1010,7 @@ func (s *Server) discoveryImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := "https://image.tmdb.org/t/p/" + size + path
-	if cached, ok := s.imageCache.Get(key); ok {
-		writeImage(w, cached, s.imageFailureTTL)
-		return
-	}
-	value, _, _ := s.imageFlights.Do(key, func() (any, error) {
-		if cached, ok := s.imageCache.Get(key); ok {
-			return cached, nil
-		}
-		image, err := s.fetchDiscoveryImage(key)
-		ttl := imageCacheTTL
-		if err != nil {
-			image, ttl = fallbackArtwork, s.imageFailureTTL
-		}
-		s.imageCache.SetWithTTL(key, image, int64(len(image.data)), ttl)
-		s.imageCache.Wait()
-		return image, nil
-	})
+	result := s.artwork.get(r.Context(), key)
 	d.mu.Lock()
 	_, exists = d.record.Assets[r.PathValue("id")]
 	d.mu.Unlock()
@@ -845,31 +1023,5 @@ func (s *Server) discoveryImage(w http.ResponseWriter, r *http.Request) {
 		blocked(w)
 		return
 	}
-	writeImage(w, value.(imageData), s.imageFailureTTL)
-}
-
-func (s *Server) fetchDiscoveryImage(uri string) (imageData, error) {
-	req, err := http.NewRequestWithContext(s.ctx, "GET", uri, nil)
-	if err != nil {
-		return imageData{}, err
-	}
-	res, err := s.discoveryService.imageClient.Do(req)
-	if err != nil {
-		return imageData{}, errors.New("metadata image unavailable")
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return imageData{}, errors.New("metadata image unavailable")
-	}
-	data, err := io.ReadAll(io.LimitReader(res.Body, (5<<20)+1))
-	if err != nil || len(data) > 5<<20 {
-		return imageData{}, errors.New("metadata image invalid")
-	}
-	mime := http.DetectContentType(data)
-	switch mime {
-	case "image/jpeg", "image/png", "image/gif", "image/webp", "image/avif":
-		return imageData{data: data, mime: mime}, nil
-	default:
-		return imageData{}, errors.New("metadata image invalid")
-	}
+	writeArtwork(w, result)
 }

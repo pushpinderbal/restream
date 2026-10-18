@@ -6,8 +6,8 @@ Restream brings your IPTV subscription to the browser. Host it on your own compu
 
 - 📺 **Live TV and programme guide**: browse channels and see what's on now and next.
 - 🎬 **Movies and shows**: explore searchable categories or search across your whole library.
-- ▶️ **Pick up where you left off**: Continue watching, Up next, and Recently played, with progress saved in your browser and kept separate for each signed-in account.
-- 🧭 **Discovery**: explore your library on Home, with optional TMDB Trending recommendations matched to titles your provider carries.
+- ▶️ **Pick up where you left off**: Continue watching, Up next, and Recently played, with history and progress saved on your server and shared across devices for each signed-in account. Without sign-in, everyone shares one history.
+- 🧭 **Discovery**: browse Explore and optional TMDB Trending side by side on Home, matched to titles your provider carries.
 - ⚡ **Shared library cache**: cached listings stay available while the server refreshes them in the background, reducing repeated requests to your provider.
 - 🔐 **Optional OIDC sign-in**: use your identity provider with viewer and administrator roles, or run without a login on your private network.
 - 📱 **Desktop and mobile**: responsive browsing, touch controls, and fullscreen playback.

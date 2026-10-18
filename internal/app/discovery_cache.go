@@ -61,15 +61,16 @@ func (s *Server) restoreDiscoveryMatches(record *discoveryRecord, previous disco
 	}
 }
 
-func (s *Server) discoveryTrends(ctx context.Context, record *discoveryRecord, kind, mediaType string) ([]tmdbTitle, error) {
+func (s *Server) discoveryTrends(ctx context.Context, record *discoveryRecord, kind, mediaType string, continuing bool) ([]tmdbTitle, error) {
 	metadata, exists := record.Metadata[kind]
-	if !exists || time.Since(metadata.FetchedAt) >= s.discoveryRefreshInterval() {
+	if !exists || metadata.FetchedAt.IsZero() || !continuing && time.Since(metadata.FetchedAt) >= s.discoveryRefreshInterval() {
 		titles, err := s.tmdbList(ctx, "trending/"+mediaType+"/week", nil)
 		if err != nil {
 			return nil, err
 		}
 		metadata = discoveryMetadata{Titles: slices.Clone(titles), FetchedAt: time.Now().UTC()}
 		record.Metadata[kind] = metadata
+		record.Cursors[kind] = 0
 	}
 	trends := []tmdbTitle{}
 	seen := map[int]bool{}

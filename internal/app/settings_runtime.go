@@ -170,7 +170,8 @@ func (rt *Runtime) updateSettings(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, rt.settings.response(rt.base.providerEnvironment))
 		return
 	}
-	providerChanged := effectiveProvider(next.Provider, rt.base.providerEnvironment) != effectiveProvider(rt.settings.Provider, rt.base.providerEnvironment) || next.Library.GuideHours != rt.settings.Library.GuideHours
+	providerIdentityChanged := effectiveProvider(next.Provider, rt.base.providerEnvironment) != effectiveProvider(rt.settings.Provider, rt.base.providerEnvironment)
+	providerChanged := providerIdentityChanged || next.Library.GuideHours != rt.settings.Library.GuideHours
 	if providerChanged && rt.manager != nil && rt.manager.Active() > 0 {
 		fail(w, 409, "streams_active", "Stop active playback before changing provider or guide settings.")
 		return
@@ -218,6 +219,10 @@ func (rt *Runtime) updateSettings(w http.ResponseWriter, r *http.Request) {
 	if next.TMDBReadAccessToken != rt.settings.TMDBReadAccessToken {
 		record := oldServer.discoveryService.record
 		record.NextAttempt = time.Time{}
+		record.Failures = 0
+		record.Paused = false
+		record.Pending = false
+		record.Cursors = nil
 		record.Metadata = nil
 		record.Error = ""
 		data, _ := json.Marshal(record)
@@ -226,7 +231,15 @@ func (rt *Runtime) updateSettings(w http.ResponseWriter, r *http.Request) {
 	if next.Library.GuideHours != rt.settings.Library.GuideHours || next.Provider.Timezone != rt.settings.Provider.Timezone {
 		_, _ = rt.db.Exec(`DELETE FROM meta WHERE key='epg_at'`)
 	}
-	server, err := New(cfg, provider, streamInterface(manager))
+	// Authentication pauses belong to the credentials that produced them.
+	// Other settings changes preserve listing retry state.
+	if providerIdentityChanged {
+		_, err = rt.db.Exec(`DELETE FROM cache_retries`)
+	}
+	var server *Server
+	if err == nil {
+		server, err = New(cfg, provider, streamInterface(manager))
+	}
 	if err != nil {
 		_ = rt.persist(rt.settings)
 		if providerChanged && manager != nil {
