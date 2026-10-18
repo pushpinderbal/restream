@@ -68,6 +68,7 @@ type entry struct {
 
 type Manager struct {
 	mu       sync.Mutex
+	outputMu sync.Mutex
 	cfg      Config
 	encoder  string
 	resolve  Resolver
@@ -253,8 +254,9 @@ func (m *Manager) Seek(ctx context.Context, id string, position float64) (Sessio
 		return Session{}, ErrInvalid
 	}
 	old := e.gen
+	slog.Debug("Stream seeking", "session_id", e.session.ID, "offset", position)
 	old.cancel()
-	go discard(old)
+	go m.discard(old)
 	m.launchLocked(e, position, old.done)
 	return e.session, nil
 }
@@ -266,12 +268,13 @@ func (m *Manager) Stop(id string) error {
 		delete(m.sessions, id)
 		e.gen.cancel()
 		m.stopping++
+		slog.Info("Stream stopped", "session_id", id, "reason", "requested", "state", e.session.State)
 	}
 	m.mu.Unlock()
 	if e == nil {
 		return ErrNotFound
 	}
-	discard(e.gen)
+	m.discard(e.gen)
 	m.mu.Lock()
 	m.stopping--
 	m.mu.Unlock()
@@ -297,6 +300,7 @@ func (m *Manager) Close() error {
 		for id, e := range m.sessions {
 			e.gen.cancel()
 			delete(m.sessions, id)
+			slog.Info("Stream stopped", "session_id", id, "reason", "server_shutdown", "state", e.session.State)
 		}
 	}
 	m.mu.Unlock()
@@ -326,6 +330,7 @@ func (m *Manager) sweep() {
 					delete(m.sessions, id)
 					e.gen.cancel()
 					m.stopping++
+					slog.Info("Stream stopped", "session_id", id, "reason", "idle_timeout", "state", e.session.State)
 					go m.retire(e.gen)
 				}
 			}
@@ -342,14 +347,18 @@ func (m *Manager) update(e *entry, g *generation, fn func(*Session)) {
 	}
 }
 
-func discard(g *generation) {
+func (m *Manager) discard(g *generation) {
 	<-g.done
+	// Removing an empty session directory must not race a new generation's
+	// MkdirAll between creating that parent and creating its child.
+	m.outputMu.Lock()
+	defer m.outputMu.Unlock()
 	_ = os.RemoveAll(g.dir)
 	// Remove the session directory only once every generation has been discarded.
 	_ = os.Remove(filepath.Dir(g.dir))
 }
 
-func (m *Manager) retire(g *generation) { discard(g); m.mu.Lock(); m.stopping--; m.mu.Unlock() }
+func (m *Manager) retire(g *generation) { m.discard(g); m.mu.Lock(); m.stopping--; m.mu.Unlock() }
 
 func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64, prior <-chan struct{}) {
 	defer m.wg.Done()
@@ -374,7 +383,10 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 		m.fail(e, g, ctx, "source_validation", "invalid_url", started)
 		return
 	}
-	if err := os.MkdirAll(g.dir, 0700); err != nil {
+	m.outputMu.Lock()
+	err = os.MkdirAll(g.dir, 0700)
+	m.outputMu.Unlock()
+	if err != nil {
 		m.fail(e, g, ctx, "output_directory", errorClass(err), started)
 		return
 	}
@@ -478,9 +490,13 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 		case err := <-done:
 			if !ready && playable(g.dir) {
 				ready = true
+				m.logReady(e, g, mode, started)
 			}
 			if ready && err == nil && !live {
-				m.update(e, g, func(s *Session) { s.State = "ended" })
+				m.update(e, g, func(s *Session) {
+					s.State = "ended"
+					slog.Info("Stream processing completed", "session_id", s.ID, "elapsed", time.Since(started).Round(time.Millisecond))
+				})
 			} else if live && ctx.Err() == nil {
 				reason := exitClass(err, stderr.String())
 				m.logFailure(e, "ffmpeg_exit", reason, started)
@@ -498,7 +514,7 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 				ready = true
 				tick.Stop()
 				startupTimer.Stop()
-				m.update(e, g, func(s *Session) { s.State = "ready" })
+				m.logReady(e, g, mode, started)
 			}
 		case <-startupTimer.C:
 			if !ready {
@@ -509,6 +525,13 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 			}
 		}
 	}
+}
+
+func (m *Manager) logReady(e *entry, g *generation, mode string, started time.Time) {
+	m.update(e, g, func(s *Session) {
+		s.State = "ready"
+		slog.Info("Stream ready", "session_id", s.ID, "processing", mode, "elapsed", time.Since(started).Round(time.Millisecond))
+	})
 }
 
 func playable(dir string) bool {
@@ -546,6 +569,8 @@ func (m *Manager) logFailure(e *entry, stage, reason string, started time.Time) 
 	message := "Stream startup failed"
 	if stage == "probe" {
 		message = "Stream probe failed; using transcode fallback"
+	} else if stage == "ffmpeg_exit" {
+		message = "Stream processing failed"
 	}
 	slog.Warn(message, "session_id", e.session.ID, "item_id", safeLogID(e.item.ID), "stage", stage, "reason", reason, "elapsed", time.Since(started).Round(time.Millisecond))
 }

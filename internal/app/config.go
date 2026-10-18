@@ -27,7 +27,7 @@ func LoadConfig() (Config, error) {
 	c := Config{
 		ListenAddr: env("LISTEN_ADDR", ":8080"), DataDir: "/data", WebDir: "/app/web",
 		Timezone: "UTC", UserAgent: os.Getenv("STALKER_USER_AGENT"),
-		TranscodeMode: "auto", MaxStreams: 1, EPGHours: 24, RefreshInterval: 24 * time.Hour,
+		TranscodeMode: "auto", MaxStreams: 1, EPGHours: 6, RefreshInterval: 24 * time.Hour,
 	}
 	var err error
 	c.Auth, err = loadAuthConfig()

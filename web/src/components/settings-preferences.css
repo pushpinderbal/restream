@@ -362,14 +362,6 @@ html:has(.settings-editable) {
   font-size: 13px;
   line-height: 1.6;
 }
-.settings-managed-note {
-  display: block;
-  margin: 6px 0 0 2px;
-  color: var(--muted-foreground);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
 .settings-status-heading {
   display: flex;
   flex-wrap: wrap;

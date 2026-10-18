@@ -185,6 +185,13 @@ func (s *Server) scheduler(catalog bool) {
 		if saveErr := s.saveScheduledRefresh(kind, *state); saveErr != nil {
 			slog.Warn("Could not persist refresh outcome", "kind", kind, "error", saveErr)
 		}
+		if err != nil {
+			attrs := append(refreshFailureAttrs(err), "kind", kind, "elapsed", finished.Sub(started).Round(time.Millisecond), "paused", state.Paused)
+			if state.NextRefreshAt != nil {
+				attrs = append(attrs, "next_retry_at", *state.NextRefreshAt)
+			}
+			slog.Warn("Provider refresh failed; showing saved data", attrs...)
+		}
 		s.stateMu.Unlock()
 	}
 }

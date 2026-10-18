@@ -78,7 +78,7 @@ func (s *Server) loadEpisodeListWithTTL(r *http.Request, series model.Item, key 
 		loaded, err := load(ctx)
 		if err != nil {
 			if s.ctx.Err() == nil {
-				slog.Warn("Episode load failed", "seriesID", safeEpisodeLogID(series.ID), "stage", "provider", "reason", episodeFailureReason(err), "elapsed", time.Since(started).Round(time.Millisecond))
+				slog.Warn("Episode load failed", "seriesID", safeEpisodeLogID(series.ID), "stage", "provider", "reason", providerFailureReason(err), "elapsed", time.Since(started).Round(time.Millisecond))
 			}
 			if saveErr := s.cache.cacheFailed(entry, err); saveErr != nil {
 				return nil, saveErr

@@ -300,6 +300,7 @@ async function mockApi(
     settingsSaveFailure?: boolean | (() => boolean);
     settingsSaveGate?: Promise<void>;
     guideHours?: number;
+    tmdbTokenConfigured?: boolean;
     providerEnvironment?: Array<
       | "portalUrl"
       | "mac"
@@ -403,7 +404,7 @@ async function mockApi(
       blockedCategories: [...preferences.configuration.blockedCategories],
       guideHours: options.guideHours ?? 48,
     },
-    discovery: { tmdbTokenConfigured: false },
+    discovery: { tmdbTokenConfigured: options.tmdbTokenConfigured ?? false },
     playback: { maxStreams: 1, transcodeMode: "auto" },
     updatedAt: "2026-09-28T12:00:00Z",
   };
@@ -3297,10 +3298,8 @@ test("Settings actions support keyboard submission and prevent duplicate pending
   } finally {
     releaseSave();
   }
-  await expect(
-    page.getByText("All changes saved.", { exact: true }),
-  ).toBeVisible();
-  await expect(save).not.toHaveAttribute("aria-busy", "true");
+  await expect(page.locator(".settings-save-bar")).toHaveCount(0);
+  await expect(save).toHaveCount(0);
   expect(api.effectiveSettings().playback.maxStreams).toBe(2);
   const refresh = page.getByRole("button", {
     name: /^(Refresh now|Refreshing…|Refreshed)$/,
@@ -3318,19 +3317,25 @@ test("Settings actions support keyboard submission and prevent duplicate pending
 test("Settings saves modified sections together and restores saved values", async ({
   page,
 }) => {
-  const api = await mockApi(page);
+  const api = await mockApi(page, { guideHours: 6 });
   await page.goto("/?view=settings");
+  await expect(
+    page.getByLabel("Guide coverage in hours", { exact: true }),
+  ).toHaveValue("6");
+  await expect(
+    page.getByText(/The guide normally updates every 4 hours/),
+  ).toBeVisible();
   const save = page.getByRole("button", { name: "Save changes", exact: true });
   const discard = page.getByRole("button", {
     name: "Discard changes",
     exact: true,
   });
-  await expect(save).toHaveCount(1);
-  await expect(save).toBeDisabled();
-  await expect(discard).toBeDisabled();
   await expect(
-    page.getByText("No unsaved changes", { exact: true }),
-  ).toBeVisible();
+    page.getByLabel("Maximum simultaneous streams", { exact: true }),
+  ).toHaveValue("1");
+  await expect(save).toHaveCount(0);
+  await expect(discard).toHaveCount(0);
+  await expect(page.locator(".settings-save-bar")).toHaveCount(0);
   await page
     .getByLabel("Maximum simultaneous streams", { exact: true })
     .fill("2");
@@ -3338,7 +3343,8 @@ test("Settings saves modified sections together and restores saved values", asyn
   await page
     .getByLabel("Maximum simultaneous streams", { exact: true })
     .fill("1");
-  await expect(save).toBeDisabled();
+  await expect(save).toHaveCount(0);
+  await expect(discard).toHaveCount(0);
   await page
     .getByRole("combobox", { name: "Refresh every", exact: true })
     .click();
@@ -3373,9 +3379,7 @@ test("Settings saves modified sections together and restores saved values", asyn
     page.getByText("Unsaved changes", { exact: true }),
   ).toBeVisible();
   await save.click();
-  await expect(
-    page.getByText("All changes saved.", { exact: true }),
-  ).toBeVisible();
+  await expect(page.locator(".settings-save-bar")).toHaveCount(0);
   expect(api.settingsPatches).toEqual([
     {
       library: {
@@ -3388,8 +3392,8 @@ test("Settings saves modified sections together and restores saved values", asyn
     },
   ]);
   expect(api.providerPatches).toEqual([]);
-  await expect(save).toBeDisabled();
-  await expect(discard).toBeDisabled();
+  await expect(save).toHaveCount(0);
+  await expect(discard).toHaveCount(0);
   await page.reload();
   await expect(
     page.getByLabel("Maximum simultaneous streams", { exact: true }),
@@ -3417,6 +3421,9 @@ test("Settings discards all drafts without saving and preserves drafts during re
   await page.setViewportSize({ width, height: 900 });
   const api = await mockApi(page, { refreshDelayMs: 500 });
   await page.goto("/?view=settings");
+  await expect(
+    page.getByText(/The guide normally updates every 4 hours/),
+  ).toBeVisible();
   await page.getByLabel("Timezone", { exact: true }).fill("Europe/London");
   await page.getByLabel("Guide coverage in hours", { exact: true }).fill("24");
   await page
@@ -3459,10 +3466,10 @@ test("Settings discards all drafts without saving and preserves drafts during re
   ).toHaveValue("");
   await expect(
     page.getByRole("button", { name: "Save changes", exact: true }),
-  ).toBeDisabled();
+  ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Discard changes", exact: true }),
-  ).toBeDisabled();
+  ).toHaveCount(0);
   expect(api.settingsPatches).toEqual([]);
   expect(api.mutations).toEqual([{ method: "POST", path: "/api/refresh" }]);
   expect(
@@ -3529,6 +3536,10 @@ test("Settings edits remaining provider fields with environment overrides at 390
     const input = page.getByLabel(label, { exact: true });
     await expect(input).toBeDisabled();
     await expect(input).toHaveValue("");
+    await expect(input).toHaveAttribute(
+      "placeholder",
+      "Managed by environment",
+    );
     await expect(input).toHaveAccessibleDescription("Managed by environment");
   }
   await page.getByText("Device identity", { exact: true }).click();
@@ -3548,9 +3559,7 @@ test("Settings edits remaining provider fields with environment overrides at 390
     deviceId: "app-managed-device",
     deviceId2: "app-managed-device-two",
   });
-  await expect(
-    page.getByText("All changes saved.", { exact: true }),
-  ).toBeVisible();
+  await expect(page.locator(".settings-save-bar")).toHaveCount(0);
   await page.reload();
   await page.getByText("Device identity", { exact: true }).click();
   await expect(page.getByLabel("Serial number", { exact: true })).toHaveValue(
@@ -3593,10 +3602,14 @@ test("Settings locks a fully environment-managed provider and still saves playba
   ]) {
     await expect(page.getByLabel(label, { exact: true })).toBeDisabled();
     await expect(page.getByLabel(label, { exact: true })).toHaveValue("");
+    await expect(page.getByLabel(label, { exact: true })).toHaveAttribute(
+      "placeholder",
+      "Managed by environment",
+    );
   }
   await expect(
     page.getByRole("button", { name: "Save changes", exact: true }),
-  ).toBeDisabled();
+  ).toHaveCount(0);
   await page
     .getByLabel("Maximum simultaneous streams", { exact: true })
     .fill("2");
@@ -3637,6 +3650,120 @@ test("Settings completes provider setup when only the portal URL is managed by e
   ).toBeEnabled();
 });
 
+for (const width of [1440, 390, 320]) {
+  test(`Settings shows managed fields and a saved token inside inputs at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    const api = await mockApi(page, {
+      providerEnvironment: [
+        "portalUrl",
+        "mac",
+        "timezone",
+        "serialNumber",
+        "deviceId",
+        "deviceId2",
+      ],
+      tmdbTokenConfigured: true,
+    });
+    await page.goto("/?view=settings");
+    for (const label of ["Portal URL", "MAC address", "Timezone"]) {
+      const input = page.getByLabel(label, { exact: true });
+      await expect(input).toHaveAttribute(
+        "placeholder",
+        "Managed by environment",
+      );
+      await expect(input).toHaveCSS("opacity", "1");
+      await expect(input).toBeDisabled();
+      await expect(input).toHaveValue("");
+      await expect(input).toHaveAccessibleDescription("Managed by environment");
+    }
+    if (process.env.CAPTURE_SCREENSHOTS) {
+      await page.evaluate(() => document.fonts.ready);
+      await page.screenshot({
+        path: `/tmp/restream-managed-inputs-${width}.png`,
+      });
+    }
+    await page.getByText("Device identity", { exact: true }).click();
+    for (const label of ["Serial number", "Device ID", "Secondary device ID"]) {
+      await expect(page.getByLabel(label, { exact: true })).toHaveAttribute(
+        "placeholder",
+        "Managed by environment",
+      );
+      await expect(page.getByLabel(label, { exact: true })).toBeDisabled();
+    }
+
+    const token = page.getByLabel("TMDB read access token", { exact: true });
+    await expect(token).toHaveValue("");
+    await expect(token).toHaveAttribute(
+      "placeholder",
+      "•••••••• — Token saved",
+    );
+    await expect(token).toHaveAccessibleDescription(
+      "Enter a new token to replace the saved one.",
+    );
+    await expect(page.locator(".settings-save-bar")).toHaveCount(0);
+    await page.locator("#settings-discovery").scrollIntoViewIfNeeded();
+    if (process.env.CAPTURE_SCREENSHOTS)
+      await page.screenshot({ path: `/tmp/restream-saved-token-${width}.png` });
+
+    // The visible mask is never a draft value or part of an unrelated save.
+    await page
+      .getByLabel("Maximum simultaneous streams", { exact: true })
+      .fill("2");
+    await page
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect(page.locator(".settings-save-bar")).toHaveCount(0);
+    expect(api.settingsPatches).toEqual([
+      { playback: { maxStreams: 2, transcodeMode: "auto" } },
+    ]);
+    await expect(token).toHaveAttribute(
+      "placeholder",
+      "•••••••• — Token saved",
+    );
+
+    await page
+      .getByRole("button", { name: "Remove token", exact: true })
+      .click();
+    await expect(token).toHaveAttribute("placeholder", "Token will be removed");
+    await page.getByRole("button", { name: "Keep token", exact: true }).click();
+    await expect(token).toHaveAttribute(
+      "placeholder",
+      "•••••••• — Token saved",
+    );
+    await expect(page.locator(".settings-save-bar")).toHaveCount(0);
+
+    await token.fill("replacement-test-token");
+    await token.fill("");
+    await expect(page.locator(".settings-save-bar")).toHaveCount(0);
+    await token.fill("replacement-test-token");
+    await page
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect(token).toHaveValue("");
+    await expect(token).toHaveAttribute(
+      "placeholder",
+      "•••••••• — Token saved",
+    );
+    expect(api.settingsPatches.at(-1)).toEqual({
+      discovery: { tmdbReadAccessToken: "replacement-test-token" },
+    });
+    await page.reload();
+    await expect(token).toHaveValue("");
+    await expect(token).toHaveAttribute(
+      "placeholder",
+      "•••••••• — Token saved",
+    );
+    expect(await page.locator("body").innerText()).not.toContain(
+      "replacement-test-token",
+    );
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+  });
+}
+
 test("Settings keeps failed drafts and masks, retains and clears the TMDB token", async ({
   page,
 }) => {
@@ -3645,6 +3772,10 @@ test("Settings keeps failed drafts and masks, retains and clears the TMDB token"
   await page.goto("/?view=settings");
   const token = page.getByLabel("TMDB read access token", { exact: true });
   await expect(token).toHaveAttribute("type", "password");
+  await expect(token).toHaveAttribute(
+    "placeholder",
+    "Enter a TMDB read access token",
+  );
   await token.fill("example-browser-test-token");
   await page.getByLabel("Timezone", { exact: true }).fill("Europe/London");
   await page.getByLabel("Guide coverage in hours", { exact: true }).fill("24");
@@ -3673,6 +3804,7 @@ test("Settings keeps failed drafts and masks, retains and clears the TMDB token"
     .poll(() => api.effectiveSettings().discovery.tmdbTokenConfigured)
     .toBe(true);
   await expect(token).toHaveValue("");
+  await expect(token).toHaveAttribute("placeholder", "•••••••• — Token saved");
   expect(Object.keys(api.settingsPatches[1]).sort()).toEqual([
     "discovery",
     "library",
@@ -3689,20 +3821,20 @@ test("Settings keeps failed drafts and masks, retains and clears the TMDB token"
   await expect(
     page.getByText("Token will be removed when you save.", { exact: true }),
   ).toBeVisible();
+  await expect(token).toHaveAttribute("placeholder", "Token will be removed");
   await page
     .getByRole("button", { name: "Discard changes", exact: true })
     .click();
   expect(api.effectiveSettings().discovery.tmdbTokenConfigured).toBe(true);
+  await expect(token).toHaveAttribute("placeholder", "•••••••• — Token saved");
   await expect(
     page.getByRole("button", { name: "Save changes", exact: true }),
-  ).toBeDisabled();
+  ).toHaveCount(0);
   await page
     .getByLabel("Maximum simultaneous streams", { exact: true })
     .fill("2");
   await page.getByRole("button", { name: "Save changes", exact: true }).click();
-  await expect(
-    page.getByText("All changes saved.", { exact: true }),
-  ).toBeVisible();
+  await expect(page.locator(".settings-save-bar")).toHaveCount(0);
   expect(api.settingsPatches.at(-1)).toEqual({
     playback: { maxStreams: 2, transcodeMode: "auto" },
   });
@@ -3712,6 +3844,10 @@ test("Settings keeps failed drafts and masks, retains and clears the TMDB token"
   await expect
     .poll(() => api.effectiveSettings().discovery.tmdbTokenConfigured)
     .toBe(false);
+  await expect(token).toHaveAttribute(
+    "placeholder",
+    "Enter a TMDB read access token",
+  );
 });
 
 test("Settings releases playback and refreshes metadata without changing saved configuration", async ({

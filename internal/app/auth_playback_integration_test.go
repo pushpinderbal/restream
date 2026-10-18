@@ -31,6 +31,7 @@ func authPlaybackRequest(t *testing.T, a *authTestApp, method, path, body string
 }
 
 func TestOIDCPlaybackBelongsToItsUser(t *testing.T) {
+	logs := captureActivityLogs(t)
 	p := newAuthTestProvider(t)
 	owner := newAuthTestApp(t, p, nil)
 	streams := &policyStreams{values: map[string]stream.Session{}}
@@ -96,6 +97,13 @@ func TestOIDCPlaybackBelongsToItsUser(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 204 || streams.Active() != 0 {
 		t.Fatal("owner could not stop playback", resp.StatusCode)
+	}
+	output := logs()
+	if strings.Count(output, "Stream starting") != 1 || !strings.Contains(output, "session_id=test-1") || !strings.Contains(output, "user_id=") {
+		t.Fatal("stream start is missing its user/session context", output)
+	}
+	if strings.Contains(output, "secret-command") || strings.Contains(output, "opaque-access-token") || strings.Contains(output, "opaque-refresh-token") {
+		t.Fatal("stream activity exposed credentials", output)
 	}
 }
 

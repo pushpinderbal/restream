@@ -79,7 +79,7 @@ func TestLoadConfigIgnoresAllApplicationSettingEnvironmentVariables(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TMDBReadAccessToken != "" || cfg.MaxStreams != 1 || cfg.TranscodeMode != "auto" || cfg.EPGHours != 24 || cfg.RefreshInterval != 24*time.Hour || len(cfg.categoryEnvironment.dashboard) != 0 || len(cfg.categoryEnvironment.blocked) != 0 {
+	if cfg.TMDBReadAccessToken != "" || cfg.MaxStreams != 1 || cfg.TranscodeMode != "auto" || cfg.EPGHours != 6 || cfg.RefreshInterval != 24*time.Hour || len(cfg.categoryEnvironment.dashboard) != 0 || len(cfg.categoryEnvironment.blocked) != 0 {
 		t.Fatal("application settings were read from the environment")
 	}
 }

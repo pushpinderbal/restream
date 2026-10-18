@@ -239,7 +239,7 @@ func TestDefaultRefreshCadenceAndLegacyPreferenceView(t *testing.T) {
 	if code != 200 || json.Unmarshal([]byte(body), &value) != nil || value.RefreshIntervalSeconds != 86400 || len(value.Categories) != 0 || value.Configuration.DashboardCategories == nil || value.Configuration.BlockedCategories == nil {
 		t.Fatal(code, body)
 	}
-	if s.refreshInterval(true) != 24*time.Hour || s.refreshInterval(false) != 12*time.Hour || s.discoveryRefreshInterval() != 24*time.Hour {
+	if s.refreshInterval(true) != 24*time.Hour || s.refreshInterval(false) != 4*time.Hour || s.discoveryRefreshInterval() != 24*time.Hour {
 		t.Fatal("configured cadence did not drive derived freshness")
 	}
 	for _, data := range []string{`{"refreshIntervalSeconds":60,"categories":[]}`, `not valid JSON`} {

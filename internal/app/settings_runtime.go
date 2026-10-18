@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -171,6 +172,19 @@ func (rt *Runtime) updateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	providerIdentityChanged := effectiveProvider(next.Provider, rt.base.providerEnvironment) != effectiveProvider(rt.settings.Provider, rt.base.providerEnvironment)
+	sections := []string{}
+	if next.Provider != rt.settings.Provider {
+		sections = append(sections, "provider")
+	}
+	if !reflect.DeepEqual(next.Library, rt.settings.Library) {
+		sections = append(sections, "library")
+	}
+	if next.Playback != rt.settings.Playback {
+		sections = append(sections, "playback")
+	}
+	if next.TMDBReadAccessToken != rt.settings.TMDBReadAccessToken {
+		sections = append(sections, "discovery")
+	}
 	providerChanged := providerIdentityChanged || next.Library.GuideHours != rt.settings.Library.GuideHours
 	if providerChanged && rt.manager != nil && rt.manager.Active() > 0 {
 		fail(w, 409, "streams_active", "Stop active playback before changing provider or guide settings.")
@@ -190,18 +204,21 @@ func (rt *Runtime) updateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		provider, manager, err = runtimeDependencies(cfg)
 		if err != nil {
+			slog.Error("Settings update failed", append(activityAttrs(r), "stage", "playback_prepare")...)
 			rt.restoreGeneration(true, oldServer)
 			fail(w, 500, "settings_unavailable", "Unable to prepare playback for these settings.")
 			return
 		}
 	} else if manager != nil {
 		if err = manager.Configure(cfg.MaxStreams, cfg.TranscodeMode); err != nil {
+			slog.Warn("Settings update failed", append(activityAttrs(r), "stage", "playback_configure")...)
 			fail(w, 400, "invalid_settings", "Unable to apply playback settings.")
 			return
 		}
 	}
 	next.UpdatedAt = time.Now().UTC()
 	if err = rt.persist(next); err != nil {
+		slog.Error("Settings update failed", append(activityAttrs(r), "stage", "settings_save")...)
 		if providerChanged {
 			if manager != nil {
 				_ = manager.Close()
@@ -242,6 +259,7 @@ func (rt *Runtime) updateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		_ = rt.persist(rt.settings)
+		slog.Error("Settings update failed", append(activityAttrs(r), "stage", "settings_apply")...)
 		if providerChanged && manager != nil {
 			_ = manager.Close()
 		}
@@ -255,6 +273,7 @@ func (rt *Runtime) updateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	rt.server, rt.provider, rt.manager, rt.settings = server, provider, manager, next
 	server.stopBlockedSessions()
+	slog.Info("Settings updated", append(activityAttrs(r), "sections", sections)...)
 	respond(w, 200, next.response(rt.base.providerEnvironment))
 }
 

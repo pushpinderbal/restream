@@ -554,7 +554,7 @@ func safeEpisodeLogID(id string) string {
 	}
 	return id
 }
-func episodeFailureReason(err error) string {
+func providerFailureReason(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timeout"
 	}
@@ -563,9 +563,11 @@ func episodeFailureReason(err error) string {
 	}
 	message := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(message, "response exceeds configured size limit"):
+		return "response_too_large"
 	case strings.Contains(message, "http 429"), strings.Contains(message, "rate limit"):
 		return "rate_limited"
-	case strings.Contains(message, "authorization"), strings.Contains(message, "unauthorized"):
+	case strings.Contains(message, "authorization"), strings.Contains(message, "unauthorized"), strings.Contains(message, "http 401"), strings.Contains(message, "http 403"), strings.Contains(message, "handshake returned no token"):
 		return "authorization"
 	case strings.Contains(message, "invalid data"), strings.Contains(message, "invalid portal list"), strings.Contains(message, "invalid portal ordered list"), strings.Contains(message, "invalid portal episode list"):
 		return "invalid_portal_data"
@@ -591,6 +593,7 @@ func (s *Server) doRefresh(catalog, epg bool) error {
 	var refreshErr error
 	if catalog {
 		started := time.Now()
+		slog.Info("Portal metadata refresh started")
 		ctx, cancel := context.WithTimeout(s.ctx, refreshAttemptTimeout)
 		items, err := s.provider.Catalog(ctx)
 		if err == nil {
@@ -615,7 +618,6 @@ func (s *Server) doRefresh(catalog, epg bool) error {
 				return err
 			}
 			message = "Portal metadata refresh failed. Showing saved data."
-			slog.Warn("Portal metadata refresh failed", "error", err, "elapsed", time.Since(started).Round(time.Millisecond))
 			refreshErr = err
 		} else {
 			slog.Info("Portal metadata refresh completed", "liveChannels", len(items), "elapsed", time.Since(started).Round(time.Millisecond))
@@ -625,14 +627,14 @@ func (s *Server) doRefresh(catalog, epg bool) error {
 		s.stateMu.Unlock()
 		if err == nil && s.tmdbConfigured() {
 			if _, ok := s.provider.(model.BrowseProvider); ok {
-				if discoveryErr := s.refreshDiscoveryAfterLibrary(s.cache.libraryRevision()); discoveryErr != nil && s.ctx.Err() == nil {
-					slog.Warn("Trending refresh did not finish; saved titles remain available")
-				}
+				// Discovery records its own outcome and retry details.
+				_ = s.refreshDiscoveryAfterLibrary(s.cache.libraryRevision())
 			}
 		}
 	}
 	if epg && s.ctx.Err() == nil {
 		started := time.Now()
+		slog.Info("Program guide refresh started")
 		ctx, cancel := context.WithTimeout(s.ctx, refreshAttemptTimeout)
 		programs, err := s.provider.EPG(ctx)
 		cancel()
@@ -648,11 +650,9 @@ func (s *Server) doRefresh(catalog, epg bool) error {
 				return err
 			}
 			message = "Program guide refresh failed. Showing saved data."
-			slog.Warn("Program guide refresh failed", "error", err, "elapsed", time.Since(started).Round(time.Millisecond))
 			refreshErr = err
 		} else if err = s.cache.setEPG(programs); err != nil {
 			message = "Program guide cache could not be saved."
-			slog.Warn("Could not persist program guide cache", "error", err)
 			refreshErr = err
 		} else {
 			slog.Info("Program guide refresh completed", "programs", len(programs), "elapsed", time.Since(started).Round(time.Millisecond))
@@ -764,6 +764,15 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	}
 	session, err := s.streams.Start(r.Context(), item, body.Start)
 	if err != nil {
+		if r.Context().Err() == nil {
+			reason := "stream_unavailable"
+			if errors.Is(err, stream.ErrCapacity) {
+				reason = "capacity_reached"
+			} else if errors.Is(err, stream.ErrInvalid) {
+				reason = "invalid_request"
+			}
+			slog.Warn("Stream start rejected", append(activityAttrs(r), "kind", item.Kind, "reason", reason)...)
+		}
 		streamError(w, err)
 		return
 	}
@@ -771,6 +780,7 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		blocked(w)
 		return
 	}
+	slog.Info("Stream starting", append(activityAttrs(r), "session_id", session.ID, "kind", item.Kind, "offset", body.Start)...)
 	respond(w, 201, session)
 }
 func (s *Server) session(w http.ResponseWriter, r *http.Request) {

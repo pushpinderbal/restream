@@ -146,7 +146,7 @@ func New(cfg Config) (*Client, error) {
 		return nil, errors.New("invalid EPG hours")
 	}
 	if cfg.EPGHours == 0 {
-		cfg.EPGHours = 24
+		cfg.EPGHours = 6
 	}
 	if cfg.MaxResponseBytes < 0 || cfg.MaxResponseBytes > maxAllowedResponseBytes {
 		return nil, errors.New("invalid maximum portal response size")
