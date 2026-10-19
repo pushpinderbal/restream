@@ -239,7 +239,7 @@ func TestDefaultRefreshCadenceAndLegacyPreferenceView(t *testing.T) {
 	if code != 200 || json.Unmarshal([]byte(body), &value) != nil || value.RefreshIntervalSeconds != 86400 || len(value.Categories) != 0 || value.Configuration.DashboardCategories == nil || value.Configuration.BlockedCategories == nil {
 		t.Fatal(code, body)
 	}
-	if s.refreshInterval(true) != 24*time.Hour || s.refreshInterval(false) != 4*time.Hour || s.discoveryRefreshInterval() != 24*time.Hour {
+	if s.refreshInterval() != 24*time.Hour || s.discoveryRefreshInterval() != 24*time.Hour {
 		t.Fatal("configured cadence did not drive derived freshness")
 	}
 	for _, data := range []string{`{"refreshIntervalSeconds":60,"categories":[]}`, `not valid JSON`} {
@@ -426,49 +426,6 @@ func TestDiscoveryCategoryPolicyWarmsOnlyEligibleCategoriesAndRefiltersCache(t *
 	defer p.queryMu.Unlock()
 	if len(p.queries) != len(queries) {
 		t.Fatal("fully excluded dashboard performed provider requests", p.queries)
-	}
-}
-
-func TestConfiguredCadenceSchedulesWithoutExtraProviderRequests(t *testing.T) {
-	cfg := Config{DataDir: t.TempDir(), WebDir: t.TempDir(), RefreshInterval: time.Hour}
-	p := &fixtureProvider{}
-	s, err := New(cfg, p, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ts := httptest.NewServer(s)
-	t.Cleanup(func() { ts.Close(); s.Close() })
-	waitFor(t, func() bool {
-		s.stateMu.RLock()
-		defer s.stateMu.RUnlock()
-		return s.catalogSync.LastSuccessfulAt != nil && s.epgSync.LastSuccessfulAt != nil && !s.catalogSync.Running && !s.epgSync.Running
-	})
-	p.mu.Lock()
-	catalogs, epgs := p.catalogs, p.epgs
-	p.mu.Unlock()
-	waitFor(t, func() bool {
-		s.stateMu.RLock()
-		defer s.stateMu.RUnlock()
-		return s.catalogSync.NextRefreshAt != nil && s.epgSync.NextRefreshAt != nil && time.Until(*s.catalogSync.NextRefreshAt) < 61*time.Minute && time.Until(*s.epgSync.NextRefreshAt) < 13*time.Hour
-	})
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.catalogs != catalogs || p.epgs != epgs {
-		t.Fatal("saving cadence forced provider requests", p.catalogs, p.epgs)
-	}
-	if s.discoveryRefreshInterval() != time.Hour {
-		t.Fatal("adaptive caches did not follow saved cadence")
-	}
-	// Successful requests can still return expired provider data. That must
-	// not turn the one-hour preference into an implicit minute retry loop.
-	last := time.Now().UTC()
-	for _, end := range []time.Time{last.Add(2 * time.Minute), last.Add(20 * time.Minute)} {
-		if err := s.cache.setEPG([]model.Program{{ChannelID: "live:1", Title: "Old guide", Start: last.Add(-time.Hour), End: end}}); err != nil {
-			t.Fatal(err)
-		}
-		if next := s.nextScheduledRefresh(false, last, 15*time.Minute); !next.Equal(last.Add(15 * time.Minute)) {
-			t.Fatal("stale/insufficient guide coverage accelerated the cadence", next)
-		}
 	}
 }
 

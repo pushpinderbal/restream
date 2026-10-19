@@ -246,7 +246,7 @@ func (s *Server) refreshBrowsePage(ctx context.Context, provider model.BrowsePro
 	library := s.cache.cacheRevision()
 	flightKey := fmt.Sprintf("%s:%d:%d", key, generation, library.UnixNano())
 	_, err = waitCache(ctx, s.cacheFlight(&s.browseFlights, flightKey, func() (any, error) {
-		saved, found, err := s.cache.browseSnapshot(q, s.refreshInterval(true))
+		saved, found, err := s.cache.browseSnapshot(q, s.refreshInterval())
 		if err != nil || found && !saved.Stale {
 			return nil, err
 		}
@@ -326,7 +326,7 @@ func (s *Server) browseRangeSnapshot(q model.BrowseQuery, through int) (model.Br
 		if err = s.cache.db.QueryRow(`SELECT fetched_at FROM pages WHERE kind=? AND category=? AND search=? AND page=?`, q.Kind, q.Category, q.Search, n).Scan(&at); err != nil {
 			return out, false, err
 		}
-		out.Stale = out.Stale || at == 0 || time.Since(time.Unix(0, at)) >= s.refreshInterval(true)
+		out.Stale = out.Stale || at == 0 || time.Since(time.Unix(0, at)) >= s.refreshInterval()
 		out.Items = append(out.Items, page.Items...)
 		out.Total, out.HasMore = page.Total, page.HasMore
 		if !page.HasMore {
@@ -348,7 +348,7 @@ func (s *Server) loadBrowseRange(ctx context.Context, provider model.BrowseProvi
 	for n := q.Page; n <= through; n++ {
 		current := q
 		current.Page = n
-		saved, ok, readErr := s.cache.browseSnapshot(current, s.refreshInterval(true))
+		saved, ok, readErr := s.cache.browseSnapshot(current, s.refreshInterval())
 		if readErr != nil {
 			return page, readErr
 		}
@@ -383,7 +383,7 @@ func (s *Server) loadBrowseRange(ctx context.Context, provider model.BrowseProvi
 			if err := s.refreshBrowsePage(rangeCtx, provider, current); err != nil {
 				return nil, err
 			}
-			saved, ok, err := s.cache.browseSnapshot(current, s.refreshInterval(true))
+			saved, ok, err := s.cache.browseSnapshot(current, s.refreshInterval())
 			if err != nil {
 				return nil, err
 			}

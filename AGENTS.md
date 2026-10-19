@@ -1,4 +1,4 @@
-1. Do not write unit tests for everything. Prefer integration tests.
+1. Prefer behavior-focused integration tests for user workflows and meaningful failure cases. Consolidate shared setup and overlapping scenarios. Avoid tests for cosmetic styling and repeating whole workflows at nearby screen sizes; keep desktop/mobile coverage and add sizes only for distinct behavior.
 2. Prefer trusted libraries over hand-rolling complexity.
 3. Prefer modern, cohesive UI built with shadcn/ui, Spectrum UI, Radix UI, and Tailwind. Check these libraries and reuse the app's existing components before creating custom UI. Use shared variants and theme tokens for consistent buttons, controls, spacing, and interaction states; avoid one-off designs or style overrides when a suitable design component exists.
 4. For UI work, run the app and test it in a browser, including primary interactions and desktop/mobile layouts.

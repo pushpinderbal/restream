@@ -71,10 +71,16 @@ func (s *Server) initScheduledRefresh() error {
 		// Recompute successful schedules when cadence changes, but never shorten
 		// a persisted failure cooldown because settings or the process changed.
 		if !state.Paused && state.Failures == 0 {
-			next := s.nextScheduledRefresh(catalog, last, s.refreshInterval(catalog))
+			next := s.nextScheduledRefresh(last)
 			if resume || len(data) > 0 && saved.Configuration != configuration {
 				next = time.Now().UTC()
 			}
+			state.NextRefreshAt = &next
+		}
+		if !catalog && !state.Paused && state.Failures > 0 && state.FinishedAt != nil && state.NextRefreshAt != nil {
+			// Older guide retries may predate the configured regular interval.
+			// Preserve any longer provider cooldown when updating that schedule.
+			next := maxTime(*state.NextRefreshAt, s.nextScheduledRefresh(*state.FinishedAt))
 			state.NextRefreshAt = &next
 		}
 		if err := s.saveScheduledRefresh(kind, *state); err != nil {
@@ -168,13 +174,17 @@ func (s *Server) scheduler(catalog bool) {
 			if state.Paused {
 				state.Error = "Provider authentication or configuration needs attention. Update Settings or retry manually."
 			} else {
-				next := finished.Add(retryCooldown(err, state.Failures))
+				delay := retryCooldown(err, state.Failures)
+				if !catalog {
+					delay = max(delay, s.refreshInterval())
+				}
+				next := finished.Add(delay)
 				state.NextRefreshAt = &next
 			}
 		} else {
 			state.Failures, state.Paused, state.Error = 0, false, ""
 			state.LastSuccessfulAt = &finished
-			next := s.nextScheduledRefresh(catalog, finished, s.refreshInterval(catalog))
+			next := s.nextScheduledRefresh(finished)
 			state.NextRefreshAt = &next
 		}
 		if catalog {
