@@ -1,6 +1,10 @@
 import type { ComponentProps } from "react";
 import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu";
 import { cn } from "@/lib/utils";
+import { Check } from "lucide-react";
+
+const menuItemClass =
+  "relative flex min-h-11 cursor-default select-none items-center gap-3 rounded-md px-3 py-2 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground";
 
 function DropdownMenu(
   props: ComponentProps<typeof DropdownMenuPrimitive.Root>,
@@ -23,10 +27,13 @@ function DropdownMenuContent({
   className,
   sideOffset = 8,
   collisionPadding = 16,
+  portalContainer,
   ...props
-}: ComponentProps<typeof DropdownMenuPrimitive.Content>) {
+}: ComponentProps<typeof DropdownMenuPrimitive.Content> & {
+  portalContainer?: HTMLElement | null;
+}) {
   return (
-    <DropdownMenuPrimitive.Portal>
+    <DropdownMenuPrimitive.Portal container={portalContainer}>
       <DropdownMenuPrimitive.Content
         data-slot="dropdown-menu-content"
         className={cn(
@@ -48,12 +55,31 @@ function DropdownMenuItem({
   return (
     <DropdownMenuPrimitive.Item
       data-slot="dropdown-menu-item"
-      className={cn(
-        "relative flex min-h-11 cursor-default select-none items-center gap-3 rounded-md px-3 py-2 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground",
-        className,
-      )}
+      className={cn(menuItemClass, className)}
       {...props}
     />
+  );
+}
+
+const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup;
+
+function DropdownMenuRadioItem({
+  className,
+  children,
+  ...props
+}: ComponentProps<typeof DropdownMenuPrimitive.RadioItem>) {
+  return (
+    <DropdownMenuPrimitive.RadioItem
+      className={cn(menuItemClass, "pl-9", className)}
+      {...props}
+    >
+      <span className="absolute left-3 flex size-4 items-center justify-center">
+        <DropdownMenuPrimitive.ItemIndicator>
+          <Check aria-hidden="true" />
+        </DropdownMenuPrimitive.ItemIndicator>
+      </span>
+      {children}
+    </DropdownMenuPrimitive.RadioItem>
   );
 }
 
@@ -90,4 +116,6 @@ export {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
 };

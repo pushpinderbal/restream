@@ -70,10 +70,18 @@ type Program struct {
 }
 
 type Source struct {
-	URL      string
-	Headers  map[string]string
-	Live     bool
-	Duration float64
+	URL       string
+	Headers   map[string]string
+	Live      bool
+	Duration  float64
+	Subtitles []SubtitleSource
+}
+
+// SubtitleSource is provider-only metadata; URLs and headers never reach the browser.
+type SubtitleSource struct {
+	URL, Label, Language string
+	Headers              map[string]string
+	Default, Forced      bool
 }
 
 type Provider interface {

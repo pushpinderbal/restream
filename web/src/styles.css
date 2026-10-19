@@ -964,6 +964,15 @@ p {
 .control-button:hover {
   transform: scale(1.12);
 }
+.control-button[data-active="true"] {
+  color: var(--primary);
+}
+.subtitles-control {
+  margin-left: auto;
+}
+.subtitles-control + .fullscreen {
+  margin-left: 0;
+}
 .control-button:disabled {
   opacity: 0.35;
 }
@@ -1292,6 +1301,18 @@ p {
   }
   .video-wrap {
     border-radius: 0;
+  }
+}
+
+@media (max-width: 380px) {
+  .controls-row {
+    gap: 3px;
+  }
+  .time-readout {
+    line-height: 1.2;
+  }
+  .time-readout span {
+    display: block;
   }
 }
 

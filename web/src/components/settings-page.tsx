@@ -41,6 +41,7 @@ import { Spinner } from "./spectrumui/spinner-dependencies";
 import { MorphButton } from "./spectrumui/morph-button";
 import { AnimatedAlert } from "./spectrumui/animated-alert";
 import { TextStates } from "./spectrumui/text-states";
+import { SubtitleAppearanceSettings } from "./subtitle-appearance-settings";
 import "./settings-preferences.css";
 
 export type RefreshTarget = "all" | "catalog" | "epg";
@@ -50,10 +51,11 @@ const settingsSections = [
   { id: "settings-library", label: "Library & guide" },
   { id: "settings-discovery", label: "Discovery" },
   { id: "settings-playback", label: "Playback" },
+  { id: "settings-subtitles", label: "Subtitles" },
   { id: "settings-status", label: "Status" },
   { id: "settings-about", label: "About" },
 ];
-const readOnlySections = settingsSections.slice(-2);
+const readOnlySections = settingsSections.slice(-3);
 const processingLabels: Record<string, string> = {
   auto: "Automatic",
   copy: "Copy",
@@ -329,6 +331,7 @@ export function SettingsPage({
 
   const details = (
     <>
+      <SubtitleAppearanceSettings />
       <section
         id="settings-status"
         tabIndex={-1}

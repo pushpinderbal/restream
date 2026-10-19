@@ -37,24 +37,29 @@ type Config struct {
 type Resolver func(context.Context, model.Item) (model.Source, error)
 
 type Session struct {
-	ID       string  `json:"id"`
-	URL      string  `json:"url"`
-	State    string  `json:"state"`
-	Duration float64 `json:"duration"`
-	Offset   float64 `json:"offset"`
-	Error    string  `json:"error,omitempty"`
+	ID             string          `json:"id"`
+	URL            string          `json:"url"`
+	State          string          `json:"state"`
+	Duration       float64         `json:"duration"`
+	Offset         float64         `json:"offset"`
+	Error          string          `json:"error,omitempty"`
+	Subtitles      []SubtitleTrack `json:"subtitles,omitempty"`
+	SubtitleOffset *float64        `json:"subtitleOffset,omitempty"`
 }
 
 type generation struct {
-	number uint64
-	cancel context.CancelFunc
-	dir    string
-	done   chan struct{}
+	number    uint64
+	cancel    context.CancelFunc
+	dir       string
+	done      chan struct{}
+	subtitles *subtitleState
 }
 
 type probeResult struct {
 	mode     string
 	duration float64
+	origin   float64
+	hls      bool
 }
 
 type entry struct {
@@ -195,6 +200,8 @@ func (m *Manager) launchLocked(e *entry, pos float64, prior <-chan struct{}) {
 	e.session.State = "starting"
 	e.session.Offset = pos
 	e.session.Error = ""
+	e.session.Subtitles = nil
+	e.session.SubtitleOffset = nil
 	e.session.URL = "/api/streams/" + e.session.ID + "/" + strconv.FormatUint(number, 10) + "/index.m3u8"
 	m.wg.Add(1)
 	go m.run(ctx, e, g, pos, prior)
@@ -305,6 +312,8 @@ func (m *Manager) Close() error {
 	}
 	m.mu.Unlock()
 	m.wg.Wait()
+	m.outputMu.Lock()
+	defer m.outputMu.Unlock()
 	return os.RemoveAll(m.dir)
 }
 
@@ -349,6 +358,10 @@ func (m *Manager) update(e *entry, g *generation, fn func(*Session)) {
 
 func (m *Manager) discard(g *generation) {
 	<-g.done
+	if g.subtitles != nil {
+		g.subtitles.mu.Lock()
+		defer g.subtitles.mu.Unlock()
+	}
 	// Removing an empty session directory must not race a new generation's
 	// MkdirAll between creating that parent and creating its child.
 	m.outputMu.Lock()
@@ -362,7 +375,13 @@ func (m *Manager) retire(g *generation) { m.discard(g); m.mu.Lock(); m.stopping-
 
 func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64, prior <-chan struct{}) {
 	defer m.wg.Done()
-	defer close(g.done)
+	var subtitleDone <-chan struct{}
+	defer func() {
+		if subtitleDone != nil {
+			<-subtitleDone
+		}
+		close(g.done)
+	}()
 	started := time.Now()
 	if prior != nil {
 		select {
@@ -394,21 +413,41 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 	m.mu.Lock()
 	cached := e.probe
 	m.mu.Unlock()
-	mode, probedDuration := "transcode", 0.0
-	if cached != nil {
-		mode, probedDuration = cached.mode, cached.duration
-	} else {
+	if cached == nil {
 		var reason string
-		mode, probedDuration, reason = m.probeWithDiagnostics(startupCtx, source)
+		cached, reason = m.probeWithDiagnostics(startupCtx, source)
 		if reason != "" && ctx.Err() == nil {
 			m.logFailure(e, "probe", reason, started)
 		} else if reason == "" && ctx.Err() == nil {
 			m.mu.Lock()
 			if m.sessions[e.session.ID] == e && e.gen == g {
-				e.probe = &probeResult{mode: mode, duration: probedDuration}
+				e.probe = cached
 			}
 			m.mu.Unlock()
 		}
+	}
+	mode, probedDuration := cached.mode, cached.duration
+	if e.transcodeMode == "copy" || e.transcodeMode == "transcode" {
+		mode = e.transcodeMode
+	}
+	if e.item.Kind != "live" && (cached.hls || len(source.Subtitles) > 0) {
+		subtitles := newSubtitleState(ctx, source, cached.origin, filepath.Join(g.dir, "subtitles"), &m.outputMu)
+		m.mu.Lock()
+		g.subtitles = subtitles
+		m.mu.Unlock()
+		done := make(chan struct{})
+		subtitleDone = done
+		go func() {
+			defer close(done)
+			tracks := subtitles.discover(cached.hls, fmt.Sprintf("/api/streams/%s/%d/", e.session.ID, g.number))
+			var subtitleOffset *float64
+			if len(tracks) > 0 && mode == "copy" && pos > 0 {
+				if actual, ok := probeCopySubtitleOffset(ctx, source, pos, cached.origin); ok {
+					subtitleOffset = &actual
+				}
+			}
+			m.update(e, g, func(s *Session) { s.Subtitles = tracks; s.SubtitleOffset = subtitleOffset })
+		}()
 	}
 	duration := 0.0
 	if !source.Live && e.item.Kind != "live" {
@@ -421,9 +460,6 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 		}
 	}
 	m.update(e, g, func(s *Session) { s.Duration = duration })
-	if e.transcodeMode == "copy" || e.transcodeMode == "transcode" {
-		mode = e.transcodeMode
-	}
 	live := source.Live || e.item.Kind == "live"
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-readrate", "1"}
 	if !live {
@@ -454,7 +490,8 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 	} else {
 		args = append(args, "-c:v", m.encoder)
 		if m.encoder == "libx264" {
-			args = append(args, "-preset", "veryfast", "-tune", "zerolatency")
+			// Retain decoded A53 caption side data in the encoded H.264 SEI.
+			args = append(args, "-preset", "veryfast", "-tune", "zerolatency", "-a53cc", "1")
 		}
 		args = append(args, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k")
 		args = append(args, "-force_key_frames", "expr:gte(t,n_forced*1)")
@@ -669,15 +706,16 @@ func validHeader(k, v string) bool {
 	return true
 }
 
-func (m *Manager) probeWithDiagnostics(ctx context.Context, source model.Source) (string, float64, string) {
+func (m *Manager) probeWithDiagnostics(ctx context.Context, source model.Source) (*probeResult, string) {
+	result := &probeResult{mode: "transcode"}
 	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	args := []string{"-v", "error", "-rw_timeout", "10000000", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-show_entries", "stream=codec_name,codec_type,pix_fmt,duration:format=duration", "-of", "json"}
+	args := []string{"-v", "error", "-rw_timeout", "10000000", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-show_entries", "stream=codec_name,codec_type,pix_fmt,duration:format=duration,start_time,format_name", "-of", "json"}
 	if len(source.Headers) > 0 {
 		var hs strings.Builder
 		for k, v := range source.Headers {
 			if !validHeader(k, v) {
-				return "transcode", 0, "invalid_header"
+				return result, "invalid_header"
 			}
 			hs.WriteString(k + ": " + v + "\r\n")
 		}
@@ -690,9 +728,9 @@ func (m *Manager) probeWithDiagnostics(ctx context.Context, source model.Source)
 	out, err := cmd.Output()
 	if err != nil {
 		if pctx.Err() != nil {
-			return "transcode", 0, errorClass(pctx.Err())
+			return result, errorClass(pctx.Err())
 		}
-		return "transcode", 0, exitClass(err, stderr.String())
+		return result, exitClass(err, stderr.String())
 	}
 	var data struct {
 		Streams []struct {
@@ -702,11 +740,13 @@ func (m *Manager) probeWithDiagnostics(ctx context.Context, source model.Source)
 			Duration  string `json:"duration"`
 		} `json:"streams"`
 		Format struct {
-			Duration string `json:"duration"`
+			Duration   string `json:"duration"`
+			StartTime  string `json:"start_time"`
+			FormatName string `json:"format_name"`
 		} `json:"format"`
 	}
 	if json.Unmarshal(out, &data) != nil {
-		return "transcode", 0, "invalid_probe_output"
+		return result, "invalid_probe_output"
 	}
 	duration, _ := strconv.ParseFloat(data.Format.Duration, 64)
 	if duration <= 0 || math.IsNaN(duration) || math.IsInf(duration, 0) {
@@ -731,9 +771,15 @@ func (m *Manager) probeWithDiagnostics(ctx context.Context, source model.Source)
 		}
 	}
 	if video && audio {
-		return "copy", duration, ""
+		result.mode = "copy"
 	}
-	return "transcode", duration, ""
+	result.duration = duration
+	result.origin, _ = strconv.ParseFloat(data.Format.StartTime, 64)
+	if math.IsNaN(result.origin) || math.IsInf(result.origin, 0) {
+		result.origin = 0
+	}
+	result.hls = strings.Contains(data.Format.FormatName, "hls")
+	return result, ""
 }
 
 func (m *Manager) MediaHandler() http.Handler { return http.HandlerFunc(m.serveMedia) }
@@ -749,6 +795,10 @@ func (m *Manager) serveMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, gen, file := parts[2], parts[3], parts[4]
+	if strings.HasPrefix(file, "subtitles-") && strings.HasSuffix(file, ".json") {
+		m.serveSubtitles(w, r, id, gen, strings.TrimSuffix(strings.TrimPrefix(file, "subtitles-"), ".json"))
+		return
+	}
 	if file != "index.m3u8" && !(strings.HasPrefix(file, "seg-") && strings.HasSuffix(file, ".ts") && digits(file[4:len(file)-3])) {
 		http.NotFound(w, r)
 		return
