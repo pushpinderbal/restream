@@ -757,7 +757,8 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "invalid", "Invalid start position.")
 		return
 	}
-	session, err := s.streams.Start(r.Context(), item, body.Start)
+	ctx := stream.WithLogger(r.Context(), slog.With(activityAttrs(r)...))
+	session, err := s.streams.Start(ctx, item, body.Start)
 	if err != nil {
 		if r.Context().Err() == nil {
 			reason := "stream_unavailable"

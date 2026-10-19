@@ -3,17 +3,26 @@ package app
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/pushpinderbal/restream/internal/stalker"
 )
 
 // Log classifications instead of upstream error text: URLs, tokens and response
-// bodies can contain credentials. Internal user IDs link activity without names.
+// bodies can contain credentials. Keep user IDs alongside readable identities.
 func activityAttrs(r *http.Request) []any {
-	if user := authenticatedUser(r); user != nil {
-		return []any{"user_id", user.ID}
+	return userLogAttrs(authenticatedUser(r))
+}
+
+func userLogAttrs(user *AuthUser) []any {
+	if user == nil {
+		return []any{"user", "anonymous"}
 	}
-	return nil
+	name := strings.TrimSpace(user.Name)
+	if name == "" {
+		name = user.ID
+	}
+	return []any{"user_id", user.ID, "user", name}
 }
 
 func refreshFailureAttrs(err error) []any {

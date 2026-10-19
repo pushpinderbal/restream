@@ -88,10 +88,10 @@ type authClaims struct {
 
 func (c authClaims) valid() bool { return c.Role == "viewer" || c.Role == "admin" }
 func (c authClaims) name() string {
-	if c.Name != "" {
-		return c.Name
+	if name := strings.TrimSpace(c.Name); name != "" {
+		return name
 	}
-	return c.Username
+	return strings.TrimSpace(c.Username)
 }
 
 func newAuth(cfg AuthConfig, db *sql.DB) (*authManager, error) {
@@ -350,18 +350,24 @@ func (a *authManager) callback(w http.ResponseWriter, r *http.Request) {
 	a.sessions.Clear(ctx)
 	a.sessions.Put(ctx, "user_id", userID)
 	a.sessions.Put(ctx, "user_version", version)
-	slog.Info("User signed in", "user_id", userID, "role", claims.Role)
+	slog.Info("User signed in", append(userLogAttrs(&AuthUser{ID: userID, Name: claims.name()}), "role", claims.Role)...)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 func (a *authManager) logout(w http.ResponseWriter, r *http.Request) {
 	userID := a.sessions.GetString(r.Context(), "user_id")
+	var user *AuthUser
+	if userID != "" {
+		user = &AuthUser{ID: userID}
+		// Read the saved display name without refreshing provider credentials.
+		_ = a.db.QueryRowContext(r.Context(), `SELECT name FROM auth_users WHERE id=?`, userID).Scan(&user.Name)
+	}
 	if err := a.sessions.Destroy(r.Context()); err != nil {
-		slog.Error("Sign-out failed", "stage", "session_destroy", "user_id", userID)
+		slog.Error("Sign-out failed", append(userLogAttrs(user), "stage", "session_destroy")...)
 		fail(w, 500, "auth", "Unable to sign out.")
 		return
 	}
 	if userID != "" {
-		slog.Info("User signed out", "user_id", userID)
+		slog.Info("User signed out", userLogAttrs(user)...)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -405,7 +411,7 @@ func (a *authManager) user(r *http.Request) *AuthUser {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
 		defer cancel()
 		_, _ = a.db.ExecContext(ctx, `UPDATE auth_users SET role='',checked_at=0,session_version=session_version+1 WHERE id=?`, id)
-		slog.Warn("User access revoked", "user_id", id, "stage", "session_revalidation", "reason", reason)
+		slog.Warn("User access revoked", append(userLogAttrs(&u), "stage", "session_revalidation", "reason", reason)...)
 		return nil
 	}
 	var token oauth2.Token
@@ -445,9 +451,10 @@ func (a *authManager) user(r *http.Request) *AuthUser {
 	if err != nil {
 		return revoke("user_save_failed")
 	}
-	if u.Role != claims.Role {
-		slog.Info("User role changed", "user_id", id, "previous_role", u.Role, "role", claims.Role)
-	}
+	previousRole := u.Role
 	u.Name, u.Role = claims.name(), claims.Role
+	if previousRole != u.Role {
+		slog.Info("User role changed", append(userLogAttrs(&u), "previous_role", previousRole, "role", u.Role)...)
+	}
 	return &u
 }

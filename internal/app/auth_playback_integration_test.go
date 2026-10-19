@@ -100,7 +100,7 @@ func TestOIDCPlaybackBelongsToItsUser(t *testing.T) {
 		t.Fatal("owner could not stop playback", resp.StatusCode)
 	}
 	output := logs()
-	if strings.Count(output, "Stream starting") != 1 || !strings.Contains(output, "session_id=test-1") || !strings.Contains(output, "user_id=") {
+	if strings.Count(output, "Stream starting") != 1 || !strings.Contains(output, "session_id=test-1") || !strings.Contains(output, "user_id=") || !strings.Contains(output, "user=Alex") {
 		t.Fatal("stream start is missing its user/session context", output)
 	}
 	if strings.Contains(output, "secret-command") || strings.Contains(output, "opaque-access-token") || strings.Contains(output, "opaque-refresh-token") {
