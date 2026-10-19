@@ -177,7 +177,7 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 			last = cache.categoriesAt
 		}
 		cache.mu.RUnlock()
-		if s.tmdbConfigured() && s.nextScheduledRefresh(true, last, s.refreshInterval(true)).After(time.Now()) {
+		if s.tmdbConfigured() && s.nextScheduledRefresh(last).After(time.Now()) {
 			s.queueDiscovery(cache.libraryRevision())
 		}
 		s.wg.Add(1)
@@ -304,7 +304,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	catSync, epgSync := s.catalogSync, s.epgSync
 	catErr, epgErr := s.catalogError, s.epgError
 	s.stateMu.RUnlock()
-	catSync.IntervalSeconds, epgSync.IntervalSeconds = s.refreshInterval(true).Seconds(), s.refreshInterval(false).Seconds()
+	catSync.IntervalSeconds, epgSync.IntervalSeconds = s.refreshInterval().Seconds(), s.refreshInterval().Seconds()
 	catSync.Error, epgSync.Error = catErr, epgErr
 	s.discoveryService.mu.Lock()
 	discoveryRecord := s.discoveryService.record
@@ -581,13 +581,8 @@ func providerFailureReason(err error) string {
 		return "provider_error"
 	}
 }
-func (s *Server) refreshInterval(catalog bool) time.Duration {
-	p := s.preferencesSnapshot()
-	cadence := time.Duration(p.value.RefreshIntervalSeconds) * time.Second
-	if catalog {
-		return cadence
-	}
-	return guideRefreshInterval
+func (s *Server) refreshInterval() time.Duration {
+	return time.Duration(s.preferencesSnapshot().value.RefreshIntervalSeconds) * time.Second
 }
 func (s *Server) doRefresh(catalog, epg bool) error {
 	var refreshErr error

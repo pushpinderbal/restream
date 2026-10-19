@@ -901,9 +901,9 @@ function SettingsForms({
             </div>
           </div>
           <p className="settings-field-help">
-            Cached titles stay visible while updates arrive. The guide normally
-            updates every 4 hours, or sooner when coverage runs low. Stop active
-            playback before changing guide coverage.
+            Cached titles stay visible while updates arrive. The library and
+            guide use the selected refresh interval. Stop active playback before
+            changing guide coverage.
           </p>
           {categoryError && (
             <AnimatedAlert variant="warning">{categoryError}</AnimatedAlert>

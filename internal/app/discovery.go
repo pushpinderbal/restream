@@ -253,7 +253,7 @@ func (s *Server) discoveryCandidates() ([]model.Item, error) {
 	policy := s.preferencesSnapshot()
 	s.cache.mu.RLock()
 	defer s.cache.mu.RUnlock()
-	ttl := s.refreshInterval(true)
+	ttl := s.refreshInterval()
 	if ttl <= 0 {
 		ttl = 24 * time.Hour
 	}
@@ -570,7 +570,7 @@ func (s *Server) discoveryBrowseCategory(ctx context.Context, kind, categoryID, 
 	if err := s.refreshBrowsePage(ctx, p, q); err != nil {
 		return model.BrowsePage{}, err
 	}
-	page, _, err := s.cache.browseSnapshot(q, s.refreshInterval(true))
+	page, _, err := s.cache.browseSnapshot(q, s.refreshInterval())
 	if err != nil {
 		return model.BrowsePage{}, err
 	}

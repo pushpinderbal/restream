@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Locator } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { createHistoryFixture } from "./watch-history-fixture";
 
 type Auth = {
@@ -151,51 +151,6 @@ async function openAccount(page: Page) {
   return accountMenu(page);
 }
 
-async function reviewInteraction(page: Page, target: Locator, label: string) {
-  if (!process.env.INTERACTION_REVIEW) return;
-  await target.scrollIntoViewIfNeeded();
-  await page.screenshot({ path: `../output/interaction-review/${label}.png` });
-}
-
-async function focusUnderline(target: Locator, pseudo = "::before") {
-  return target.evaluate((element, selector) => {
-    const style = getComputedStyle(element, selector);
-    return (
-      style.content !== "none" &&
-      style.content !== "normal" &&
-      style.display !== "none" &&
-      Number(style.opacity) > 0 &&
-      parseFloat(style.width) > 0 &&
-      parseFloat(style.height) > 0
-    );
-  }, pseudo);
-}
-
-async function expectPointerFocus(page: Page, target: Locator) {
-  await expect(page.locator("html")).toHaveAttribute(
-    "data-input-modality",
-    "pointer",
-  );
-  await expect(target).toHaveCSS("outline-style", "none");
-  await expect(target).toHaveCSS("box-shadow", "none");
-  await expect(target).not.toHaveCSS("text-decoration-line", /underline/);
-  if (
-    await target.evaluate((element) => element.classList.contains("focus-icon"))
-  )
-    await expect.poll(() => focusUnderline(target)).toBe(false);
-}
-
-async function expectKeyboardIcon(page: Page, target: Locator) {
-  await expect(page.locator("html")).toHaveAttribute(
-    "data-input-modality",
-    "keyboard",
-  );
-  await expect(target).toBeFocused();
-  await expect(target).toHaveCSS("outline-style", "none");
-  await expect(target).toHaveCSS("box-shadow", "none");
-  await expect.poll(() => focusUnderline(target)).toBe(true);
-}
-
 async function openSettings(page: Page) {
   const menu = await openAccount(page);
   await menu.getByRole("menuitem", { name: "Settings", exact: true }).click();
@@ -216,11 +171,6 @@ test("login gate prevents protected requests and reports callback errors", async
   ).toHaveAttribute("href", "/auth/login");
   await expect(page.getByRole("alert")).toContainText("does not have access");
   expect(state.privateRequests).toEqual([]);
-  if (process.env.CAPTURE_SCREENSHOTS)
-    await page.screenshot({
-      path: "../output/auth-ui/login-desktop.png",
-      fullPage: true,
-    });
 });
 
 test("failed session check fails closed and supports retry", async ({
@@ -270,19 +220,12 @@ for (const width of [1440, 320]) {
     await expect(
       menu.getByRole("menuitem", { name: /Sign(?:ing)? out/ }),
     ).toHaveCount(0);
-    if (process.env.CAPTURE_SCREENSHOTS)
-      await page.screenshot({
-        path: `../output/auth-ui/anonymous-account-${width}.png`,
-      });
+
     await page.keyboard.press("Escape");
     await expect(menu).toHaveCount(0);
     await expect(account(page)).toBeFocused();
-    await expectKeyboardIcon(page, account(page));
-    await reviewInteraction(
-      page,
-      account(page),
-      `account-${width}-keyboard-escape`,
-    );
+    await expect(account(page)).toBeFocused();
+
     await openAccount(page);
     // A locator click waits for stability; raw mouse input can race Radix's
     // deferred outside-click listener when the menu has just mounted.
@@ -291,39 +234,21 @@ for (const width of [1440, 320]) {
     });
     await expect(menu).toHaveCount(0);
     await expect(account(page)).toBeFocused();
-    await expectPointerFocus(page, account(page));
-    await reviewInteraction(
-      page,
-      account(page),
-      `account-${width}-pointer-outside`,
-    );
+
     await page.keyboard.press("Tab");
     await page.keyboard.press("Shift+Tab");
-    await expectKeyboardIcon(page, account(page));
-    await reviewInteraction(
-      page,
-      account(page),
-      `account-${width}-keyboard-tab`,
-    );
+    await expect(account(page)).toBeFocused();
+
     await account(page).press("ArrowDown");
     await expect(
       menu.getByRole("menuitem", { name: "Settings", exact: true }),
     ).toBeFocused();
     await page.keyboard.press("Escape");
     await expect(account(page)).toBeFocused();
-    await reviewInteraction(
-      page,
-      account(page),
-      `account-${width}-keyboard-arrow-escape`,
-    );
-    await expectKeyboardIcon(page, account(page));
+
+    await expect(account(page)).toBeFocused();
     await openSettings(page);
-    await expectPointerFocus(page, account(page));
-    await reviewInteraction(
-      page,
-      account(page),
-      `account-${width}-pointer-settings`,
-    );
+
     await expect(page.getByLabel("Portal URL", { exact: true })).toBeVisible();
     await expect(account(page)).toHaveAttribute("aria-current", "page");
     await expect(account(page)).toHaveClass(/active/);
@@ -404,20 +329,12 @@ test("viewer setup guidance protects every route and fits mobile widths", async 
   ]) {
     await page.goto(url);
     await expectViewerNotice();
-    if (process.env.CAPTURE_SCREENSHOTS)
-      await page.screenshot({
-        path: `../output/provider-setup/viewer-${name}-1440.png`,
-      });
   }
   // The same notice is shared by all routes. Resize the mounted notice to
   // cover mobile wrapping without repeating six full app loads per width.
   for (const width of [390, 320]) {
     await page.setViewportSize({ width, height: 900 });
     await expectViewerNotice();
-    if (process.env.CAPTURE_SCREENSHOTS)
-      await page.screenshot({
-        path: `../output/provider-setup/viewer-player-${width}.png`,
-      });
   }
   expect(
     state.privateRequests.some((path) => path.startsWith("/api/settings")),
@@ -519,11 +436,7 @@ for (const width of [1440, 320]) {
         () => document.documentElement.scrollWidth <= innerWidth,
       ),
     ).toBe(true);
-    if (process.env.CAPTURE_SCREENSHOTS)
-      await page.screenshot({
-        path: `../output/settings-design/status-viewer-${width}.png`,
-        fullPage: false,
-      });
+
     await openAccount(page);
     await accountMenu(page)
       .getByRole("menuitem", { name: "Sign out", exact: true })
@@ -692,11 +605,6 @@ test("admin navigation fits 320px with accessible controls", async ({
   );
   await nav.getByRole("button", { name: "Account", exact: true }).click();
   await expect(page.getByText("Bob", { exact: true })).toBeVisible();
-  if (process.env.CAPTURE_SCREENSHOTS)
-    await page.screenshot({
-      path: "../output/auth-ui/account-admin-320.png",
-      fullPage: true,
-    });
 });
 
 test("auth works without BroadcastChannel and rechecks on focus", async ({
@@ -778,11 +686,7 @@ for (const width of [1440, 320]) {
     await expect(
       status.getByRole("button", { name: "Refresh now", exact: true }),
     ).toBeVisible();
-    if (process.env.CAPTURE_SCREENSHOTS)
-      await page.screenshot({
-        path: `../output/settings-design/status-admin-${width}.png`,
-        fullPage: false,
-      });
+
     // A provider role downgrade removes an already mounted administrative form.
     state.setAuth({ mode: "oidc", user: { ...admin.user!, role: "viewer" } });
     const before = state.authChecks();

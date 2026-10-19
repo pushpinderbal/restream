@@ -345,25 +345,14 @@ func (s *Server) policyMedia(next http.Handler) http.Handler {
 }
 
 func (s *Server) discoveryRefreshInterval() time.Duration {
-	return s.refreshInterval(true)
+	return s.refreshInterval()
 }
 
-func (s *Server) nextScheduledRefresh(catalog bool, last time.Time, interval time.Duration) time.Time {
+func (s *Server) nextScheduledRefresh(last time.Time) time.Time {
 	if last.IsZero() {
 		return time.Now()
 	}
-	next := last.Add(interval)
-	if catalog {
-		return next
-	}
-	s.cache.mu.RLock()
-	programs := append([]model.Program(nil), s.cache.programs...)
-	s.cache.mu.RUnlock()
-	coverage := guideCoverageEnd(programs, last)
-	if !coverage.IsZero() {
-		next = minTime(next, maxTime(last.Add(guideMinimumRefreshInterval), coverage.Add(-guideCoverageMargin)))
-	}
-	return next
+	return last.Add(s.refreshInterval())
 }
 
 func maxTime(a, b time.Time) time.Time {

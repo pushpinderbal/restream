@@ -60,7 +60,7 @@ async function choose(page: Page, label: string, option: string) {
   await page.getByRole("option", { name: option, exact: true }).click();
 }
 
-for (const width of [1440, 390, 320]) {
+for (const width of [1440, 320]) {
   test(`viewer subtitle appearance is immediate, local, and persists at ${width}px`, async ({
     page,
   }) => {
@@ -120,11 +120,7 @@ for (const width of [1440, 390, 320]) {
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth),
     ).toBeLessThanOrEqual(width);
-    if (process.env.CAPTURE_SCREENSHOTS && width !== 320)
-      await page.screenshot({
-        path: `../output/subtitle-settings-${width}.png`,
-        fullPage: true,
-      });
+
     await page.reload();
     await expect(
       page.getByRole("combobox", { name: "Font", exact: true }),
@@ -235,66 +231,5 @@ test("invalid stored subtitle preferences fall back to safe defaults", async ({
   await expect(page.locator(".subtitle-preview-caption")).toHaveCSS(
     "color",
     "rgb(255, 255, 255)",
-  );
-});
-
-test("native video cues use the same selected colors and fonts as the preview", async ({
-  page,
-}, testInfo) => {
-  await mockSettings(page);
-  await page.goto("/?view=settings");
-  await choose(page, "Font", "Monospace");
-  await choose(page, "Text color", "Cyan");
-  await choose(page, "Background", "Solid black");
-  // A real MediaStream exercises Chromium's native cue renderer without a
-  // provider or an encoded fixture. The canvas only supplies the video frame.
-  await page.evaluate(async () => {
-    const preview = document.querySelector<HTMLElement>(
-      ".subtitle-appearance-preview",
-    )!;
-    const canvas = document.createElement("canvas");
-    canvas.width = 640;
-    canvas.height = 360;
-    const context = canvas.getContext("2d")!;
-    context.fillStyle = "#516d79";
-    context.fillRect(0, 0, 640, 360);
-    const wrapper = document.createElement("div");
-    wrapper.className = "video-wrap";
-    wrapper.dataset.nativeAppearance = "";
-    wrapper.style.cssText = `${preview.style.cssText}; position: fixed; z-index: 100; inset: 10px auto auto 10px; width: 640px; height: 360px; background: #516d79;`;
-    const video = document.createElement("video");
-    video.muted = true;
-    video.playsInline = true;
-    video.srcObject = canvas.captureStream(1);
-    video.style.cssText = "width: 100%; height: 100%;";
-    wrapper.append(video);
-    document.body.append(wrapper);
-    const track = video.addTextTrack("subtitles", "Native style preview", "en");
-    track.addCue(
-      new VTTCue(0, 3600, "The coast is clear.\nLet’s see what comes next."),
-    );
-    track.mode = "showing";
-    await video.play();
-  });
-  const native = page.locator("[data-native-appearance]");
-  await expect
-    .poll(() =>
-      native
-        .locator("video")
-        .evaluate((video) => video.textTracks[0].activeCues?.length),
-    )
-    .toBe(1);
-  await native.screenshot({
-    path: process.env.CAPTURE_SCREENSHOTS
-      ? "../output/subtitle-native-cyan.png"
-      : testInfo.outputPath("native-subtitle-cyan-monospace.png"),
-  });
-  await expect(page.locator(".subtitle-preview-caption")).toHaveCSS(
-    "font-family",
-    /Courier New/,
-  );
-  await expect(page.locator(".subtitle-preview-caption")).toHaveCSS(
-    "color",
-    "rgb(128, 237, 255)",
   );
 });

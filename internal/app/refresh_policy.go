@@ -6,12 +6,7 @@ import (
 	"time"
 )
 
-const (
-	guideRefreshInterval        = 4 * time.Hour
-	guideCoverageMargin         = time.Hour
-	guideMinimumRefreshInterval = 15 * time.Minute
-	refreshAttemptTimeout       = 5 * time.Minute
-)
+const refreshAttemptTimeout = 5 * time.Minute
 
 // Jitter spreads recovery work across instances. A provider's Retry-After is
 // always a floor, even when it exceeds our ordinary backoff cap.
