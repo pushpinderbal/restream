@@ -36,52 +36,80 @@ func captureActivityLogs(t *testing.T) func() string {
 }
 
 func TestSignInAndSettingsActivityLogs(t *testing.T) {
-	logs := captureActivityLogs(t)
-	p := newAuthTestProvider(t)
-	p.role = "admin"
-	a := newAuthTestApp(t, p, nil)
-	var identity struct{ User AuthUser }
-	if err := json.Unmarshal([]byte(a.login(t)), &identity); err != nil || identity.User.ID == "" {
-		t.Fatal("missing signed-in identity", err)
-	}
-	for _, expected := range []string{"Sign-in started", "User signed in", "user_id=" + identity.User.ID, "role=admin"} {
-		if !strings.Contains(logs(), expected) {
-			t.Fatalf("missing %q: %s", expected, logs())
-		}
-	}
-	before := logs()
-	for range 5 {
-		a.get(t, "/api/auth").Body.Close()
-		a.get(t, "/api/status").Body.Close()
-	}
-	if logs() != before {
-		t.Fatal("routine auth/status polling produced activity logs", logs())
-	}
-	resp := authPlaybackRequest(t, a, "PATCH", "/api/settings", `{"discovery":{"tmdbReadAccessToken":"private-metadata-token"}}`)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !strings.Contains(logs(), "Settings updated") || !strings.Contains(logs(), "sections=[discovery]") {
-		t.Fatal("settings change was not logged", resp.StatusCode, logs())
-	}
-	before = logs()
-	resp = authPlaybackRequest(t, a, "PATCH", "/api/settings", `{"discovery":{"tmdbReadAccessToken":"private-metadata-token"}}`)
-	resp.Body.Close()
-	if logs() != before {
-		t.Fatal("unchanged settings produced activity logs", logs())
-	}
-	resp = authPlaybackRequest(t, a, "POST", "/auth/logout", "")
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent || !strings.Contains(logs(), "User signed out") {
-		t.Fatal("sign-out was not logged", resp.StatusCode, logs())
-	}
-	resp = a.get(t, "/auth/callback?code=private-code&state=private-state&error=private-provider-error")
-	resp.Body.Close()
-	if !strings.Contains(logs(), "Sign-in failed") || !strings.Contains(logs(), "stage=callback_validation") {
-		t.Fatal("failed sign-in stage was not logged", logs())
-	}
-	for _, secret := range []string{"private-", "opaque-access-token", "opaque-refresh-token", "test-secret", p.name, p.server.URL} {
-		if strings.Contains(logs(), secret) {
-			t.Fatalf("activity logs exposed %q: %s", secret, logs())
-		}
+	for _, tc := range []struct{ label, name, username, wantName string }{
+		{"display name", "Alex", "alex-user", "Alex"},
+		{"username", "  ", "alex-user", "alex-user"},
+		{"user ID", "", "", ""},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			logs := captureActivityLogs(t)
+			p := newAuthTestProvider(t)
+			p.role = "admin"
+			p.name = tc.name
+			p.claims = func(claims map[string]any) { claims["preferred_username"] = tc.username }
+			a := newAuthTestApp(t, p, nil)
+			var identity struct{ User AuthUser }
+			if err := json.Unmarshal([]byte(a.login(t)), &identity); err != nil || identity.User.ID == "" || identity.User.Name != tc.wantName {
+				t.Fatal("missing signed-in identity", err)
+			}
+			for _, expected := range []string{"Sign-in started", "User signed in", "user_id=" + identity.User.ID, "role=admin"} {
+				if !strings.Contains(logs(), expected) {
+					t.Fatalf("missing %q: %s", expected, logs())
+				}
+			}
+			before := logs()
+			for range 5 {
+				a.get(t, "/api/auth").Body.Close()
+				a.get(t, "/api/status").Body.Close()
+			}
+			if logs() != before {
+				t.Fatal("routine auth/status polling produced activity logs", logs())
+			}
+			resp := authPlaybackRequest(t, a, "PATCH", "/api/settings", `{"discovery":{"tmdbReadAccessToken":"private-metadata-token"}}`)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK || !strings.Contains(logs(), "Settings updated") || !strings.Contains(logs(), "sections=[discovery]") {
+				t.Fatal("settings change was not logged", resp.StatusCode, logs())
+			}
+			before = logs()
+			resp = authPlaybackRequest(t, a, "PATCH", "/api/settings", `{"discovery":{"tmdbReadAccessToken":"private-metadata-token"}}`)
+			resp.Body.Close()
+			if logs() != before {
+				t.Fatal("unchanged settings produced activity logs", logs())
+			}
+			resp = authPlaybackRequest(t, a, "POST", "/auth/logout", "")
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent || !strings.Contains(logs(), "User signed out") {
+				t.Fatal("sign-out was not logged", resp.StatusCode, logs())
+			}
+			resp = a.get(t, "/auth/callback?code=private-code&state=private-state&error=private-provider-error")
+			resp.Body.Close()
+			if !strings.Contains(logs(), "Sign-in failed") || !strings.Contains(logs(), "stage=callback_validation") {
+				t.Fatal("failed sign-in stage was not logged", logs())
+			}
+			wantUser := tc.wantName
+			if wantUser == "" {
+				wantUser = identity.User.ID
+			}
+			for _, message := range []string{"User signed in", "Settings updated", "User signed out"} {
+				found := false
+				for _, line := range strings.Split(logs(), "\n") {
+					if strings.Contains(line, `msg="`+message+`"`) {
+						found = true
+						if !strings.Contains(line, "user="+wantUser) || !strings.Contains(line, "user_id="+identity.User.ID) {
+							t.Fatalf("missing user context for %q: %s", message, line)
+						}
+					}
+				}
+				if !found {
+					t.Fatalf("missing activity %q", message)
+				}
+			}
+			for _, secret := range []string{"private-", "opaque-access-token", "opaque-refresh-token", "test-secret", p.server.URL} {
+				if strings.Contains(logs(), secret) {
+					t.Fatalf("activity logs exposed %q: %s", secret, logs())
+				}
+			}
+		})
 	}
 }
 

@@ -78,7 +78,8 @@ func TestFFmpegSessionLifecycle(t *testing.T) {
 	}
 	defer m.Close()
 	item := model.Item{ID: "v", Kind: "movie", Duration: 60}
-	s, err := m.Start(context.Background(), item, 0)
+	owner := WithLogger(context.Background(), slog.With("user_id", "stream-owner", "user", "Alex"))
+	s, err := m.Start(owner, item, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +162,11 @@ func TestFFmpegSessionLifecycle(t *testing.T) {
 	for _, expected := range []string{"Stream ready", "processing=copy", "Stream processing completed", "Stream stopped", "reason=requested", "session_id=" + s.ID} {
 		if !strings.Contains(string(output), expected) {
 			t.Fatalf("missing %q in stream lifecycle logs: %s", expected, output)
+		}
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.Contains(line, "session_id="+s.ID) && (!strings.Contains(line, "user=Alex") || !strings.Contains(line, "user_id=stream-owner")) {
+			t.Fatalf("stream lost its owner across lifecycle/seek: %s", line)
 		}
 	}
 	if _, err = m.Start(context.Background(), item, 0); err != nil {
@@ -318,7 +324,8 @@ func TestResolverDiagnosticDoesNotLogErrorText(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	s, err := m.Start(context.Background(), model.Item{ID: "episode:1:2:3", Kind: "episode"}, 0)
+	ctx := WithLogger(context.Background(), slog.With("user_id", "stream-owner", "user", "stream-owner"))
+	s, err := m.Start(ctx, model.Item{ID: "episode:1:2:3", Kind: "episode"}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +341,7 @@ func TestResolverDiagnosticDoesNotLogErrorText(t *testing.T) {
 		t.Fatalf("state: %s", got.State)
 	}
 	logText := logs.String()
-	if !strings.Contains(logText, "stage=resolve") || !strings.Contains(logText, "reason=error") || strings.Contains(logText, "secret-token") || strings.Contains(logText, "private.invalid") {
+	if !strings.Contains(logText, "user=stream-owner") || !strings.Contains(logText, "user_id=stream-owner") || !strings.Contains(logText, "stage=resolve") || !strings.Contains(logText, "reason=error") || strings.Contains(logText, "secret-token") || strings.Contains(logText, "private.invalid") {
 		t.Fatalf("unsafe or incomplete resolver diagnostic: %s", logText)
 	}
 }

@@ -69,6 +69,15 @@ type entry struct {
 	gen           *generation
 	heartbeat     time.Time
 	probe         *probeResult
+	logger        *slog.Logger
+}
+
+type loggerContextKey struct{}
+
+// WithLogger attaches request identity to a stream's lifecycle logs. Start
+// captures the logger so background work and later seeks retain the owner.
+func WithLogger(ctx context.Context, logger *slog.Logger) context.Context {
+	return context.WithValue(ctx, loggerContextKey{}, logger)
 }
 
 type Manager struct {
@@ -184,7 +193,11 @@ func (m *Manager) Start(ctx context.Context, item model.Item, start float64) (Se
 	}
 	m.next++
 	id := strconv.FormatUint(uint64(time.Now().UnixNano()), 36) + "-" + strconv.FormatUint(m.next, 36)
-	e := &entry{item: item, transcodeMode: m.cfg.TranscodeMode, heartbeat: time.Now()}
+	logger, _ := ctx.Value(loggerContextKey{}).(*slog.Logger)
+	if logger == nil {
+		logger = slog.Default()
+	}
+	e := &entry{item: item, transcodeMode: m.cfg.TranscodeMode, heartbeat: time.Now(), logger: logger.With("session_id", id)}
 	e.session = Session{ID: id, Duration: validDuration(item.Duration)}
 	m.sessions[id] = e
 	m.launchLocked(e, start, nil)
@@ -261,7 +274,7 @@ func (m *Manager) Seek(ctx context.Context, id string, position float64) (Sessio
 		return Session{}, ErrInvalid
 	}
 	old := e.gen
-	slog.Debug("Stream seeking", "session_id", e.session.ID, "offset", position)
+	e.logger.Debug("Stream seeking", "offset", position)
 	old.cancel()
 	go m.discard(old)
 	m.launchLocked(e, position, old.done)
@@ -275,7 +288,7 @@ func (m *Manager) Stop(id string) error {
 		delete(m.sessions, id)
 		e.gen.cancel()
 		m.stopping++
-		slog.Info("Stream stopped", "session_id", id, "reason", "requested", "state", e.session.State)
+		e.logger.Info("Stream stopped", "reason", "requested", "state", e.session.State)
 	}
 	m.mu.Unlock()
 	if e == nil {
@@ -307,7 +320,7 @@ func (m *Manager) Close() error {
 		for id, e := range m.sessions {
 			e.gen.cancel()
 			delete(m.sessions, id)
-			slog.Info("Stream stopped", "session_id", id, "reason", "server_shutdown", "state", e.session.State)
+			e.logger.Info("Stream stopped", "reason", "server_shutdown", "state", e.session.State)
 		}
 	}
 	m.mu.Unlock()
@@ -339,7 +352,7 @@ func (m *Manager) sweep() {
 					delete(m.sessions, id)
 					e.gen.cancel()
 					m.stopping++
-					slog.Info("Stream stopped", "session_id", id, "reason", "idle_timeout", "state", e.session.State)
+					e.logger.Info("Stream stopped", "reason", "idle_timeout", "state", e.session.State)
 					go m.retire(e.gen)
 				}
 			}
@@ -532,7 +545,7 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 			if ready && err == nil && !live {
 				m.update(e, g, func(s *Session) {
 					s.State = "ended"
-					slog.Info("Stream processing completed", "session_id", s.ID, "elapsed", time.Since(started).Round(time.Millisecond))
+					e.logger.Info("Stream processing completed", "elapsed", time.Since(started).Round(time.Millisecond))
 				})
 			} else if live && ctx.Err() == nil {
 				reason := exitClass(err, stderr.String())
@@ -567,7 +580,7 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 func (m *Manager) logReady(e *entry, g *generation, mode string, started time.Time) {
 	m.update(e, g, func(s *Session) {
 		s.State = "ready"
-		slog.Info("Stream ready", "session_id", s.ID, "processing", mode, "elapsed", time.Since(started).Round(time.Millisecond))
+		e.logger.Info("Stream ready", "processing", mode, "elapsed", time.Since(started).Round(time.Millisecond))
 	})
 }
 
@@ -609,7 +622,7 @@ func (m *Manager) logFailure(e *entry, stage, reason string, started time.Time) 
 	} else if stage == "ffmpeg_exit" {
 		message = "Stream processing failed"
 	}
-	slog.Warn(message, "session_id", e.session.ID, "item_id", safeLogID(e.item.ID), "stage", stage, "reason", reason, "elapsed", time.Since(started).Round(time.Millisecond))
+	e.logger.Warn(message, "item_id", safeLogID(e.item.ID), "stage", stage, "reason", reason, "elapsed", time.Since(started).Round(time.Millisecond))
 }
 
 func safeLogID(id string) string {
