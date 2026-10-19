@@ -8,6 +8,18 @@ import {
 import { motion } from "motion/react";
 import * as Slider from "@radix-ui/react-slider";
 import { Button } from "./ui/button";
+import type { SubtitleTrack } from "../api";
+import { subtitleLabel } from "../use-provider-subtitles";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 import {
   Maximize2,
   Minimize2,
@@ -17,9 +29,17 @@ import {
   RotateCw,
   Volume2,
   VolumeX,
+  Captions,
 } from "lucide-react";
 
 type Props = {
+  subtitles?: {
+    tracks: SubtitleTrack[];
+    selected: string | null;
+    select: (id: string | null) => void;
+    retry?: () => void;
+    status: "loading" | "ready" | "error";
+  };
   area: RefObject<HTMLDivElement | null>;
   playing: boolean;
   muted: boolean;
@@ -64,13 +84,18 @@ export function PlayerControls(props: Props) {
   actions.current = props;
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const scrubbing = useRef(false);
+  const subtitleMenuOpen = useRef(false);
   const canSeek = !live && duration > 0 && !busy && !finished;
   const reveal = useCallback(() => {
     setVisible(true);
     clearTimeout(timer.current);
     if (playing && !busy && !finished) {
       timer.current = setTimeout(() => {
-        if (scrubbing.current || area.current?.querySelector(":focus-visible"))
+        if (
+          scrubbing.current ||
+          subtitleMenuOpen.current ||
+          area.current?.querySelector(":focus-visible")
+        )
           return;
         setVisible(false);
       }, 2600);
@@ -87,6 +112,7 @@ export function PlayerControls(props: Props) {
         playing &&
         !busy &&
         !scrubbing.current &&
+        !subtitleMenuOpen.current &&
         !element.querySelector(":focus-visible")
       ) {
         clearTimeout(timer.current);
@@ -97,7 +123,11 @@ export function PlayerControls(props: Props) {
       clearTimeout(timer.current);
       if (playing && !busy && !finished) {
         timer.current = setTimeout(() => {
-          if (!scrubbing.current && !element.querySelector(":focus-visible"))
+          if (
+            !scrubbing.current &&
+            !subtitleMenuOpen.current &&
+            !element.querySelector(":focus-visible")
+          )
             setVisible(false);
         }, 2600);
       }
@@ -105,7 +135,9 @@ export function PlayerControls(props: Props) {
     const keyboard = (event: KeyboardEvent) => {
       reveal();
       if (
-        (event.target as HTMLElement).closest('[role="slider"], input, select')
+        (event.target as HTMLElement).closest(
+          '[role="slider"], [role="menu"], input, select',
+        )
       )
         return;
       if (
@@ -322,6 +354,74 @@ export function PlayerControls(props: Props) {
           <span className="time-readout">
             {time(value)} <span>/ {time(duration)}</span>
           </span>
+        )}
+        {!!props.subtitles?.tracks.length && (
+          <DropdownMenu
+            onOpenChange={(open) => {
+              subtitleMenuOpen.current = open;
+              reveal();
+            }}
+          >
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="control-button subtitles-control"
+                aria-label="Subtitles"
+                title="Subtitles"
+                data-active={!!props.subtitles.selected}
+              >
+                <Captions className="size-[23px]" size={23} strokeWidth={1.5} />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              side="top"
+              align="end"
+              portalContainer={area.current}
+              aria-label="Subtitles"
+            >
+              <DropdownMenuLabel>Subtitles</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuRadioGroup
+                value={props.subtitles.selected ?? "off"}
+                onValueChange={(value) =>
+                  props.subtitles?.select(value === "off" ? null : value)
+                }
+              >
+                <DropdownMenuRadioItem value="off">Off</DropdownMenuRadioItem>
+                {props.subtitles.tracks.map((track) => (
+                  <DropdownMenuRadioItem key={track.id} value={track.id}>
+                    {subtitleLabel(track)}
+                  </DropdownMenuRadioItem>
+                ))}
+              </DropdownMenuRadioGroup>
+              {props.subtitles.selected &&
+                props.subtitles.status !== "ready" && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <div
+                      className="px-3 py-2 text-sm text-muted-foreground"
+                      role="status"
+                    >
+                      {props.subtitles.status === "loading"
+                        ? "Loading subtitles…"
+                        : "Subtitles temporarily unavailable"}
+                    </div>
+                    {props.subtitles.status === "error" && (
+                      <DropdownMenuItem
+                        onSelect={() =>
+                          props.subtitles?.retry
+                            ? props.subtitles.retry()
+                            : props.subtitles?.select(props.subtitles.selected)
+                        }
+                      >
+                        Try again
+                      </DropdownMenuItem>
+                    )}
+                  </>
+                )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
         <Button
           variant="ghost"

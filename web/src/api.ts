@@ -149,6 +149,18 @@ export type Session = {
   duration: number;
   offset: number;
   error?: string;
+  subtitles?: SubtitleTrack[];
+  subtitleOffset?: number;
+};
+
+export type SubtitleTrack = {
+  id: string;
+  label: string;
+  language?: string;
+  url: string;
+  default?: boolean;
+  forced?: boolean;
+  source?: "embedded";
 };
 
 export class ApiError extends Error {

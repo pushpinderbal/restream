@@ -22,6 +22,8 @@ import {
 import { Radio, ChevronRight, Pause, Play, X } from "lucide-react";
 import type { RefreshTarget } from "./components/settings-page";
 import { PlayerControls } from "./components/player-controls";
+import { useProviderSubtitles } from "./use-provider-subtitles";
+import { useSubtitleAppearance } from "./subtitle-appearance";
 import { AppNavigation } from "./components/app-navigation";
 import { LibraryBrowser } from "./components/library-browser";
 import { SearchPage } from "./components/search-page";
@@ -2376,6 +2378,7 @@ function PlaybackPlayer({
   const historyFinished = useRef(false);
   const playbackArea = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
+  const { style: subtitleStyle } = useSubtitleAppearance();
   const sessionId = useRef<string | null>(null);
   const seekVersion = useRef(0);
   const seekingRef = useRef(false);
@@ -2570,7 +2573,10 @@ function PlaybackPlayer({
                   current.state === next.state &&
                   current.url === next.url &&
                   current.offset === next.offset &&
+                  current.subtitleOffset === next.subtitleOffset &&
                   current.duration === next.duration &&
+                  JSON.stringify(current.subtitles) ===
+                    JSON.stringify(next.subtitles) &&
                   current.error === next.error
                     ? current
                     : next,
@@ -2697,6 +2703,10 @@ function PlaybackPlayer({
           }
           hls = new Hls({
             enableWorker: true,
+            // Inspect A53/CEA-608 data even when the upstream provider omitted
+            // caption renditions. The subtitle picker manages native tracks.
+            enableCEA708Captions: true,
+            renderTextTracksNatively: true,
             // The ESM distribution requires an explicit worker URL.
             workerPath: hlsWorkerUrl,
             startPosition: activeItem.kind === "live" ? -1 : 0,
@@ -2743,6 +2753,12 @@ function PlaybackPlayer({
       if (clearMediaRef.current === clearMedia) clearMediaRef.current = null;
     };
   }, [playbackUrl, activeItem.kind, isPresent, viewerFinished]);
+
+  const subtitles = useProviderSubtitles(
+    video,
+    session,
+    isPresent && !viewerFinished && !seeking && playbackUrl === session?.url,
+  );
 
   // Use HLS's safe live sync point; native HLS exposes its window via seekable.
   const liveTarget = useCallback(() => {
@@ -2946,7 +2962,7 @@ function PlaybackPlayer({
         tabIndex={0}
         aria-label="Video player"
       >
-        <div className="video-wrap">
+        <div className="video-wrap" style={subtitleStyle}>
           <video
             ref={video}
             playsInline
@@ -3081,6 +3097,7 @@ function PlaybackPlayer({
             </div>
           )}
           <PlayerControls
+            subtitles={subtitles}
             area={playbackArea}
             playing={playing}
             muted={muted}

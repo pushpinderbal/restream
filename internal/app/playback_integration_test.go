@@ -30,19 +30,36 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 	movie := filepath.Join(t.TempDir(), "sample.mp4")
 	// Leave enough footage after the browser's late seek to check that settings
 	// and library filtering preserve playback before the fixture reaches its end.
-	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "60", "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", "-movflags", "+faststart", movie)
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "60", "-c:v", "libx264", "-preset", "ultrafast", "-g", "200", "-sc_threshold", "0", "-bf", "2", "-c:a", "aac", "-movflags", "+faststart", movie)
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("generate test media: %v: %s", err, b)
 	}
+	captionedMovie := embeddedCaptionFixture(t)
 	var mediaRequests atomic.Int32
 	var portal *httptest.Server
 	portal = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/media/subtitles.vtt" || r.URL.Path == "/media/spanish.srt" {
+			if !strings.Contains(r.Header.Get("Cookie"), "mac=00%3A11%3A22%3A33%3A44%3A55") {
+				t.Error("subtitle identity missing")
+			}
+			w.Header().Set("Content-Type", "text/vtt")
+			if strings.Contains(r.URL.Path, "spanish") {
+				io.WriteString(w, "1\n00:00:00,000 --> 00:01:00,000\nSubtítulos del proveedor\n")
+				return
+			}
+			io.WriteString(w, "WEBVTT\n\n00:00:00.000 --> 00:01:00.000\nProvider subtitle fixture\n")
+			return
+		}
 		if r.URL.Path == "/media/sample.mp4" {
 			if !strings.Contains(r.Header.Get("Cookie"), "mac=00%3A11%3A22%3A33%3A44%3A55") {
 				t.Error("server did not forward provider media identity")
 			}
 			mediaRequests.Add(1)
 			http.ServeFile(w, r, movie)
+			return
+		}
+		if r.URL.Path == "/media/captions.mp4" {
+			http.ServeFile(w, r, captionedMovie)
 			return
 		}
 		q := r.URL.Query()
@@ -65,11 +82,30 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 				data = []any{map[string]any{"id": "7", "title": "Test films"}}
 			}
 		case "get_ordered_list":
-			data = map[string]any{"total_items": 1, "data": []any{map[string]any{"id": "2", "name": "Test movie", "cmd": "private-vod-command"}}}
+			data = map[string]any{"total_items": 3, "data": []any{
+				map[string]any{"id": "2", "name": "Test movie", "cmd": "private-vod-command"},
+				map[string]any{"id": "4", "name": "Captioned episode", "cmd": "private-captioned-command"},
+				map[string]any{"id": "5", "name": "Captioned movie", "cmd": "private-captioned-sidecar-command"},
+			}}
 		case "get_epg_info":
 			data = map[string]any{"1": []any{map[string]any{"name": "Fixture guide", "start_timestamp": time.Now().Unix(), "stop_timestamp": time.Now().Add(time.Hour).Unix()}}}
 		case "create_link":
 			data = map[string]any{"cmd": "ffmpeg " + portal.URL + "/media/sample.mp4"}
+			if strings.Contains(q.Get("cmd"), "captioned") {
+				data = map[string]any{"cmd": "ffmpeg " + portal.URL + "/media/captions.mp4", "subtitles": []any{
+					map[string]any{"url": portal.URL + "/media/spanish.srt", "language": "es", "name": "Spanish"},
+				}}
+				if strings.Contains(q.Get("cmd"), "sidecar") {
+					data.(map[string]any)["subtitles"] = []any{
+						map[string]any{"url": portal.URL + "/media/subtitles.vtt", "language": "en", "name": "English"},
+					}
+				}
+			} else if !strings.Contains(q.Get("cmd"), "live") {
+				data.(map[string]any)["subtitles"] = []any{
+					map[string]any{"url": portal.URL + "/media/subtitles.vtt", "language": "en", "name": "English"},
+					map[string]any{"url": portal.URL + "/media/spanish.srt", "language": "es", "name": "Spanish"},
+				}
+			}
 		default:
 			t.Errorf("unexpected action %q", q.Get("action"))
 			http.Error(w, "unsupported", 400)
@@ -93,7 +129,7 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager, err := stream.New(stream.Config{MaxStreams: 1, SessionTTL: time.Minute, DataDir: cfg.DataDir}, provider.Resolve)
+	manager, err := stream.New(stream.Config{MaxStreams: 1, SessionTTL: time.Minute, DataDir: cfg.DataDir, TranscodeMode: "transcode"}, provider.Resolve)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,18 +194,22 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 		t.Fatal("stopped media still accessible")
 	}
 	if os.Getenv("RESTREAM_BROWSER_TESTS") == "1" {
-		script, err := filepath.Abs("../../web/tests/real-playback.mjs")
-		if err != nil {
-			t.Fatal(err)
+		for _, check := range []struct{ script, mode string }{{"subtitles-playback.mjs", "copy"}, {"subtitles-playback.mjs", "transcode"}, {"embedded-captions-playback.mjs", "copy"}, {"embedded-captions-playback.mjs", "transcode"}, {"real-playback.mjs", "transcode"}} {
+			if err := manager.Configure(1, check.mode); err != nil {
+				t.Fatal(err)
+			}
+			script, err := filepath.Abs("../../web/tests/" + check.script)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			output, err := exec.CommandContext(ctx, "bun", script, server.URL, check.mode).CombinedOutput()
+			cancel()
+			if err != nil {
+				t.Fatalf("%s %s browser playback failed: %v\n%s", check.script, check.mode, err, output)
+			}
+			t.Log(string(output))
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "bun", script, server.URL)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("real browser playback failed: %v\n%s", err, output)
-		}
-		t.Log(string(output))
 	}
 
 }

@@ -327,7 +327,7 @@ for (const width of [1440, 320]) {
     await expect(page.getByLabel("Portal URL", { exact: true })).toBeVisible();
     await expect(account(page)).toHaveAttribute("aria-current", "page");
     await expect(account(page)).toHaveClass(/active/);
-    for (const section of ["Status", "About"]) {
+    for (const section of ["Subtitles", "Status", "About"]) {
       if (width > 820)
         await page
           .getByRole("navigation", { name: "Settings sections", exact: true })
@@ -425,7 +425,7 @@ test("viewer setup guidance protects every route and fits mobile widths", async 
 });
 
 for (const width of [1440, 320]) {
-  test(`viewer can read Status and About through Settings at ${width}px`, async ({
+  test(`viewer can access Subtitles, Status, and About through Settings at ${width}px`, async ({
     page,
   }) => {
     await page.setViewportSize({ width, height: 900 });
@@ -474,7 +474,11 @@ for (const width of [1440, 320]) {
         name: "Settings sections",
         exact: true,
       });
-      await expect(sections.getByRole("link")).toHaveText(["Status", "About"]);
+      await expect(sections.getByRole("link")).toHaveText([
+        "Subtitles",
+        "Status",
+        "About",
+      ]);
       await sections.getByRole("link", { name: "About", exact: true }).click();
     } else {
       const jump = page.getByRole("combobox", {
@@ -482,7 +486,11 @@ for (const width of [1440, 320]) {
         exact: true,
       });
       await jump.click();
-      await expect(page.getByRole("option")).toHaveText(["Status", "About"]);
+      await expect(page.getByRole("option")).toHaveText([
+        "Subtitles",
+        "Status",
+        "About",
+      ]);
       await page.getByRole("option", { name: "About", exact: true }).click();
     }
     await expect(page.locator("#settings-about")).toBeInViewport();
@@ -652,7 +660,7 @@ test("permission loss rechecks the role while content denial keeps the current a
     page
       .getByRole("navigation", { name: "Settings sections", exact: true })
       .getByRole("link"),
-  ).toHaveText(["Status", "About"]);
+  ).toHaveText(["Subtitles", "Status", "About"]);
   await expect(page.getByLabel("Portal URL", { exact: true })).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Save changes", exact: true }),

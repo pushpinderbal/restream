@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -80,7 +81,7 @@ func TestPlaybackConfigurationPreservesActiveSessions(t *testing.T) {
 	second := start()
 	assertAudio(second, "aac")
 	unchanged, err := m.Get(first.ID)
-	if err != nil || unchanged != first {
+	if err != nil || !reflect.DeepEqual(unchanged, first) {
 		t.Fatalf("configuration changed active session: %+v, %v", unchanged, err)
 	}
 	if _, err := m.Seek(context.Background(), first.ID, 2); err != nil {

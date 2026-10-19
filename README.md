@@ -2,6 +2,10 @@
 
 Restream brings your IPTV subscription to the browser. Host it on your own computer or server to watch live TV, movies, and shows from a Stalker/MAG provider, with a programme guide, search, watch progress, and a shared library cache. Use it on desktop or mobile, with optional OIDC sign-in through your own identity provider.
 
+[![A tour of Restream: discover titles on Home, browse movies, play with captions, and preview subtitle styles in Settings.](docs/assets/showcase.gif)](docs/assets/showcase.png)
+
+*Home, your library, and playback in one place. The preview uses a fictional demo library; select the image for a still view.*
+
 ## Features
 
 - 📺 **Live TV and programme guide**: browse channels and see what's on now and next.
@@ -11,6 +15,7 @@ Restream brings your IPTV subscription to the browser. Host it on your own compu
 - ⚡ **Shared library cache**: cached listings stay available while the server refreshes them in the background, reducing repeated requests to your provider.
 - 🔐 **Optional OIDC sign-in**: use your identity provider with viewer and administrator roles, or run without a login on your private network.
 - 📱 **Desktop and mobile**: responsive browsing, touch controls, and fullscreen playback.
+- 💬 **Subtitles**: choose provider subtitles or embedded captions from the player's CC menu. Preview your preferred font, size, color, and background in Settings, saved for this browser. Availability varies by movie and episode.
 
 ## Get started
 

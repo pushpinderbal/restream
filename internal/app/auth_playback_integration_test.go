@@ -67,6 +67,7 @@ func TestOIDCPlaybackBelongsToItsUser(t *testing.T) {
 		{"DELETE", "/api/sessions/test-1", ""},
 		{"GET", "/api/streams/test-1/1/index.m3u8", ""},
 		{"GET", "/api/streams/test-1/1/seg-000001.ts", ""},
+		{"GET", "/api/streams/test-1/1/subtitles-0.json?start=30", ""},
 	}
 	for _, request := range paths {
 		resp := authPlaybackRequest(t, other, request.method, request.path, request.body)

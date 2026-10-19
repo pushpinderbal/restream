@@ -1550,11 +1550,19 @@ func (c *Client) Resolve(ctx context.Context, it model.Item) (model.Source, erro
 	if e != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return model.Source{}, errors.New("portal returned an invalid playback URL")
 	}
+	headers, e := c.playbackHeaders(ctx, u)
+	if e != nil {
+		return model.Source{}, e
+	}
+	return model.Source{URL: u.String(), Headers: headers, Live: it.Kind == "live", Duration: it.Duration, Subtitles: c.playbackSubtitles(ctx, m, u)}, nil
+}
+
+func (c *Client) playbackHeaders(ctx context.Context, u *url.URL) (map[string]string, error) {
 	headers := map[string]string{"User-Agent": c.cfg.UserAgent, "Referer": c.endpoint.Scheme + "://" + c.endpoint.Host + "/"}
 	// Playback endpoints on the same portal often require the MAG identity.
 	if strings.EqualFold(u.Host, c.endpoint.Host) {
 		if e := c.lock(ctx); e != nil {
-			return model.Source{}, e
+			return nil, e
 		}
 		token := c.token
 		c.mu.release()
@@ -1563,7 +1571,7 @@ func (c *Client) Resolve(ctx context.Context, it model.Item) (model.Source, erro
 			headers["Authorization"] = "Bearer " + token
 		}
 	}
-	return model.Source{URL: u.String(), Headers: headers, Live: it.Kind == "live", Duration: it.Duration}, nil
+	return headers, nil
 }
 
 // A VOD catalog row can be a movie shell whose command names the movie ID.

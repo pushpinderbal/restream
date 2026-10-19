@@ -1,0 +1,12 @@
+.video-wrap video::cue {
+  color: var(--subtitle-color, #fff);
+  background-color: var(--subtitle-background, #000c);
+  font-family: var(--subtitle-font-family, Arial, Helvetica, sans-serif);
+  font-size: clamp(
+    calc(14px * var(--subtitle-font-scale, 1)),
+    calc(2vw * var(--subtitle-font-scale, 1)),
+    calc(24px * var(--subtitle-font-scale, 1))
+  );
+  text-shadow: var(--subtitle-shadow, 0 1px 2px #000, 0 0 3px #000);
+  white-space: pre-line;
+}

@@ -3194,6 +3194,7 @@ test("Settings scroll navigation preserves drafts across sections and responsive
     "library",
     "discovery",
     "playback",
+    "subtitles",
     "status",
     "about",
   ])
