@@ -6,6 +6,7 @@ export function trackViewportRecovery() {
   if (!viewport || !/CriOS\//.test(navigator.userAgent)) return () => {};
 
   const original = viewport.content;
+  const root = document.documentElement;
   let appliedWidth = 0;
   let timer: number | undefined;
   const update = () => {
@@ -24,6 +25,12 @@ export function trackViewportRecovery() {
       (Math.abs(scale - 1) > 0.01 && !fittedToWindow)
     )
       return;
+
+    // The layout height can stay at 1499px while only 682px is visible, even
+    // after the width recovers. Keep fixed navigation inside the visible area.
+    const height = window.visualViewport?.height ?? window.innerHeight;
+    if (height > 0)
+      root.style.setProperty("--sidebar-viewport-height", `${height}px`);
     if (
       (!appliedWidth || appliedWidth === width) &&
       Math.abs(window.innerWidth - width) <= 1
@@ -59,6 +66,7 @@ export function trackViewportRecovery() {
   return () => {
     listeners.abort();
     window.clearTimeout(timer);
+    root.style.removeProperty("--sidebar-viewport-height");
     if (appliedWidth) viewport.content = original;
   };
 }
