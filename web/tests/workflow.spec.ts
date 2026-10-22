@@ -5807,6 +5807,34 @@ test.describe("Chrome iPad viewport recovery", () => {
         .toBe(1180);
       const bounds = (await page.locator("#main-content").boundingBox())!;
       expect(bounds.x + bounds.width).toBe(1180);
+      const navigation = page.getByRole("navigation", {
+        name: "Library",
+        exact: true,
+      });
+      const expectReachableSidebar = async () => {
+        const visibleHeight = await page.evaluate(
+          () => window.visualViewport!.height,
+        );
+        for (const name of ["Search", "Home", "VOD", "Live TV", "Account"]) {
+          const button = navigation.getByRole("button", { name, exact: true });
+          const box = (await button.boundingBox())!;
+          expect(box.y, `${name} is below the top edge`).toBeGreaterThanOrEqual(
+            0,
+          );
+          expect(
+            box.y + box.height,
+            `${name} fits the visible window without scrolling the page`,
+          ).toBeLessThanOrEqual(visibleHeight);
+        }
+      };
+      await expectReachableSidebar();
+      await page.evaluate(() => window.scrollBy(0, 200));
+      await expectReachableSidebar();
+      const scrollBeforeMenu = await page.evaluate(() => window.scrollY);
+      await navigation.getByRole("button", { name: "Account" }).click();
+      await expect(page.getByRole("menu", { name: "Account" })).toBeVisible();
+      expect(await page.evaluate(() => window.scrollY)).toBe(scrollBeforeMenu);
+      await page.keyboard.press("Escape");
       expect(page.url()).toBe(playerURL);
       expect(
         await video!.evaluate(
@@ -5821,6 +5849,13 @@ test.describe("Chrome iPad viewport recovery", () => {
         });
 
       if (fullscreen === "element") {
+        // Browser chrome can change the visible height without changing width.
+        await page.setViewportSize({ width: 820, height: 620 });
+        await page.clock.fastForward(500);
+        await expectReachableSidebar();
+        await page.setViewportSize({ width: 820, height: 682 });
+        await page.clock.fastForward(500);
+        await expectReachableSidebar();
         // Do not reset pinch zoom when the window changes. Resume width updates
         // after the user returns to normal zoom.
         await page.evaluate(() =>
