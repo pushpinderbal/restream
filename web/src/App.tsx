@@ -38,7 +38,6 @@ import {
 } from "./components/watch-suggestions";
 import { useWatchHistory, type WatchHistoryEntry } from "./watch-history";
 import { createContentPolicy } from "./content-preferences";
-import { requestViewportRecovery } from "./lib/viewport";
 import { Spinner } from "./components/spectrumui/spinner-dependencies";
 import InfiniteScroll from "./components/spectrumui/infinite-scroll";
 import { AnimatedAlert } from "./components/spectrumui/animated-alert";
@@ -1343,11 +1342,12 @@ function App() {
                 selectionRef.current !== selectedId
               )
                 return;
-              if (
-                restoreOriginScroll() ||
-                scrolledExpansion.current === selectedId
-              )
+              if (originScrollToRestore.current !== null) {
+                // Motion restores height:auto after the completion callback.
+                window.requestAnimationFrame(restoreOriginScroll);
                 return;
+              }
+              if (scrolledExpansion.current === selectedId) return;
               scrolledExpansion.current = selectedId;
               expandedArea.current?.scrollIntoView({
                 block: "start",
@@ -2474,14 +2474,12 @@ function PlaybackPlayer({
     action: "play" | "pause";
   } | null>(null);
   const feedbackSequence = useRef(0);
-  useEffect(() => () => requestViewportRecovery(), []);
   useLayoutEffect(() => {
     if (isPresent) return;
     saveProgressRef.current();
     onFlushProgress();
     pendingPlayUrlRef.current = null;
     clearMediaRef.current?.();
-    requestViewportRecovery();
   }, [isPresent, onFlushProgress]);
   useEffect(() => {
     if (!isPresent) return;
