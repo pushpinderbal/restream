@@ -62,7 +62,7 @@ html {
 body {
   margin: 0;
   min-width: 320px;
-  min-height: 100vh;
+  min-height: 100dvh;
   background: #0c0d10;
 }
 button {
@@ -150,7 +150,7 @@ p {
 .app-shell {
   position: relative;
   isolation: isolate;
-  min-height: 100vh;
+  min-height: 100dvh;
 }
 .library-layout {
   min-height: 100dvh;

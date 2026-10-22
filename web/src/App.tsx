@@ -38,6 +38,7 @@ import {
 } from "./components/watch-suggestions";
 import { useWatchHistory, type WatchHistoryEntry } from "./watch-history";
 import { createContentPolicy } from "./content-preferences";
+import { requestViewportRecovery } from "./lib/viewport";
 import { Spinner } from "./components/spectrumui/spinner-dependencies";
 import InfiniteScroll from "./components/spectrumui/infinite-scroll";
 import { AnimatedAlert } from "./components/spectrumui/animated-alert";
@@ -260,11 +261,13 @@ function App() {
   const [playerRetrying, setPlayerRetrying] = useState(false);
   const playerRetryMessage = useRef("");
   const playerOrigin = useRef<PlayerOrigin | null>(playerOriginFromHistory());
+  const originScrollToRestore = useRef<number | null>(null);
   const playerOpenRef = useRef(playerOpen);
   playerOpenRef.current = playerOpen;
   const pendingPlayback = useRef<AbortController | null>(null);
   const navigationRevision = useRef(0);
   const cancelPlaybackIntent = useCallback(() => {
+    originScrollToRestore.current = null;
     navigationRevision.current++;
     pendingPlayback.current?.abort();
     pendingPlayback.current = null;
@@ -310,6 +313,22 @@ function App() {
   const scrolledExpansion = useRef("");
   const selectionRef = useRef(selectedId);
   selectionRef.current = selectedId;
+  const restoreOriginScroll = useCallback(() => {
+    const top = originScrollToRestore.current;
+    const area = expandedArea.current;
+    // Search animates its returned details. Wait for their final height so the
+    // browser can restore positions near the bottom without clamping the scroll.
+    if (top === null || playerOpenRef.current || area?.style.height !== "auto")
+      return false;
+    originScrollToRestore.current = null;
+    scrolledExpansion.current = selectionRef.current;
+    window.scrollTo({ top, behavior: "instant" });
+    const target =
+      area.querySelector<HTMLElement>(".play-action:not(:disabled)") ||
+      area.querySelector<HTMLElement>("h1");
+    target?.focus({ preventScroll: true });
+    return true;
+  }, []);
   const [catalogGrid, setCatalogGrid] = useState<HTMLDivElement | null>(null);
   const [gridColumns, setGridColumns] = useState(1);
   const libraryScroll = useRef(0);
@@ -474,6 +493,8 @@ function App() {
         previousOrigin &&
         new URL(previousOrigin.url, window.location.href).href ===
           window.location.href;
+      if (!next.player && returningToOrigin && next.item && previousOrigin)
+        originScrollToRestore.current = previousOrigin.scroll;
       playerOpenRef.current = next.player;
       playerOrigin.current = next.player ? playerOriginFromHistory() : null;
 
@@ -493,6 +514,7 @@ function App() {
       setSelected((old) => (old?.id === next.item ? old : null));
       window.requestAnimationFrame(() =>
         window.scrollTo({
+          behavior: "instant",
           top: next.player
             ? 0
             : returningToOrigin && previousOrigin
@@ -504,6 +526,9 @@ function App() {
     window.addEventListener("popstate", restore);
     return () => window.removeEventListener("popstate", restore);
   }, [cancelPlaybackIntent]);
+  useLayoutEffect(() => {
+    if (!playerOpen) restoreOriginScroll();
+  }, [playerOpen, selectedId, selected, restoreOriginScroll]);
   useEffect(() => {
     if (!selectedId || selected?.id === selectedId || !status?.configured)
       return;
@@ -985,7 +1010,6 @@ function App() {
         title: playbackTitle,
       });
       setPlaybackDuration(0);
-      window.scrollTo({ top: 0 });
     },
     [liveItems, browseItems, categories, tab, category, cancelPlaybackIntent],
   );
@@ -1040,14 +1064,14 @@ function App() {
     searchContext,
   ]);
   const stopPlayback = () => {
+    if (!playerOpenRef.current) return;
     cancelPlaybackIntent();
     playerOpenRef.current = false;
     const title = playback?.title || selected;
     const episode = playback?.item.kind === "episode" ? playback.item : null;
     const origin = playerOrigin.current;
-    setPlayback(null);
-    setPlayerOpen(false);
-    setPlayerError("");
+    // Let route restoration close the player and reveal its origin together.
+    // Closing it before asynchronous history.back() temporarily unmounts Search.
     if (origin && origin.initialURL && origin.url !== origin.initialURL) {
       window.history.replaceState({}, "", origin.url);
       window.dispatchEvent(new PopStateEvent("popstate"));
@@ -1195,15 +1219,6 @@ function App() {
     status?.configured,
     playerRetry,
   ]);
-  useEffect(() => {
-    if (!playerOpen || !playback) return;
-    const frame = window.requestAnimationFrame(() =>
-      document
-        .querySelector<HTMLElement>(".watch-sidebar .dock-title")
-        ?.focus({ preventScroll: true }),
-    );
-    return () => window.cancelAnimationFrame(frame);
-  }, [playerOpen, playback?.item.id]);
   const playbackCategory =
     playback &&
     categories.find(
@@ -1325,7 +1340,11 @@ function App() {
               if (
                 (playerOpenRef.current &&
                   playingTitleRef.current === selectedId) ||
-                selectionRef.current !== selectedId ||
+                selectionRef.current !== selectedId
+              )
+                return;
+              if (
+                restoreOriginScroll() ||
                 scrolledExpansion.current === selectedId
               )
                 return;
@@ -2378,6 +2397,14 @@ function PlaybackPlayer({
   const historyFinished = useRef(false);
   const playbackArea = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
+  useLayoutEffect(() => {
+    const area = playbackArea.current;
+    if (!isPresent || !area) return;
+    // Reveal the committed player before loading the stream. An instant scroll
+    // also cancels any smooth title reveal left over from the browsing view.
+    area.scrollIntoView({ block: "start", behavior: "instant" });
+    area.focus({ preventScroll: true });
+  }, [isPresent, selection]);
   const { style: subtitleStyle } = useSubtitleAppearance();
   const sessionId = useRef<string | null>(null);
   const seekVersion = useRef(0);
@@ -2447,12 +2474,14 @@ function PlaybackPlayer({
     action: "play" | "pause";
   } | null>(null);
   const feedbackSequence = useRef(0);
+  useEffect(() => () => requestViewportRecovery(), []);
   useLayoutEffect(() => {
     if (isPresent) return;
     saveProgressRef.current();
     onFlushProgress();
     pendingPlayUrlRef.current = null;
     clearMediaRef.current?.();
+    requestViewportRecovery();
   }, [isPresent, onFlushProgress]);
   useEffect(() => {
     if (!isPresent) return;
