@@ -64,6 +64,7 @@ func TestOIDCPlaybackBelongsToItsUser(t *testing.T) {
 		{"GET", "/api/sessions/test-1", ""},
 		{"POST", "/api/sessions/test-1/heartbeat", ""},
 		{"POST", "/api/sessions/test-1/seek", `{"position":5}`},
+		{"POST", "/api/sessions/test-1/speed", `{"position":5,"rate":2}`},
 		{"DELETE", "/api/sessions/test-1", ""},
 		{"GET", "/api/streams/test-1/1/index.m3u8", ""},
 		{"GET", "/api/streams/test-1/1/seg-000001.ts", ""},

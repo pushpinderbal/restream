@@ -2602,6 +2602,7 @@ function PlaybackPlayer({
                   current.state === next.state &&
                   current.url === next.url &&
                   current.offset === next.offset &&
+                  current.playbackRate === next.playbackRate &&
                   current.subtitleOffset === next.subtitleOffset &&
                   current.duration === next.duration &&
                   JSON.stringify(current.subtitles) ===
@@ -2710,9 +2711,12 @@ function PlaybackPlayer({
     setPlaying(false);
     setBuffering(true);
     attachedUrlRef.current = playbackUrl;
+    const rate = latestSession.current?.playbackRate ?? 1;
     element.pause();
     element.removeAttribute("src");
     element.load();
+    element.defaultPlaybackRate = rate;
+    element.playbackRate = rate;
     const startNative = () => {
       if (element.canPlayType("application/vnd.apple.mpegurl"))
         element.src = playbackUrl;
@@ -2739,10 +2743,11 @@ function PlaybackPlayer({
             // The ESM distribution requires an explicit worker URL.
             workerPath: hlsWorkerUrl,
             startPosition: activeItem.kind === "live" ? -1 : 0,
-            maxBufferLength: 30,
-            maxMaxBufferLength: 30,
-            backBufferLength: 30,
-            frontBufferFlushThreshold: 30,
+            // Keep 30 seconds of viewing time, including at faster speeds.
+            maxBufferLength: 30 * rate,
+            maxMaxBufferLength: 30 * rate,
+            backBufferLength: 30 * rate,
+            frontBufferFlushThreshold: 30 * rate,
             // VOD is an append-only event playlist; never jump to its live edge.
             liveSyncOnStallIncrease: activeItem.kind === "live" ? 1 : 0,
             liveSyncDuration: activeItem.kind === "live" ? undefined : 86400,
@@ -2843,15 +2848,20 @@ function PlaybackPlayer({
     }
   };
 
-  const seek = async (target: number, resume = false) => {
+  const seek = async (target: number, resume = false, rate?: number) => {
     saveProgress();
     onFlushProgress();
     const id = sessionId.current;
     if (!id || !session || seekingRef.current) return;
-    if (!Number.isFinite(session.duration) || session.duration <= 0) return;
+    const hasDuration =
+      Number.isFinite(session.duration) && session.duration > 0;
+    if (!Number.isFinite(target) || (!hasDuration && rate === undefined))
+      return;
     const desired = Math.max(
       0,
-      Math.min(Math.max(0, session.duration - 0.5), target),
+      hasDuration
+        ? Math.min(Math.max(0, session.duration - 0.5), target)
+        : target,
     );
     const element = video.current;
     const local = desired - session.offset;
@@ -2867,7 +2877,7 @@ function PlaybackPlayer({
             (i) => local >= ranges.start(i) && local < ranges.end(i) - 0.25,
           ),
         ));
-    if (element && available) {
+    if (element && available && rate === undefined) {
       element.currentTime = local;
       setPosition(desired);
       if (resume)
@@ -2885,14 +2895,15 @@ function PlaybackPlayer({
     setError("");
     try {
       const next = await jsonRequest<Session>(
-        `/api/sessions/${encodeURIComponent(id)}/seek`,
+        `/api/sessions/${encodeURIComponent(id)}/${rate === undefined ? "seek" : "speed"}`,
         "POST",
-        { position: desired },
+        { position: desired, ...(rate === undefined ? {} : { rate }) },
       );
       if (sessionId.current !== id) return;
       pendingPlayUrlRef.current = resumeAfterSeek ? next.url : null;
       setSession(next);
       setPosition(next.offset);
+      setBuffered([]);
       if (next.state === "failed")
         setError(next.error || "Could not seek in this video.");
     } catch (cause) {
@@ -2997,6 +3008,11 @@ function PlaybackPlayer({
             playsInline
             controls={false}
             preload="auto"
+            onLoadedMetadata={(event) => {
+              const rate = latestSession.current?.playbackRate ?? 1;
+              event.currentTarget.defaultPlaybackRate = rate;
+              event.currentTarget.playbackRate = rate;
+            }}
             onPointerDown={(event) => {
               videoPointer.current = event.pointerType;
             }}
@@ -3137,6 +3153,20 @@ function PlaybackPlayer({
             buffered={buffered}
             live={!vod}
             liveDelay={liveDelay}
+            playbackRate={session?.playbackRate ?? 1}
+            onPlaybackRate={(rate) => {
+              const current = latestSession.current;
+              if (
+                current &&
+                video.current &&
+                rate !== (current.playbackRate ?? 1)
+              )
+                void seek(
+                  current.offset + video.current.currentTime,
+                  false,
+                  rate,
+                );
+            }}
             onGoLive={() => void goLive()}
             onPlay={() => void togglePlay()}
             onSeek={(target) => void seek(target)}

@@ -172,16 +172,32 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 		t.Fatalf("duration not probed: %+v", session)
 	}
 	assertLocalMedia(t, server.URL, session.URL, portal.URL)
+	previous := session.URL
+	for _, invalid := range []string{`{"position":5,"rate":0}`, `{"position":-1,"rate":2}`, `{"position":5,"rate":3}`, `{"position":5}`, `{"position":5,"rate":null}`} {
+		status, body = request(t, server.URL, "POST", "/api/sessions/"+session.ID+"/speed", invalid)
+		if status != 400 {
+			t.Fatalf("invalid playback speed accepted: %d %s", status, body)
+		}
+	}
+	status, body = request(t, server.URL, "POST", "/api/sessions/"+session.ID+"/speed", `{"position":5,"rate":2}`)
+	if status != 200 {
+		t.Fatal(status, body)
+	}
+	session = awaitPlayable(t, server.URL, session.ID)
+	if session.URL == previous || session.Offset != 5 || session.PlaybackRate != 2 || manager.Active() != 1 {
+		t.Fatalf("playback speed lost slot or position: %+v", session)
+	}
+	assertLocalMedia(t, server.URL, session.URL, portal.URL)
 	if mediaRequests.Load() == 0 {
 		t.Fatal("media bypassed central server")
 	}
-	previous := session.URL
+	previous = session.URL
 	status, body = request(t, server.URL, "POST", "/api/sessions/"+session.ID+"/seek", `{"position":5}`)
 	if status != 200 {
 		t.Fatal(status, body)
 	}
 	session = awaitPlayable(t, server.URL, session.ID)
-	if session.URL == previous || session.Offset != 5 || manager.Active() != 1 {
+	if session.URL == previous || session.Offset != 5 || session.PlaybackRate != 2 || manager.Active() != 1 {
 		t.Fatalf("seek lost slot or timeline: %+v", session)
 	}
 	assertLocalMedia(t, server.URL, session.URL, portal.URL)
@@ -194,7 +210,7 @@ func TestPortalToBrowserPlayback(t *testing.T) {
 		t.Fatal("stopped media still accessible")
 	}
 	if os.Getenv("RESTREAM_BROWSER_TESTS") == "1" {
-		for _, check := range []struct{ script, mode string }{{"subtitles-playback.mjs", "copy"}, {"subtitles-playback.mjs", "transcode"}, {"embedded-captions-playback.mjs", "copy"}, {"embedded-captions-playback.mjs", "transcode"}, {"real-playback.mjs", "transcode"}} {
+		for _, check := range []struct{ script, mode string }{{"speed-playback.mjs", "copy"}, {"speed-playback.mjs", "transcode"}, {"subtitles-playback.mjs", "copy"}, {"subtitles-playback.mjs", "transcode"}, {"embedded-captions-playback.mjs", "copy"}, {"embedded-captions-playback.mjs", "transcode"}, {"real-playback.mjs", "transcode"}} {
 			if err := manager.Configure(1, check.mode); err != nil {
 				t.Fatal(err)
 			}

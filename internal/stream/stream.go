@@ -42,6 +42,7 @@ type Session struct {
 	State          string          `json:"state"`
 	Duration       float64         `json:"duration"`
 	Offset         float64         `json:"offset"`
+	PlaybackRate   float64         `json:"playbackRate"`
 	Error          string          `json:"error,omitempty"`
 	Subtitles      []SubtitleTrack `json:"subtitles,omitempty"`
 	SubtitleOffset *float64        `json:"subtitleOffset,omitempty"`
@@ -53,6 +54,7 @@ type generation struct {
 	dir       string
 	done      chan struct{}
 	subtitles *subtitleState
+	rate      float64
 }
 
 type probeResult struct {
@@ -198,7 +200,7 @@ func (m *Manager) Start(ctx context.Context, item model.Item, start float64) (Se
 		logger = slog.Default()
 	}
 	e := &entry{item: item, transcodeMode: m.cfg.TranscodeMode, heartbeat: time.Now(), logger: logger.With("session_id", id)}
-	e.session = Session{ID: id, Duration: validDuration(item.Duration)}
+	e.session = Session{ID: id, Duration: validDuration(item.Duration), PlaybackRate: 1}
 	m.sessions[id] = e
 	m.launchLocked(e, start, nil)
 	return e.session, nil
@@ -208,7 +210,7 @@ func (m *Manager) launchLocked(e *entry, pos float64, prior <-chan struct{}) {
 	m.next++
 	number := m.next
 	ctx, cancel := context.WithCancel(m.ctx)
-	g := &generation{number: number, cancel: cancel, dir: filepath.Join(m.dir, e.session.ID, strconv.FormatUint(number, 10)), done: make(chan struct{})}
+	g := &generation{number: number, cancel: cancel, dir: filepath.Join(m.dir, e.session.ID, strconv.FormatUint(number, 10)), done: make(chan struct{}), rate: e.session.PlaybackRate}
 	e.gen = g
 	e.session.State = "starting"
 	e.session.Offset = pos
@@ -252,6 +254,19 @@ func (m *Manager) Heartbeat(id string) error {
 }
 
 func (m *Manager) Seek(ctx context.Context, id string, position float64) (Session, error) {
+	return m.restart(ctx, id, position, nil)
+}
+
+// SetPlaybackRate restarts the relay at the viewer's position so FFmpeg's input
+// pacing and initial buffer match the selected speed. Seeking retains this rate.
+func (m *Manager) SetPlaybackRate(ctx context.Context, id string, position, rate float64) (Session, error) {
+	if math.IsNaN(rate) || rate < 0.5 || rate > 2 {
+		return Session{}, ErrInvalid
+	}
+	return m.restart(ctx, id, position, &rate)
+}
+
+func (m *Manager) restart(ctx context.Context, id string, position float64, rate *float64) (Session, error) {
 	if err := ctx.Err(); err != nil {
 		return Session{}, err
 	}
@@ -273,8 +288,14 @@ func (m *Manager) Seek(ctx context.Context, id string, position float64) (Sessio
 	if e.session.Duration > 0 && position >= e.session.Duration {
 		return Session{}, ErrInvalid
 	}
+	if rate != nil {
+		if *rate == e.session.PlaybackRate {
+			return e.session, nil
+		}
+		e.session.PlaybackRate = *rate
+	}
 	old := e.gen
-	e.logger.Debug("Stream seeking", "offset", position)
+	e.logger.Debug("Stream seeking", "offset", position, "playback_rate", e.session.PlaybackRate)
 	old.cancel()
 	go m.discard(old)
 	m.launchLocked(e, position, old.done)
@@ -474,10 +495,13 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 	}
 	m.update(e, g, func(s *Session) { s.Duration = duration })
 	live := source.Live || e.item.Kind == "live"
-	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-readrate", "1"}
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y"}
 	if !live {
-		// Fill initial segments immediately, then pace the relay.
-		args = append(args, "-readrate_initial_burst", "8")
+		// Preserve 30 seconds of viewing time at every speed, then build the
+		// server buffer with 20% headroom over the viewer's consumption rate.
+		args = append(args, "-readrate", strconv.FormatFloat(g.rate*1.2, 'f', -1, 64), "-readrate_initial_burst", strconv.FormatFloat(30*g.rate, 'f', -1, 64))
+	} else {
+		args = append(args, "-readrate", "1")
 	}
 	args = append(args, "-rw_timeout", "10000000", "-protocol_whitelist", "http,https,tcp,tls,crypto")
 	if pos > 0 {

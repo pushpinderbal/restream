@@ -80,6 +80,9 @@ func (p *policyStreams) Heartbeat(id string) error { _, err := p.Get(id); return
 func (p *policyStreams) Seek(_ context.Context, id string, _ float64) (stream.Session, error) {
 	return p.Get(id)
 }
+func (p *policyStreams) SetPlaybackRate(_ context.Context, id string, _, _ float64) (stream.Session, error) {
+	return p.Get(id)
+}
 func (p *policyStreams) Stop(id string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
