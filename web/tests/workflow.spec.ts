@@ -862,6 +862,58 @@ async function playableVideo(page: Page, position = 30, edge = 100) {
   );
 }
 
+async function emulateStaleViewport(page: Page) {
+  const state = await page.evaluateHandle(() => {
+    const viewport = document.querySelector<HTMLMetaElement>(
+      'meta[name="viewport"]',
+    )!;
+    const original = viewport.content;
+    const changes: string[] = [];
+    const orientation = Object.getOwnPropertyDescriptor(
+      screen.orientation,
+      "type",
+    );
+    Object.defineProperty(screen.orientation, "type", {
+      configurable: true,
+      value: "landscape-primary",
+    });
+    const observer = new MutationObserver(() => changes.push(viewport.content));
+    observer.observe(viewport, { attributes: true });
+    return {
+      original,
+      changes,
+      cleanup() {
+        observer.disconnect();
+        viewport.content = original;
+        if (orientation)
+          Object.defineProperty(screen.orientation, "type", orientation);
+        else Reflect.deleteProperty(screen.orientation, "type");
+      },
+    };
+  });
+  return {
+    changes: () => state.evaluate((value) => value.changes),
+    async expectRecovered() {
+      await expect
+        .poll(() =>
+          state.evaluate(
+            (value) =>
+              value.changes.length >= 2 &&
+              value.changes.at(-1) === value.original,
+          ),
+        )
+        .toBe(true);
+      const content = await state.evaluate((value) => value.original);
+      expect(content).toContain("width=device-width");
+      expect(content).not.toMatch(/maximum-scale|user-scalable=no/);
+    },
+    async dispose() {
+      await state.evaluate((value) => value.cleanup());
+      await state.dispose();
+    },
+  };
+}
+
 test("LIVE greys behind the stream and jumps to the latest seek point while resuming", async ({
   page,
 }) => {
@@ -1195,6 +1247,121 @@ for (const item of [live, movie, series]) {
     await expect
       .poll(() => api.events.filter((event) => event === "DELETE").length)
       .toBe(1);
+  });
+}
+
+for (const viewport of [
+  {
+    width: 1440,
+    height: 900,
+    search: false,
+    reducedMotion: "no-preference" as const,
+  },
+  { width: 390, height: 844, search: true, reducedMotion: "reduce" as const },
+]) {
+  test(`Play reveals the loading player and Stop/Back restore the scrolled origin at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    const titles = Array.from({ length: 36 }, (_, index) => ({
+      ...movie,
+      id: `coast-${index}`,
+      name: `Coast ${index}`,
+    }));
+    let releaseCreation!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreation = resolve;
+    });
+    const api = await mockApi(page, { catalogItems: titles, createGate });
+    await page.setViewportSize(viewport);
+    await page.emulateMedia({ reducedMotion: viewport.reducedMotion });
+    await page.goto(
+      viewport.search
+        ? "/?view=search&section=movie&search=Coast"
+        : "/?section=movie&category=drama-movie",
+    );
+    const title = titles[30];
+    await page
+      .getByRole("button", { name: `Open ${title.name}`, exact: true })
+      .click();
+    const details = page.getByRole("region", {
+      name: "Expanded title",
+      exact: true,
+    });
+    await expect(
+      details.getByRole("heading", { name: title.name, exact: true }),
+    ).toBeFocused();
+    const play = details.getByRole("button", { name: "Play", exact: true });
+
+    try {
+      for (const exit of ["Stop", "Back"] as const) {
+        await play.scrollIntoViewIfNeeded();
+        // Settle any preceding smooth reveal before recording the user's position.
+        await page.evaluate(() =>
+          window.scrollBy({ top: 0, behavior: "instant" }),
+        );
+        const originURL = page.url();
+        const originScroll = await page.evaluate(() => window.scrollY);
+        expect(originScroll).toBeGreaterThan(viewport.height);
+        if (exit === "Stop")
+          await page.screenshot({
+            path: test.info().outputPath("01-browsing.png"),
+          });
+        await play.click();
+        await expect
+          .poll(() => api.sessionItemIds.length)
+          .toBe(exit === "Stop" ? 1 : 2);
+        const area = page.getByLabel("Video player", { exact: true });
+        const bounds = (await area.boundingBox())!;
+        expect(bounds.y).toBeGreaterThanOrEqual(0);
+        expect(bounds.y + bounds.height).toBeLessThanOrEqual(viewport.height);
+        await expect(area).toBeFocused();
+        await expect(page.locator(".playback-loading")).toBeInViewport({
+          ratio: 0.99,
+        });
+        if (exit === "Stop")
+          await page.screenshot({
+            path: test.info().outputPath("02-player-loading.png"),
+          });
+        releaseCreation();
+        await expect(page.locator(".primary-control")).toBeEnabled();
+        await playableVideo(page);
+        if (exit === "Stop")
+          await page.getByRole("button", { name: "Stop playback" }).click();
+        else await page.goBack();
+        await expect(page).toHaveURL(originURL);
+        await expect(page.locator("video")).toHaveCount(0);
+        await expect(
+          details.getByRole("heading", { name: title.name, exact: true }),
+        ).toBeVisible();
+        await expect
+          .poll(async () =>
+            Math.abs(
+              (await page.evaluate(() => window.scrollY)) - originScroll,
+            ),
+          )
+          .toBeLessThanOrEqual(2);
+        await expect(play).toBeFocused();
+        await expect(play).toBeInViewport({ ratio: 0.99 });
+        if (exit === "Stop")
+          await page.screenshot({
+            path: test.info().outputPath("03-browsing-restored.png"),
+          });
+        if (viewport.search)
+          await expect(
+            page.getByRole("searchbox", { name: "Search library" }),
+          ).toHaveValue("Coast");
+        else
+          await expect(
+            page.getByRole("combobox", { name: "Category", exact: true }),
+          ).toContainText("Drama");
+      }
+      expect(api.sessionItemIds).toEqual([title.id, title.id]);
+      await expect
+        .poll(() => api.events.filter((event) => event === "DELETE").length)
+        .toBe(2);
+    } finally {
+      releaseCreation();
+    }
   });
 }
 
@@ -5481,7 +5648,7 @@ test("category dropdown supports keyboard selection and retains scoped VOD contr
   await expect(page.getByRole("searchbox")).toHaveCount(0);
 });
 
-for (const width of [1440, 821, 320]) {
+for (const width of [1440, 320]) {
   test(`icon navigation reaches Home, Search, VOD, Live TV and Account settings at ${width}px`, async ({
     page,
   }) => {
@@ -5552,6 +5719,226 @@ for (const width of [1440, 821, 320]) {
     expect(api.events).not.toContain("POST");
   });
 }
+
+test("sidebar destinations remain reachable after rotation and in short windows", async ({
+  page,
+}) => {
+  await mockApi(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  await expectHome(page);
+  await page.setViewportSize({ width: 844, height: 390 });
+  const navigation = page.getByRole("navigation", {
+    name: "Library",
+    exact: true,
+  });
+  const brand = page.getByRole("button", { name: "Restream home" });
+  const account = navigation.getByRole("button", { name: "Account" });
+  await expect(navigation).toBeVisible();
+  for (const height of [390, 280]) {
+    await page.setViewportSize({ width: 844, height });
+    for (const name of ["Search", "Home", "VOD", "Live TV"]) {
+      const button = navigation.getByRole("button", { name, exact: true });
+      // Focusing also exercises scrolling when the window cannot fit all links.
+      await button.focus();
+      await expect(button).toBeInViewport({ ratio: 1 });
+      const bounds = (await button.boundingBox())!;
+      const logoBounds = (await brand.boundingBox())!;
+      const accountBounds = (await account.boundingBox())!;
+      expect(bounds.y).toBeGreaterThanOrEqual(logoBounds.y + logoBounds.height);
+      expect(bounds.y + bounds.height).toBeLessThanOrEqual(accountBounds.y);
+    }
+    await expect(brand).toBeInViewport({ ratio: 1 });
+    await expect(account).toBeInViewport({ ratio: 1 });
+  }
+  await navigation.getByRole("button", { name: "Search", exact: true }).click();
+  await page.getByRole("searchbox", { name: "Search library" }).fill("Coast");
+  await expect(
+    page.getByRole("button", { name: "Open The Quiet Coast" }),
+  ).toBeVisible();
+  await openSettings(page);
+  await expect(
+    page.getByRole("heading", { name: "Settings", exact: true }),
+  ).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page
+    .getByRole("navigation", { name: "Primary navigation" })
+    .getByRole("button", { name: "Home", exact: true })
+    .click();
+  await expectHome(page);
+});
+
+test.describe("tablet rotation", () => {
+  test.use({ isMobile: true, hasTouch: true });
+
+  test("Movies, Live TV and Search reflow without reloading or losing selection", async ({
+    page,
+  }) => {
+    const movies = Array.from({ length: 8 }, (_, index) => ({
+      ...movie,
+      id: `coast-${index}`,
+      name: `Coast ${index}`,
+    }));
+    const channels = Array.from({ length: 6 }, (_, index) => ({
+      ...live,
+      id: `channel-${index}`,
+      name: `Coast News ${index}`,
+    }));
+    const api = await mockApi(page, { catalogItems: [...movies, ...channels] });
+    await page.setViewportSize({ width: 768, height: 1024 });
+    await page.goto("/?section=movie");
+    const main = await page.locator("#main-content").elementHandle();
+
+    for (const section of ["movie", "live", "search"] as const) {
+      if (section === "search") await (await openSearch(page)).fill("Coast");
+      else await navigateLibrary(page, section);
+      const grid =
+        section === "search"
+          ? page
+              .getByRole("region", { name: "Movies results" })
+              .locator(".catalog-grid")
+          : page
+              .locator(".library-content .catalog-grid")
+              .filter({ visible: true });
+      const cards = grid.getByRole("button", { name: /^Open / });
+      await expect(cards).toHaveCount(
+        section === "live" ? channels.length : movies.length,
+      );
+      const rowStart = section === "live" ? 2 : 3;
+      for (const landscape of [true, false]) {
+        const width = landscape ? 1024 : 768;
+        const height = landscape ? 768 : 1024;
+        const url = page.url();
+        await page.setViewportSize({ width, height });
+        await expect(
+          page.getByRole("navigation", {
+            name: landscape ? "Library" : "Primary navigation",
+            exact: true,
+          }),
+        ).toBeVisible();
+        await expect
+          .poll(async () => {
+            const first = (await cards.first().boundingBox())!;
+            const next = (await cards.nth(rowStart).boundingBox())!;
+            return Math.abs(first.y - next.y) < 1;
+          })
+          .toBe(landscape);
+        const bounds = (await grid.boundingBox())!;
+        expect(bounds.x + bounds.width).toBeGreaterThan(width - 60);
+        expect(bounds.x + bounds.width).toBeLessThanOrEqual(width);
+        expect(
+          await page.evaluate(() => document.documentElement.scrollWidth),
+        ).toBeLessThanOrEqual(width);
+        expect(
+          await main!.evaluate(
+            (element) => element === document.getElementById("main-content"),
+          ),
+        ).toBe(true);
+        expect(page.url()).toBe(url);
+        if (section === "search")
+          await expect(
+            page.getByRole("searchbox", { name: "Search library" }),
+          ).toHaveValue("Coast");
+      }
+    }
+
+    // Emulate iPad Chrome reporting a rotated screen while retaining the old
+    // portrait viewport. The recovery must request fresh viewport constraints
+    // without losing the user's search or leaving a fixed width / zoom limit.
+    const viewport = await emulateStaleViewport(page);
+    try {
+      await page.evaluate(() =>
+        window.dispatchEvent(new Event("orientationchange")),
+      );
+      await viewport.expectRecovered();
+    } finally {
+      await viewport.dispose();
+    }
+    await expect(
+      page.getByRole("searchbox", { name: "Search library" }),
+    ).toHaveValue("Coast");
+    expect(
+      await main!.evaluate(
+        (element) => element === document.getElementById("main-content"),
+      ),
+    ).toBe(true);
+    expect(api.events).not.toContain("POST");
+  });
+
+  test("leaving iPad fullscreen recovers the viewport without restarting playback or losing Search", async ({
+    page,
+  }) => {
+    const api = await mockApi(page);
+    await page.setViewportSize({ width: 768, height: 1024 });
+    await page.goto("/");
+    await (await openSearch(page)).fill("Coast");
+    await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+    await page.getByRole("button", { name: "Play", exact: true }).click();
+    await playableVideo(page);
+    const video = await page.locator("video").elementHandle();
+    const playerURL = page.url();
+    await page.clock.install();
+    for (const delayBeforeExit of [5000, 0]) {
+      // Native iPad video fullscreen does not populate document.fullscreenElement.
+      await video!.evaluate((element) =>
+        element.dispatchEvent(new Event("webkitbeginfullscreen")),
+      );
+      const viewport = await emulateStaleViewport(page);
+      try {
+        // Rotate while fullscreen, then exit either after settling or immediately.
+        await page.evaluate(() =>
+          window.dispatchEvent(new Event("orientationchange")),
+        );
+        await page.clock.fastForward(delayBeforeExit);
+        expect(await viewport.changes()).toEqual([]);
+
+        // Chrome can return both a stale portrait viewport and orientation reading.
+        // Done must recover the page even without another orientation event.
+        await page.evaluate(() =>
+          Object.defineProperty(screen.orientation, "type", {
+            configurable: true,
+            value: "portrait-primary",
+          }),
+        );
+        await video!.evaluate((element) =>
+          element.dispatchEvent(new Event("webkitendfullscreen")),
+        );
+        await viewport.expectRecovered();
+        expect(page.url()).toBe(playerURL);
+        expect(
+          await video!.evaluate(
+            (element) => element === document.querySelector("video"),
+          ),
+        ).toBe(true);
+        expect(api.sessionItemIds).toEqual([movie.id]);
+        expect(api.events).not.toContain("DELETE");
+      } finally {
+        await viewport.dispose();
+      }
+    }
+
+    const closingViewport = await emulateStaleViewport(page);
+    try {
+      await page.getByRole("button", { name: "Stop playback" }).click();
+      await closingViewport.expectRecovered();
+      await expect(page.locator("video")).toHaveCount(0);
+      await expect(
+        page.getByRole("searchbox", { name: "Search library" }),
+      ).toHaveValue("Coast");
+      await expect
+        .poll(() => api.events.filter((event) => event === "DELETE").length)
+        .toBe(1);
+    } finally {
+      await closingViewport.dispose();
+    }
+    await page.setViewportSize({ width: 1024, height: 768 });
+    await expect(
+      page.getByRole("navigation", { name: "Library", exact: true }),
+    ).toBeVisible();
+    const bounds = (await page.locator("#main-content").boundingBox())!;
+    expect(bounds.x + bounds.width).toBe(1024);
+  });
+});
 
 for (const width of [1440, 320]) {
   test(`long category dropdown scrolls and filters titles without page overflow at ${width}px`, async ({
