@@ -862,58 +862,6 @@ async function playableVideo(page: Page, position = 30, edge = 100) {
   );
 }
 
-async function emulateStaleViewport(page: Page) {
-  const state = await page.evaluateHandle(() => {
-    const viewport = document.querySelector<HTMLMetaElement>(
-      'meta[name="viewport"]',
-    )!;
-    const original = viewport.content;
-    const changes: string[] = [];
-    const orientation = Object.getOwnPropertyDescriptor(
-      screen.orientation,
-      "type",
-    );
-    Object.defineProperty(screen.orientation, "type", {
-      configurable: true,
-      value: "landscape-primary",
-    });
-    const observer = new MutationObserver(() => changes.push(viewport.content));
-    observer.observe(viewport, { attributes: true });
-    return {
-      original,
-      changes,
-      cleanup() {
-        observer.disconnect();
-        viewport.content = original;
-        if (orientation)
-          Object.defineProperty(screen.orientation, "type", orientation);
-        else Reflect.deleteProperty(screen.orientation, "type");
-      },
-    };
-  });
-  return {
-    changes: () => state.evaluate((value) => value.changes),
-    async expectRecovered() {
-      await expect
-        .poll(() =>
-          state.evaluate(
-            (value) =>
-              value.changes.length >= 2 &&
-              value.changes.at(-1) === value.original,
-          ),
-        )
-        .toBe(true);
-      const content = await state.evaluate((value) => value.original);
-      expect(content).toContain("width=device-width");
-      expect(content).not.toMatch(/maximum-scale|user-scalable=no/);
-    },
-    async dispose() {
-      await state.evaluate((value) => value.cleanup());
-      await state.dispose();
-    },
-  };
-}
-
 test("LIVE greys behind the stream and jumps to the latest seek point while resuming", async ({
   page,
 }) => {
@@ -5768,6 +5716,154 @@ test("sidebar destinations remain reachable after rotation and in short windows"
   await expectHome(page);
 });
 
+test.describe("Chrome iPad viewport recovery", () => {
+  test.use({
+    isMobile: true,
+    hasTouch: true,
+    viewport: { width: 820, height: 1180 },
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/156 Version/27.0 Safari/605.1.15",
+  });
+
+  test("fullscreen exit restores the landscape layout and later portrait browsing without restarting playback", async ({
+    page,
+    browserName,
+  }) => {
+    const api = await mockApi(page);
+    await page.goto("/?view=search&section=movie&search=Coast");
+    await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+    await expect(
+      page
+        .getByRole("region", { name: "Expanded title", exact: true })
+        .getByRole("heading", { name: movie.name, exact: true }),
+    ).toBeFocused();
+    await page.getByRole("button", { name: "Play", exact: true }).click();
+    await expect(page.locator(".primary-control")).toBeEnabled();
+    await playableVideo(page);
+    const video = await page.locator("video").elementHandle();
+    const playerURL = page.url();
+    const viewport = page.locator('meta[name="viewport"]');
+    const original = await viewport.getAttribute("content");
+    await page.clock.install();
+
+    const reportWindowWidth = async (width: number) => {
+      // Reproduce the measured Chrome mismatch: its outer window is landscape,
+      // while the real CSS viewport and orientation still have portrait width.
+      // Only the outer window reading is overridden; layout must actually reflow.
+      await page.evaluate((value) => {
+        Object.defineProperty(window, "outerWidth", {
+          configurable: true,
+          value,
+        });
+        window.dispatchEvent(new Event("resize"));
+      }, width);
+    };
+    // Desktop WebKit's mobile emulation does not provide iPad's element
+    // fullscreen host. Exercise native-exit handling there; Chromium also uses
+    // the real element-fullscreen controls.
+    const fullscreenModes =
+      browserName === "chromium" ? ["element", "native"] : ["native"];
+    for (const fullscreen of fullscreenModes) {
+      const beforeFullscreen = await viewport.getAttribute("content");
+      await page.setViewportSize({ width: 820, height: 682 });
+      if (fullscreen === "element") {
+        await page
+          .getByRole("button", { name: "Full screen", exact: true })
+          .click();
+        await expect
+          .poll(() => page.evaluate(() => !!document.fullscreenElement))
+          .toBe(true);
+      } else {
+        await video!.evaluate((element) => {
+          Object.defineProperty(element, "webkitDisplayingFullscreen", {
+            configurable: true,
+            value: true,
+          });
+          element.dispatchEvent(new Event("webkitbeginfullscreen"));
+        });
+      }
+      await reportWindowWidth(1180);
+      await page.clock.fastForward(500);
+      await expect(viewport).toHaveAttribute("content", beforeFullscreen!);
+
+      if (fullscreen === "element")
+        await page
+          .getByRole("button", { name: "Exit full screen", exact: true })
+          .click();
+      else
+        await video!.evaluate((element) => {
+          Object.defineProperty(element, "webkitDisplayingFullscreen", {
+            configurable: true,
+            value: false,
+          });
+          element.dispatchEvent(new Event("webkitendfullscreen"));
+        });
+      await page.clock.fastForward(500);
+      await expect(
+        page.getByRole("navigation", { name: "Library", exact: true }),
+      ).toBeVisible();
+      await expect
+        .poll(() => page.evaluate(() => document.documentElement.clientWidth))
+        .toBe(1180);
+      const bounds = (await page.locator("#main-content").boundingBox())!;
+      expect(bounds.x + bounds.width).toBe(1180);
+      expect(page.url()).toBe(playerURL);
+      expect(
+        await video!.evaluate(
+          (element) => element === document.querySelector("video"),
+        ),
+      ).toBe(true);
+      expect(api.sessionItemIds).toEqual([movie.id]);
+      expect(api.events).not.toContain("DELETE");
+      if (fullscreen === "element")
+        await page.screenshot({
+          path: test.info().outputPath("recovered-landscape.png"),
+        });
+
+      if (fullscreen === "element") {
+        // Do not reset pinch zoom when the window changes. Resume width updates
+        // after the user returns to normal zoom.
+        await page.evaluate(() =>
+          Object.defineProperty(visualViewport, "scale", {
+            configurable: true,
+            value: 2,
+          }),
+        );
+        await reportWindowWidth(820);
+        await page.clock.fastForward(500);
+        await expect
+          .poll(() => page.evaluate(() => document.documentElement.clientWidth))
+          .toBe(1180);
+        await page.evaluate(() => {
+          Reflect.deleteProperty(visualViewport!, "scale");
+          visualViewport!.dispatchEvent(new Event("resize"));
+        });
+      }
+      await page.setViewportSize({ width: 820, height: 1180 });
+      await reportWindowWidth(820);
+      await page.clock.fastForward(500);
+      await expect(
+        page.getByRole("navigation", {
+          name: "Primary navigation",
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect
+        .poll(() => page.evaluate(() => document.documentElement.clientWidth))
+        .toBe(820);
+    }
+    expect(original).toContain("width=device-width");
+    await page
+      .getByRole("button", { name: "Stop playback", exact: true })
+      .click();
+    await expect(page.locator("video")).toHaveCount(0);
+    await expect(
+      page.getByRole("searchbox", { name: "Search library" }),
+    ).toHaveValue("Coast");
+    expect(api.sessionItemIds).toEqual([movie.id]);
+  });
+});
+
 test.describe("tablet rotation", () => {
   test.use({ isMobile: true, hasTouch: true });
 
@@ -5842,101 +5938,7 @@ test.describe("tablet rotation", () => {
       }
     }
 
-    // Emulate iPad Chrome reporting a rotated screen while retaining the old
-    // portrait viewport. The recovery must request fresh viewport constraints
-    // without losing the user's search or leaving a fixed width / zoom limit.
-    const viewport = await emulateStaleViewport(page);
-    try {
-      await page.evaluate(() =>
-        window.dispatchEvent(new Event("orientationchange")),
-      );
-      await viewport.expectRecovered();
-    } finally {
-      await viewport.dispose();
-    }
-    await expect(
-      page.getByRole("searchbox", { name: "Search library" }),
-    ).toHaveValue("Coast");
-    expect(
-      await main!.evaluate(
-        (element) => element === document.getElementById("main-content"),
-      ),
-    ).toBe(true);
     expect(api.events).not.toContain("POST");
-  });
-
-  test("leaving iPad fullscreen recovers the viewport without restarting playback or losing Search", async ({
-    page,
-  }) => {
-    const api = await mockApi(page);
-    await page.setViewportSize({ width: 768, height: 1024 });
-    await page.goto("/");
-    await (await openSearch(page)).fill("Coast");
-    await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
-    await page.getByRole("button", { name: "Play", exact: true }).click();
-    await playableVideo(page);
-    const video = await page.locator("video").elementHandle();
-    const playerURL = page.url();
-    await page.clock.install();
-    for (const delayBeforeExit of [5000, 0]) {
-      // Native iPad video fullscreen does not populate document.fullscreenElement.
-      await video!.evaluate((element) =>
-        element.dispatchEvent(new Event("webkitbeginfullscreen")),
-      );
-      const viewport = await emulateStaleViewport(page);
-      try {
-        // Rotate while fullscreen, then exit either after settling or immediately.
-        await page.evaluate(() =>
-          window.dispatchEvent(new Event("orientationchange")),
-        );
-        await page.clock.fastForward(delayBeforeExit);
-        expect(await viewport.changes()).toEqual([]);
-
-        // Chrome can return both a stale portrait viewport and orientation reading.
-        // Done must recover the page even without another orientation event.
-        await page.evaluate(() =>
-          Object.defineProperty(screen.orientation, "type", {
-            configurable: true,
-            value: "portrait-primary",
-          }),
-        );
-        await video!.evaluate((element) =>
-          element.dispatchEvent(new Event("webkitendfullscreen")),
-        );
-        await viewport.expectRecovered();
-        expect(page.url()).toBe(playerURL);
-        expect(
-          await video!.evaluate(
-            (element) => element === document.querySelector("video"),
-          ),
-        ).toBe(true);
-        expect(api.sessionItemIds).toEqual([movie.id]);
-        expect(api.events).not.toContain("DELETE");
-      } finally {
-        await viewport.dispose();
-      }
-    }
-
-    const closingViewport = await emulateStaleViewport(page);
-    try {
-      await page.getByRole("button", { name: "Stop playback" }).click();
-      await closingViewport.expectRecovered();
-      await expect(page.locator("video")).toHaveCount(0);
-      await expect(
-        page.getByRole("searchbox", { name: "Search library" }),
-      ).toHaveValue("Coast");
-      await expect
-        .poll(() => api.events.filter((event) => event === "DELETE").length)
-        .toBe(1);
-    } finally {
-      await closingViewport.dispose();
-    }
-    await page.setViewportSize({ width: 1024, height: 768 });
-    await expect(
-      page.getByRole("navigation", { name: "Library", exact: true }),
-    ).toBeVisible();
-    const bounds = (await page.locator("#main-content").boundingBox())!;
-    expect(bounds.x + bounds.width).toBe(1024);
   });
 });
 
