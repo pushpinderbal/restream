@@ -650,11 +650,13 @@ function App() {
 
   useEffect(() => {
     if (!catalogGrid) return;
-    const measure = () =>
+    const measure = () => {
+      if (!catalogGrid.clientWidth) return;
       setGridColumns(
         getComputedStyle(catalogGrid).gridTemplateColumns.split(" ").length ||
           1,
       );
+    };
     const observer = new ResizeObserver(measure);
     measure();
     observer.observe(catalogGrid);
