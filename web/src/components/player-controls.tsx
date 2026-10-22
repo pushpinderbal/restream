@@ -50,6 +50,8 @@ type Props = {
   buffered: { start: number; end: number }[];
   live: boolean;
   liveDelay: number | null;
+  playbackRate: number;
+  onPlaybackRate: (rate: number) => void;
   onGoLive: () => void;
   onPlay: () => void;
   onSeek: (position: number) => void;
@@ -84,7 +86,7 @@ export function PlayerControls(props: Props) {
   actions.current = props;
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const scrubbing = useRef(false);
-  const subtitleMenuOpen = useRef(false);
+  const menuOpen = useRef(false);
   const canSeek = !live && duration > 0 && !busy && !finished;
   const reveal = useCallback(() => {
     setVisible(true);
@@ -93,7 +95,7 @@ export function PlayerControls(props: Props) {
       timer.current = setTimeout(() => {
         if (
           scrubbing.current ||
-          subtitleMenuOpen.current ||
+          menuOpen.current ||
           area.current?.querySelector(":focus-visible")
         )
           return;
@@ -112,7 +114,7 @@ export function PlayerControls(props: Props) {
         playing &&
         !busy &&
         !scrubbing.current &&
-        !subtitleMenuOpen.current &&
+        !menuOpen.current &&
         !element.querySelector(":focus-visible")
       ) {
         clearTimeout(timer.current);
@@ -125,7 +127,7 @@ export function PlayerControls(props: Props) {
         timer.current = setTimeout(() => {
           if (
             !scrubbing.current &&
-            !subtitleMenuOpen.current &&
+            !menuOpen.current &&
             !element.querySelector(":focus-visible")
           )
             setVisible(false);
@@ -355,88 +357,136 @@ export function PlayerControls(props: Props) {
             {time(value)} <span>/ {time(duration)}</span>
           </span>
         )}
-        {!!props.subtitles?.tracks.length && (
-          <DropdownMenu
-            onOpenChange={(open) => {
-              subtitleMenuOpen.current = open;
-              reveal();
-            }}
-          >
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="control-button subtitles-control"
-                aria-label="Subtitles"
-                title="Subtitles"
-                data-active={!!props.subtitles.selected}
-              >
-                <Captions className="size-[23px]" size={23} strokeWidth={1.5} />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              side="top"
-              align="end"
-              portalContainer={area.current}
-              aria-label="Subtitles"
+        <div className="ml-auto flex items-center gap-[inherit]">
+          {!live && (
+            <DropdownMenu
+              onOpenChange={(open) => {
+                menuOpen.current = open;
+                reveal();
+              }}
             >
-              <DropdownMenuLabel>Subtitles</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuRadioGroup
-                value={props.subtitles.selected ?? "off"}
-                onValueChange={(value) =>
-                  props.subtitles?.select(value === "off" ? null : value)
-                }
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="control-button text-xs font-medium tabular-nums"
+                  aria-label={`Playback speed: ${props.playbackRate}×`}
+                  title="Playback speed"
+                  disabled={busy || finished}
+                >
+                  {props.playbackRate}×
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                side="top"
+                align="end"
+                portalContainer={area.current}
+                aria-label="Playback speed"
               >
-                <DropdownMenuRadioItem value="off">Off</DropdownMenuRadioItem>
-                {props.subtitles.tracks.map((track) => (
-                  <DropdownMenuRadioItem key={track.id} value={track.id}>
-                    {subtitleLabel(track)}
-                  </DropdownMenuRadioItem>
-                ))}
-              </DropdownMenuRadioGroup>
-              {props.subtitles.selected &&
-                props.subtitles.status !== "ready" && (
-                  <>
-                    <DropdownMenuSeparator />
-                    <div
-                      className="px-3 py-2 text-sm text-muted-foreground"
-                      role="status"
-                    >
-                      {props.subtitles.status === "loading"
-                        ? "Loading subtitles…"
-                        : "Subtitles temporarily unavailable"}
-                    </div>
-                    {props.subtitles.status === "error" && (
-                      <DropdownMenuItem
-                        onSelect={() =>
-                          props.subtitles?.retry
-                            ? props.subtitles.retry()
-                            : props.subtitles?.select(props.subtitles.selected)
-                        }
-                      >
-                        Try again
-                      </DropdownMenuItem>
-                    )}
-                  </>
-                )}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
-        <Button
-          variant="ghost"
-          size="icon"
-          className="control-button fullscreen"
-          onClick={onFullscreen}
-          aria-label={fullscreen ? "Exit full screen" : "Full screen"}
-          title="Full screen (F)"
-        >
-          {fullscreen ? (
-            <Minimize2 className="size-[23px]" size={23} strokeWidth={1.5} />
-          ) : (
-            <Maximize2 className="size-[23px]" size={23} strokeWidth={1.5} />
+                <DropdownMenuLabel>Playback speed</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuRadioGroup
+                  value={String(props.playbackRate)}
+                  onValueChange={(value) => props.onPlaybackRate(Number(value))}
+                >
+                  {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
+                    <DropdownMenuRadioItem key={rate} value={String(rate)}>
+                      {rate === 1 ? "1× (Normal)" : `${rate}×`}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
           )}
-        </Button>
+          {!!props.subtitles?.tracks.length && (
+            <DropdownMenu
+              onOpenChange={(open) => {
+                menuOpen.current = open;
+                reveal();
+              }}
+            >
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="control-button subtitles-control"
+                  aria-label="Subtitles"
+                  title="Subtitles"
+                  data-active={!!props.subtitles.selected}
+                >
+                  <Captions
+                    className="size-[23px]"
+                    size={23}
+                    strokeWidth={1.5}
+                  />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                side="top"
+                align="end"
+                portalContainer={area.current}
+                aria-label="Subtitles"
+              >
+                <DropdownMenuLabel>Subtitles</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuRadioGroup
+                  value={props.subtitles.selected ?? "off"}
+                  onValueChange={(value) =>
+                    props.subtitles?.select(value === "off" ? null : value)
+                  }
+                >
+                  <DropdownMenuRadioItem value="off">Off</DropdownMenuRadioItem>
+                  {props.subtitles.tracks.map((track) => (
+                    <DropdownMenuRadioItem key={track.id} value={track.id}>
+                      {subtitleLabel(track)}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+                {props.subtitles.selected &&
+                  props.subtitles.status !== "ready" && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <div
+                        className="px-3 py-2 text-sm text-muted-foreground"
+                        role="status"
+                      >
+                        {props.subtitles.status === "loading"
+                          ? "Loading subtitles…"
+                          : "Subtitles temporarily unavailable"}
+                      </div>
+                      {props.subtitles.status === "error" && (
+                        <DropdownMenuItem
+                          onSelect={() =>
+                            props.subtitles?.retry
+                              ? props.subtitles.retry()
+                              : props.subtitles?.select(
+                                  props.subtitles.selected,
+                                )
+                          }
+                        >
+                          Try again
+                        </DropdownMenuItem>
+                      )}
+                    </>
+                  )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="control-button fullscreen"
+            onClick={onFullscreen}
+            aria-label={fullscreen ? "Exit full screen" : "Full screen"}
+            title="Full screen (F)"
+          >
+            {fullscreen ? (
+              <Minimize2 className="size-[23px]" size={23} strokeWidth={1.5} />
+            ) : (
+              <Maximize2 className="size-[23px]" size={23} strokeWidth={1.5} />
+            )}
+          </Button>
+        </div>
       </div>
     </motion.div>
   );

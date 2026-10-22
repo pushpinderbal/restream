@@ -30,6 +30,7 @@ type Streams interface {
 	Get(string) (stream.Session, error)
 	Heartbeat(string) error
 	Seek(context.Context, string, float64) (stream.Session, error)
+	SetPlaybackRate(context.Context, string, float64, float64) (stream.Session, error)
 	Stop(string) error
 	Active() int
 	MediaHandler() http.Handler
@@ -157,6 +158,7 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	mux.HandleFunc("GET /api/sessions/{id}", s.session)
 	mux.HandleFunc("POST /api/sessions/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /api/sessions/{id}/seek", s.seek)
+	mux.HandleFunc("POST /api/sessions/{id}/speed", s.playbackSpeed)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.stop)
 	if streams != nil {
 		mux.Handle("/api/streams/", s.policyMedia(streams.MediaHandler()))
@@ -833,6 +835,33 @@ func (s *Server) seek(w http.ResponseWriter, r *http.Request) {
 	}
 	respond(w, 200, session)
 }
+func (s *Server) playbackSpeed(w http.ResponseWriter, r *http.Request) {
+	if !s.sessionAllowed(w, r, r.PathValue("id")) {
+		return
+	}
+	if s.streams == nil {
+		streamError(w, stream.ErrNotFound)
+		return
+	}
+	var body struct {
+		Position float64 `json:"position"`
+		Rate     float64 `json:"rate"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if !validPosition(body.Position) || math.IsNaN(body.Rate) || body.Rate < 0.5 || body.Rate > 2 {
+		fail(w, 400, "invalid", "Choose a playback speed between 0.5× and 2× and a valid position.")
+		return
+	}
+	session, err := s.streams.SetPlaybackRate(r.Context(), r.PathValue("id"), body.Position, body.Rate)
+	if err != nil {
+		streamError(w, err)
+		return
+	}
+	respond(w, 200, session)
+}
+
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	if !s.sessionOwned(w, r, r.PathValue("id")) {
 		return

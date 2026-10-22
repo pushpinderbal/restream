@@ -15,6 +15,7 @@ Restream brings your IPTV subscription to the browser. Host it on your own compu
 - ⚡ **Shared library cache**: cached listings stay available while the server refreshes them in the background, reducing repeated requests to your provider.
 - 🔐 **Optional OIDC sign-in**: use your identity provider with viewer and administrator roles, or run without a login on your private network.
 - 📱 **Desktop and mobile**: responsive browsing, touch controls, and fullscreen playback.
+- ⏩ **Playback speed**: watch movies and episodes at 0.5× to 2× speed from the player controls. The buffer adjusts to your speed; changing speed briefly reloads at your current position.
 - 💬 **Subtitles**: choose provider subtitles or embedded captions from the player's CC menu. Preview your preferred font, size, color, and background in Settings, saved for this browser. Availability varies by movie and episode.
 
 ## Get started

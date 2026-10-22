@@ -148,6 +148,7 @@ export type Session = {
   state: "starting" | "ready" | "ended" | "failed";
   duration: number;
   offset: number;
+  playbackRate?: number;
   error?: string;
   subtitles?: SubtitleTrack[];
   subtitleOffset?: number;

@@ -324,6 +324,8 @@ async function mockApi(
   };
   const sessionStarts: number[] = [];
   const sessionOffsets = new Map<string, number>();
+  const sessionRates = new Map<string, number>();
+  const sessionGenerations = new Map<string, number>();
   let preferences: BrowserPreferences = structuredClone(
     options.preferences ?? {
       refreshIntervalSeconds: 21600,
@@ -748,7 +750,7 @@ async function mockApi(
       const id = path.split("/").at(-1);
       return json({
         id,
-        url: `/api/streams/${id}/0/index.m3u8`,
+        url: `/api/streams/${id}/${sessionGenerations.get(id!) ?? 0}/index.m3u8`,
         state: starting
           ? "starting"
           : options.producerEnded && polls > 1
@@ -759,6 +761,7 @@ async function mockApi(
           options.sessionDuration ??
           1800,
         offset: sessionOffsets.get(id!) ?? 0,
+        playbackRate: sessionRates.get(id!) ?? 1,
       });
     }
     if (/^\/api\/sessions\/session-\d+$/.test(path) && method === "DELETE") {
@@ -771,6 +774,22 @@ async function mockApi(
       return route.fulfill({ status: 204 });
     }
     if (path.endsWith("/heartbeat")) return route.fulfill({ status: 204 });
+    if (path.endsWith("/speed")) {
+      const id = path.split("/")[3];
+      const { position, rate } = route.request().postDataJSON();
+      sessionOffsets.set(id, position);
+      sessionRates.set(id, rate);
+      const generation = (sessionGenerations.get(id) ?? 0) + 1;
+      sessionGenerations.set(id, generation);
+      return json({
+        id,
+        url: `/api/streams/${id}/${generation}/index.m3u8`,
+        state: "ready",
+        duration: options.sessionDuration ?? 1800,
+        offset: position,
+        playbackRate: rate,
+      });
+    }
     if (path.endsWith("/seek"))
       return json({
         id: path.split("/")[3],
@@ -875,6 +894,9 @@ test("LIVE greys behind the stream and jumps to the latest seek point while resu
       .or(page.locator(".primary-control")),
   ).toBeEnabled();
   await playableVideo(page);
+  await expect(
+    page.getByRole("button", { name: /Playback speed:/ }),
+  ).toHaveCount(0);
   const liveButton = page.getByRole("button", { name: "Go to live" });
   const revealControls = async () => {
     await page.locator(".playback-area").press("ArrowUp");
@@ -1341,6 +1363,62 @@ test("player supports pause, keyboard resume, and fullscreen", async ({
   await expect
     .poll(() => page.evaluate(() => !!document.fullscreenElement))
     .toBe(false);
+  expect(api.sessionItemIds).toEqual([movie.id]);
+  expect(api.events).not.toContain("DELETE");
+});
+
+test("native playback without a known duration recovers from a rejected speed change and preserves pause", async ({
+  page,
+}) => {
+  const api = await mockApi(page, { sessionDuration: 0 });
+  await page.goto("/?section=movie");
+  await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await expect(page.locator(".primary-control")).toBeEnabled();
+  await playableVideo(page);
+  const video = page.locator("video");
+  const originalSource = await video.getAttribute("src");
+  await page.route(
+    "**/api/sessions/session-1/speed",
+    (route) =>
+      route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "Speed change temporarily unavailable" }),
+      }),
+    { times: 1 },
+  );
+  await page
+    .getByRole("button", { name: "Playback speed: 1×", exact: true })
+    .click();
+  await page.getByRole("menuitemradio", { name: "2×", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Speed change temporarily unavailable",
+  );
+  await expect(video).toHaveAttribute("src", originalSource!);
+  await expect(video).toHaveJSProperty("playbackRate", 1);
+  await expect(video).toHaveJSProperty("paused", false);
+
+  await page.getByRole("button", { name: "Pause", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Playback speed: 1×", exact: true })
+    .click();
+  const changed = page.waitForRequest((request) =>
+    request.url().endsWith("/speed"),
+  );
+  await page.getByRole("menuitemradio", { name: "1.5×", exact: true }).click();
+  expect((await changed).postDataJSON()).toEqual({ position: 30, rate: 1.5 });
+  await expect(video).toHaveAttribute("src", /\/session-1\/1\/index.m3u8$/);
+  await expect(video).toHaveJSProperty("playbackRate", 1.5);
+  await expect(video).toHaveJSProperty("paused", true);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Playback speed: 1.5×", exact: true })
+    .click();
+  await expect(
+    page.getByRole("menuitemradio", { name: "1.5×", exact: true }),
+  ).toHaveAttribute("aria-checked", "true");
+  await page.keyboard.press("Escape");
   expect(api.sessionItemIds).toEqual([movie.id]);
   expect(api.events).not.toContain("DELETE");
 });
