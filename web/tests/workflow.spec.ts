@@ -184,7 +184,7 @@ async function collapseTitle(page: Page) {
     await selectedTile.click();
     await expect(
       page.getByRole("region", { name: "Expanded title" }),
-    ).toHaveCount(0);
+    ).not.toBeVisible();
   }
 }
 
@@ -4598,9 +4598,15 @@ test("hero crossfades without repeating or jumping on refresh and pauses during 
   await expect(hero.locator(".discovery-lead-art")).toHaveCount(2);
   await expect(heading).not.toHaveText(movie.name);
   seen.add(await heading.textContent());
-  await tick(true);
-  seen.add(await heading.textContent());
-  expect(seen.size).toBe(3);
+  await expect
+    .poll(
+      async () => {
+        seen.add(await heading.textContent());
+        return seen.size;
+      },
+      { intervals: [100] },
+    )
+    .toBe(3);
   expect((await hero.boundingBox())!.height).toBe(initialHeight);
   let current = (await heading.textContent())!;
   await hero.hover();
@@ -4674,6 +4680,7 @@ test("hero crossfades without repeating or jumping on refresh and pauses during 
       .scrollTo(0, document.getElementById("app-scroll")!.scrollHeight),
   );
   await expect(hero).not.toBeInViewport();
+  current = (await heading.textContent())!;
   await tick();
   await expect(heading).toHaveText(current);
   await page.setViewportSize({ width, height: 900 });

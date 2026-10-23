@@ -8,6 +8,7 @@ import {
 } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type { DiscoveryTitle, Item } from "../api";
+import { appScroller } from "../lib/app-scroll";
 import { isContinueWatching, type WatchHistoryEntry } from "../watch-history";
 import { PlayButton } from "./ui/play-button";
 import { Spinner } from "./spectrumui/spinner-dependencies";
@@ -94,8 +95,9 @@ export function DiscoveryHero({
   useEffect(() => {
     const update = () => setVisible(!document.hidden);
     document.addEventListener("visibilitychange", update);
-    const observer = new IntersectionObserver(([entry]) =>
-      setInView(entry.isIntersecting),
+    const observer = new IntersectionObserver(
+      ([entry]) => setInView(entry.isIntersecting),
+      { root: appScroller() },
     );
     if (element.current) observer.observe(element.current);
     return () => {
