@@ -8,6 +8,7 @@ import {
 } from "react";
 import { Fingerprint, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { useAuth } from "../auth";
+import { appScroller } from "../lib/app-scroll";
 import {
   getSettings,
   updateSettings,
@@ -130,6 +131,7 @@ export function SettingsPage({
   };
   useEffect(() => {
     if (canAdmin && !settings) return;
+    const scroller = appScroller();
     let frame = 0;
     const update = () => {
       frame = 0;
@@ -143,13 +145,17 @@ export function SettingsPage({
       let current = sections[0].id;
       for (const section of sections) {
         const element = document.getElementById(section.id);
-        if (element && element.getBoundingClientRect().top <= offset)
+        if (
+          element &&
+          element.getBoundingClientRect().top <=
+            scroller.getBoundingClientRect().top + offset
+        )
           current = section.id;
       }
       if (
-        window.scrollY > 0 &&
-        Math.ceil(window.scrollY + window.innerHeight) >=
-          document.documentElement.scrollHeight - 2
+        scroller.scrollTop > 0 &&
+        Math.ceil(scroller.scrollTop + scroller.clientHeight) >=
+          scroller.scrollHeight - 2
       )
         // Short final sections share a clamped scroll position.
         current = sections.at(-1)!.id;
@@ -163,11 +169,7 @@ export function SettingsPage({
       schedule();
     };
     const clearScrollbarJump = (event: PointerEvent) => {
-      if (
-        event.target === document.documentElement ||
-        event.target === document.body
-      )
-        clearJump();
+      if (event.target === scroller) clearJump();
     };
     const scrollKey = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
@@ -197,7 +199,7 @@ export function SettingsPage({
       )
         clearJump();
     };
-    window.addEventListener("scroll", schedule, { passive: true });
+    scroller.addEventListener("scroll", schedule, { passive: true });
     window.addEventListener("resize", clearJump);
     window.addEventListener("wheel", clearJump, { passive: true });
     window.addEventListener("touchmove", clearJump, { passive: true });
@@ -207,10 +209,11 @@ export function SettingsPage({
     window.addEventListener("keydown", scrollKey);
     const observer = new ResizeObserver(schedule);
     if (pageRef.current) observer.observe(pageRef.current);
+    observer.observe(scroller);
     schedule();
     return () => {
       cancelAnimationFrame(frame);
-      window.removeEventListener("scroll", schedule);
+      scroller.removeEventListener("scroll", schedule);
       window.removeEventListener("resize", clearJump);
       window.removeEventListener("wheel", clearJump);
       window.removeEventListener("touchmove", clearJump);

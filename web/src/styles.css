@@ -65,6 +65,9 @@ body {
   min-height: 100dvh;
   background: #0c0d10;
 }
+body:has(.app-shell) {
+  overflow: hidden;
+}
 button {
   cursor: pointer;
 }
@@ -131,7 +134,7 @@ p {
 }
 .skip-link {
   visibility: hidden;
-  position: fixed;
+  position: absolute;
   top: 10px;
   left: 50%;
   z-index: 100;
@@ -148,12 +151,26 @@ p {
   transform: translate(-50%, 0);
 }
 .app-shell {
-  position: relative;
+  position: fixed;
+  top: var(--app-viewport-top, 0px);
+  right: 0;
+  left: 0;
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  height: var(--app-viewport-height, 100dvh);
+  overflow: hidden;
   isolation: isolate;
-  min-height: 100dvh;
 }
 .library-layout {
-  min-height: 100dvh;
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scroll-behavior: smooth;
+  scroll-padding-top: 24px;
 }
 .main-content {
   min-width: 0;
@@ -1244,9 +1261,16 @@ p {
     --page-gutter: 20px;
     --sidebar-width: 0px;
   }
+  .app-shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+  .library-layout {
+    grid-column: 1;
+  }
   .main-content {
     padding-top: 24px;
-    padding-bottom: calc(100px + env(safe-area-inset-bottom));
+    padding-bottom: 32px;
   }
   .inline-expansion {
     scroll-margin-top: 24px;

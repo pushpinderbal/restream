@@ -10,6 +10,7 @@ import {
   type RefObject,
 } from "react";
 import { useAuth } from "./auth";
+import { appScroller } from "./lib/app-scroll";
 import type Hls from "hls.js";
 import hlsWorkerUrl from "hls.js/dist/hls.worker.js?url";
 import {
@@ -321,7 +322,7 @@ function App() {
       return false;
     originScrollToRestore.current = null;
     scrolledExpansion.current = selectionRef.current;
-    window.scrollTo({ top, behavior: "instant" });
+    appScroller().scrollTo({ top, behavior: "instant" });
     const target =
       area.querySelector<HTMLElement>(".play-action:not(:disabled)") ||
       area.querySelector<HTMLElement>("h1");
@@ -512,7 +513,7 @@ function App() {
       setEpisodeDestination(next.episodeDestination);
       setSelected((old) => (old?.id === next.item ? old : null));
       window.requestAnimationFrame(() =>
-        window.scrollTo({
+        appScroller().scrollTo({
           behavior: "instant",
           top: next.player
             ? 0
@@ -846,7 +847,7 @@ function App() {
           .querySelector<HTMLInputElement>('input[aria-label="Search library"]')
           ?.focus(),
       );
-      window.scrollTo({ top: 0 });
+      appScroller().scrollTo({ top: 0 });
     } else if (next === "dashboard") {
       if (dashboardOpen) return;
 
@@ -859,15 +860,15 @@ function App() {
       setPlaybackDetailsId("");
       setEpisodeDestination(null);
       setDetailError("");
-      window.scrollTo({ top: 0 });
+      appScroller().scrollTo({ top: 0 });
     } else if (next === "settings") {
       if (settingsOpen) return;
-      libraryScroll.current = window.scrollY;
+      libraryScroll.current = appScroller().scrollTop;
       writeLocation(tab, category, search, false, selectedId, true);
       setSettingsOpen(true);
       setDashboardOpen(false);
       setSearchOpen(false);
-      window.scrollTo({ top: 0 });
+      appScroller().scrollTo({ top: 0 });
     } else selectCategory(next);
   };
   const openDetails = (
@@ -964,7 +965,11 @@ function App() {
           ).href;
           window.history.replaceState(window.history.state, "", url);
         }
-        playerOrigin.current = { url, initialURL: url, scroll: window.scrollY };
+        playerOrigin.current = {
+          url,
+          initialURL: url,
+          scroll: appScroller().scrollTop,
+        };
       }
       const originSelection = playerOrigin.current
         ? locationSelection(playerOrigin.current.url)
@@ -1261,7 +1266,7 @@ function App() {
         episodeTarget,
       );
     } else {
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      appScroller().scrollTo({ top: 0, behavior: "smooth" });
     }
   };
   const sectionCategories = useMemo(
@@ -1287,7 +1292,7 @@ function App() {
     }
     if (element) opener.current = element;
     if (searchContext) setTab(item.kind as Tab);
-    libraryScroll.current = window.scrollY;
+    libraryScroll.current = appScroller().scrollTop;
     scrolledExpansion.current = "";
 
     setDetailError("");
@@ -1436,10 +1441,10 @@ function App() {
                   ? lastVodTab.current
                   : destination;
             navigateSection(next);
-            window.scrollTo({ top: 0 });
+            appScroller().scrollTo({ top: 0 });
           }}
         />
-        <div className="library-layout">
+        <div className="library-layout" id="app-scroll">
           <main id="main-content" className="main-content">
             {providerSetupRequired && !settingsOpen && (
               <AnimatedAlert variant="info" aria-label="Provider setup">
@@ -1585,7 +1590,7 @@ function App() {
                 now={now}
                 onBrowse={(kind) => {
                   selectCategory(kind);
-                  window.scrollTo({ top: 0 });
+                  appScroller().scrollTo({ top: 0 });
                 }}
                 onOpen={openHistory}
                 onResume={resumeDashboardTitle}
@@ -1891,6 +1896,7 @@ function App() {
                         (tab === "live" && items.length > visibleCount) ||
                         (tab !== "live" && hasMore && !browseError)) && (
                         <InfiniteScroll
+                          scrollRoot="#app-scroll"
                           isLoading={browseLoading}
                           hasMore={
                             !discoveryContext &&

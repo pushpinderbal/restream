@@ -3,12 +3,12 @@ import { createRoot } from "react-dom/client";
 import App from "./App";
 import { AuthGate } from "./auth";
 import { trackInputModality } from "./lib/input-modality";
-import { trackViewportRecovery } from "./lib/viewport";
+import { trackAppViewport } from "./lib/viewport";
 import "@fontsource-variable/manrope";
 import "./styles.css";
 
 const stopTrackingInput = trackInputModality();
-const stopTrackingViewport = trackViewportRecovery();
+const stopTrackingViewport = trackAppViewport();
 if (import.meta.hot)
   import.meta.hot.dispose(() => {
     stopTrackingInput();

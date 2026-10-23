@@ -707,7 +707,7 @@
 }
 
 .discovery-history-undo {
-  position: fixed;
+  position: absolute;
   z-index: 60;
   bottom: 24px;
   left: calc((100% + var(--sidebar-width)) / 2);

@@ -1267,10 +1267,14 @@ for (const viewport of [
         await play.scrollIntoViewIfNeeded();
         // Settle any preceding smooth reveal before recording the user's position.
         await page.evaluate(() =>
-          window.scrollBy({ top: 0, behavior: "instant" }),
+          document
+            .getElementById("app-scroll")!
+            .scrollBy({ top: 0, behavior: "instant" }),
         );
         const originURL = page.url();
-        const originScroll = await page.evaluate(() => window.scrollY);
+        const originScroll = await page.evaluate(
+          () => document.getElementById("app-scroll")!.scrollTop,
+        );
         expect(originScroll).toBeGreaterThan(viewport.height);
         if (exit === "Stop")
           await page.screenshot({
@@ -1306,7 +1310,9 @@ for (const viewport of [
         await expect
           .poll(async () =>
             Math.abs(
-              (await page.evaluate(() => window.scrollY)) - originScroll,
+              (await page.evaluate(
+                () => document.getElementById("app-scroll")!.scrollTop,
+              )) - originScroll,
             ),
           )
           .toBeLessThanOrEqual(2);
@@ -2697,7 +2703,11 @@ test("Settings section navigation preserves drafts on desktop and mobile", async
       ),
     ).toBeInViewport();
   }
-  await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
+  await page.evaluate(() =>
+    document
+      .getElementById("app-scroll")!
+      .scrollTo({ top: 0, behavior: "instant" }),
+  );
   await page.mouse.wheel(0, -1);
   await expect(
     navigation.getByRole("link", { name: "Provider", exact: true }),
@@ -4658,7 +4668,11 @@ test("hero crossfades without repeating or jumping on refresh and pauses during 
   await expect(heading).not.toHaveText(current);
   current = (await heading.textContent())!;
   await page.setViewportSize({ width, height: 350 });
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.evaluate(() =>
+    document
+      .getElementById("app-scroll")!
+      .scrollTo(0, document.getElementById("app-scroll")!.scrollHeight),
+  );
   await expect(hero).not.toBeInViewport();
   await tick();
   await expect(heading).toHaveText(current);
@@ -5822,7 +5836,6 @@ test.describe("Chrome iPad viewport recovery", () => {
     const playerURL = page.url();
     const viewport = page.locator('meta[name="viewport"]');
     const original = await viewport.getAttribute("content");
-    await page.clock.install();
 
     const reportWindowWidth = async (width: number) => {
       // Reproduce the measured Chrome mismatch: its outer window is landscape,
@@ -5835,6 +5848,13 @@ test.describe("Chrome iPad viewport recovery", () => {
         });
         window.dispatchEvent(new Event("resize"));
       }, width);
+      // Allow the browser to render the viewport change before interacting.
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          ),
+      );
     };
     // Desktop WebKit's mobile emulation does not provide iPad's element
     // fullscreen host. Exercise native-exit handling there; Chromium also uses
@@ -5843,7 +5863,10 @@ test.describe("Chrome iPad viewport recovery", () => {
       browserName === "chromium" ? ["element", "native"] : ["native"];
     for (const fullscreen of fullscreenModes) {
       const beforeFullscreen = await viewport.getAttribute("content");
+      // Desktop Chromium cannot resize its fullscreen host. Set up the measured
+      // stale viewport before entry; rotate the reported outer window in fullscreen.
       await page.setViewportSize({ width: 820, height: 682 });
+      await expect(page.locator(".app-shell")).toHaveCSS("height", "682px");
       if (fullscreen === "element") {
         await page
           .getByRole("button", { name: "Full screen", exact: true })
@@ -5861,7 +5884,6 @@ test.describe("Chrome iPad viewport recovery", () => {
         });
       }
       await reportWindowWidth(1180);
-      await page.clock.fastForward(500);
       await expect(viewport).toHaveAttribute("content", beforeFullscreen!);
 
       if (fullscreen === "element")
@@ -5876,7 +5898,6 @@ test.describe("Chrome iPad viewport recovery", () => {
           });
           element.dispatchEvent(new Event("webkitendfullscreen"));
         });
-      await page.clock.fastForward(500);
       await expect(
         page.getByRole("navigation", { name: "Library", exact: true }),
       ).toBeVisible();
@@ -5890,28 +5911,73 @@ test.describe("Chrome iPad viewport recovery", () => {
         exact: true,
       });
       const expectReachableSidebar = async () => {
-        const visibleHeight = await page.evaluate(
-          () => window.visualViewport!.height,
-        );
-        for (const name of ["Search", "Home", "VOD", "Live TV", "Account"]) {
-          const button = navigation.getByRole("button", { name, exact: true });
-          const box = (await button.boundingBox())!;
-          expect(box.y, `${name} is below the top edge`).toBeGreaterThanOrEqual(
-            0,
-          );
-          expect(
-            box.y + box.height,
-            `${name} fits the visible window without scrolling the page`,
-          ).toBeLessThanOrEqual(visibleHeight);
-        }
+        await expect(async () => {
+          // Read viewport and element coordinates together: mobile browser
+          // panning can move the visible origin without scrolling the document.
+          const { top, bottom, buttons } = await page
+            .locator(".app-sidebar button[aria-label]")
+            .evaluateAll((elements) => ({
+              top: visualViewport!.offsetTop,
+              bottom: visualViewport!.offsetTop + visualViewport!.height,
+              buttons: elements.map((element) => ({
+                name: element.getAttribute("aria-label"),
+                top: element.getBoundingClientRect().top,
+                bottom: element.getBoundingClientRect().bottom,
+              })),
+            }));
+          expect(buttons).toHaveLength(6);
+          for (const button of buttons) {
+            expect(
+              button.top,
+              `${button.name} clears the visible top`,
+            ).toBeGreaterThanOrEqual(top);
+            expect(
+              button.bottom,
+              `${button.name} fits the visible window`,
+            ).toBeLessThanOrEqual(bottom);
+          }
+        }).toPass({ timeout: 5000 });
       };
       await expectReachableSidebar();
-      await page.evaluate(() => window.scrollBy(0, 200));
+      if (browserName === "chromium") {
+        await page.mouse.move(500, 500);
+        await page.mouse.wheel(0, 350);
+      } else
+        await page
+          .locator("#app-scroll")
+          .evaluate((element) =>
+            element.scrollBy({ top: 350, behavior: "instant" }),
+          );
       await expectReachableSidebar();
-      const scrollBeforeMenu = await page.evaluate(() => window.scrollY);
+      if (fullscreen === "element") {
+        const touch = await page.context().newCDPSession(page);
+        await touch.send("Input.dispatchTouchEvent", {
+          type: "touchStart",
+          touchPoints: [{ x: 500, y: 500 }],
+        });
+        for (const y of [450, 400, 350, 300, 250]) {
+          await touch.send("Input.dispatchTouchEvent", {
+            type: "touchMove",
+            touchPoints: [{ x: 500, y }],
+          });
+        }
+        await touch.send("Input.dispatchTouchEvent", {
+          type: "touchEnd",
+          touchPoints: [],
+        });
+        await touch.detach();
+        await expectReachableSidebar();
+      }
+      const scrollBeforeMenu = await page.evaluate(
+        () => document.getElementById("app-scroll")!.scrollTop,
+      );
       await navigation.getByRole("button", { name: "Account" }).click();
       await expect(page.getByRole("menu", { name: "Account" })).toBeVisible();
-      expect(await page.evaluate(() => window.scrollY)).toBe(scrollBeforeMenu);
+      expect(
+        await page.evaluate(
+          () => document.getElementById("app-scroll")!.scrollTop,
+        ),
+      ).toBe(scrollBeforeMenu);
       await page.keyboard.press("Escape");
       expect(page.url()).toBe(playerURL);
       expect(
@@ -5929,10 +5995,8 @@ test.describe("Chrome iPad viewport recovery", () => {
       if (fullscreen === "element") {
         // Browser chrome can change the visible height without changing width.
         await page.setViewportSize({ width: 820, height: 620 });
-        await page.clock.fastForward(500);
         await expectReachableSidebar();
         await page.setViewportSize({ width: 820, height: 682 });
-        await page.clock.fastForward(500);
         await expectReachableSidebar();
         // Do not reset pinch zoom when the window changes. Resume width updates
         // after the user returns to normal zoom.
@@ -5943,7 +6007,6 @@ test.describe("Chrome iPad viewport recovery", () => {
           }),
         );
         await reportWindowWidth(820);
-        await page.clock.fastForward(500);
         await expect
           .poll(() => page.evaluate(() => document.documentElement.clientWidth))
           .toBe(1180);
@@ -5954,7 +6017,6 @@ test.describe("Chrome iPad viewport recovery", () => {
       }
       await page.setViewportSize({ width: 820, height: 1180 });
       await reportWindowWidth(820);
-      await page.clock.fastForward(500);
       await expect(
         page.getByRole("navigation", {
           name: "Primary navigation",
