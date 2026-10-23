@@ -1,5 +1,5 @@
-/** Recover Chrome on iPad retaining its portrait viewport after fullscreen. */
-export function trackViewportRecovery() {
+/** Contain Chrome iOS fullscreen viewport inconsistencies at the app boundary. */
+export function trackAppViewport() {
   const viewport = document.querySelector<HTMLMetaElement>(
     'meta[name="viewport"]',
   );
@@ -8,8 +8,9 @@ export function trackViewportRecovery() {
   const original = viewport.content;
   const root = document.documentElement;
   let appliedWidth = 0;
-  let timer: number | undefined;
+  let frame = 0;
   const update = () => {
+    frame = 0;
     const width = window.outerWidth;
     const scale = window.visualViewport?.scale ?? 1;
     // iOS can fit the previous explicit width to a smaller window on rotation.
@@ -26,11 +27,15 @@ export function trackViewportRecovery() {
     )
       return;
 
-    // The layout height can stay at 1499px while only 682px is visible, even
-    // after the width recovers. Keep fixed navigation inside the visible area.
+    // The shell occupies the visible viewport. Its content scrolls independently
+    // of the stale layout viewport, so navigation and content share one frame.
     const height = window.visualViewport?.height ?? window.innerHeight;
     if (height > 0)
-      root.style.setProperty("--sidebar-viewport-height", `${height}px`);
+      root.style.setProperty("--app-viewport-height", `${height}px`);
+    root.style.setProperty(
+      "--app-viewport-top",
+      `${window.visualViewport?.offsetTop ?? 0}px`,
+    );
     if (
       (!appliedWidth || appliedWidth === width) &&
       Math.abs(window.innerWidth - width) <= 1
@@ -47,8 +52,7 @@ export function trackViewportRecovery() {
     );
   };
   const schedule = () => {
-    window.clearTimeout(timer);
-    timer = window.setTimeout(update, 300);
+    if (!frame) frame = window.requestAnimationFrame(update);
   };
   const listeners = new AbortController();
   const options = { signal: listeners.signal };
@@ -61,12 +65,14 @@ export function trackViewportRecovery() {
   ])
     document.addEventListener(event, schedule, { ...options, capture: true });
   window.visualViewport?.addEventListener("resize", schedule, options);
+  window.visualViewport?.addEventListener("scroll", schedule, options);
   schedule();
 
   return () => {
     listeners.abort();
-    window.clearTimeout(timer);
-    root.style.removeProperty("--sidebar-viewport-height");
+    window.cancelAnimationFrame(frame);
+    root.style.removeProperty("--app-viewport-height");
+    root.style.removeProperty("--app-viewport-top");
     if (appliedWidth) viewport.content = original;
   };
 }

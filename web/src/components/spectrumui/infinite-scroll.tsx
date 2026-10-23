@@ -9,6 +9,7 @@ interface InfiniteScrollProps {
   hasMore: boolean;
   next: () => void;
   children: React.ReactNode;
+  scrollRoot?: string;
 }
 
 export default function InfiniteScroll({
@@ -16,6 +17,7 @@ export default function InfiniteScroll({
   hasMore,
   next,
   children,
+  scrollRoot,
 }: InfiniteScrollProps) {
   const observer = React.useRef<IntersectionObserver | null>(null);
   const observerRef = React.useCallback(
@@ -31,12 +33,16 @@ export default function InfiniteScroll({
           observer.current = null;
           next();
         },
-        { threshold: 0, root: null, rootMargin: "300px 0px" },
+        {
+          threshold: 0,
+          root: scrollRoot ? element.closest(scrollRoot) : null,
+          rootMargin: "300px 0px",
+        },
       );
       observer.current = current;
       current.observe(element);
     },
-    [hasMore, isLoading, next],
+    [hasMore, isLoading, next, scrollRoot],
   );
   React.useEffect(() => () => observer.current?.disconnect(), []);
   const items = React.Children.toArray(children);

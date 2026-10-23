@@ -342,6 +342,7 @@ export function SearchPage({
         })}
       {showResults && hasMore && (
         <InfiniteScroll
+          scrollRoot="#app-scroll"
           isLoading={loading}
           hasMore={hasMore}
           next={() => {
