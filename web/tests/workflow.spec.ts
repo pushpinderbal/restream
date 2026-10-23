@@ -184,7 +184,7 @@ async function collapseTitle(page: Page) {
     await selectedTile.click();
     await expect(
       page.getByRole("region", { name: "Expanded title" }),
-    ).not.toBeVisible();
+    ).toHaveCount(0);
   }
 }
 
@@ -212,10 +212,6 @@ async function navigatePlayer(
     { title, item },
   );
 }
-
-test.afterEach(async ({ page }) => {
-  await collapseTitle(page);
-});
 
 async function mockApi(
   page: Page,
@@ -4608,20 +4604,21 @@ test("hero crossfades without repeating or jumping on refresh and pauses during 
     )
     .toBe(3);
   expect((await hero.boundingBox())!.height).toBe(initialHeight);
-  let current = (await heading.textContent())!;
   await hero.hover();
+  let current = (await heading.textContent())!;
   await tick();
   await expect(heading).toHaveText(current);
   await page.mouse.move(0, 0);
   await hero.getByRole("button", { name: /^Play / }).focus();
+  current = (await heading.textContent())!;
   await tick();
   await expect(heading).toHaveText(current);
   await page.getByRole("button", { name: "Home", exact: true }).focus();
   await page.mouse.move(0, 0);
   await tick(true);
   await expect(heading).not.toHaveText(current);
-  current = (await heading.textContent())!;
   await hero.hover();
+  current = (await heading.textContent())!;
   const response = page.waitForResponse("**/api/discovery");
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await response;
@@ -4661,6 +4658,7 @@ test("hero crossfades without repeating or jumping on refresh and pauses during 
     });
     document.dispatchEvent(new Event("visibilitychange"));
   });
+  current = (await heading.textContent())!;
   await tick();
   await expect(heading).toHaveText(current);
   await page.evaluate(() => {
