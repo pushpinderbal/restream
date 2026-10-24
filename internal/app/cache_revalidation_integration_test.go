@@ -104,6 +104,15 @@ func TestShutdownCancelsSharedBackgroundBrowse(t *testing.T) {
 		close(gate)
 		t.Fatal("shutdown waited for blocked background provider request")
 	}
+	restored, err := openStore(cfg.DataDir, cfg.PortalURL, cfg.MAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.close()
+	state, err := restored.cacheRetry(pageKey(model.BrowseQuery{Kind: "movie", Category: "8", Page: 1}))
+	if err != nil || state.failures != 0 || state.attempts != 1 || state.started.IsZero() {
+		t.Fatal("shutdown cancellation lost actual attempt or counted a failure", state, err)
+	}
 }
 
 type pagedLibraryProvider struct {
@@ -408,8 +417,8 @@ func TestBrowsePersistenceFailureDoesNotRepeatedlyFetchProvider(t *testing.T) {
 	}
 	p.pageMu.Lock()
 	defer p.pageMu.Unlock()
-	if p.calls[1] != 2 {
-		t.Fatal("storage error caused repeated provider calls", p.calls)
+	if p.calls[1] != 1 {
+		t.Fatal("provider work started without persisting its recovery budget", p.calls)
 	}
 }
 

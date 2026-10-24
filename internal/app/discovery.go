@@ -69,6 +69,10 @@ type discoveryRecord struct {
 	UpdatedAt            time.Time                    `json:"updatedAt"`
 	NextAttempt          time.Time                    `json:"nextAttempt"`
 	Failures             int                          `json:"failures,omitempty"`
+	RecoveryStartedAt    time.Time                    `json:"recoveryStartedAt,omitempty"`
+	RecoveryAttempts     int                          `json:"recoveryAttempts,omitempty"`
+	RecoveryRevision     time.Time                    `json:"recoveryRevision,omitempty"`
+	RecoveryPolicy       time.Time                    `json:"recoveryPolicy,omitempty"`
 	Paused               bool                         `json:"paused,omitempty"`
 	Pending              bool                         `json:"pending,omitempty"`
 	Cursors              map[string]int               `json:"cursors,omitempty"`
@@ -130,7 +134,7 @@ func (s *Server) initDiscovery() error {
 	if err == nil {
 		// A corrupt or old discovery snapshot is safely rebuilt; playback records
 		// and the library cache are independent of this optional feature.
-		if json.Unmarshal(data, &d.record) != nil || d.record.Version != 1 {
+		if json.Unmarshal(data, &d.record) != nil || d.record.Version != 1 && !(d.record.Version == 0 && d.record.RecoveryAttempts > 0) {
 			d.record = discoveryRecord{}
 		}
 	}
@@ -339,7 +343,8 @@ func (s *Server) startDiscovery(revision time.Time, refreshMetadata bool) (*disc
 	}
 	record := d.record
 	current := record.Version == 1 && record.SearchVersion == discoverySearchVersion && record.Revision.Equal(revision) && record.PreferencesUpdatedAt.Equal(policy) && record.HadMetadata == s.tmdbConfigured()
-	if !refreshMetadata && current && (record.Paused || record.Failures > discoveryRetryLimit || time.Now().Before(record.NextAttempt)) {
+	sameRecovery := record.RecoveryRevision.Equal(revision) && record.RecoveryPolicy.Equal(policy)
+	if !refreshMetadata && (current || sameRecovery) && (record.Paused || recoveryExhausted(max(record.Failures, record.RecoveryAttempts), record.RecoveryStartedAt, discoveryRetryLimit+1, discoveryElapsedLimit) || time.Now().Before(record.NextAttempt)) {
 		s.scheduleDiscoveryRetryLocked(time.Time{})
 		return nil, false
 	}
@@ -361,23 +366,54 @@ func (s *Server) startDiscovery(revision time.Time, refreshMetadata bool) (*disc
 			close(run.done)
 			d.mu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(s.ctx, 3*time.Minute)
-		defer cancel()
 		started := time.Now()
+		if refreshMetadata || !current && !sameRecovery {
+			record.RecoveryStartedAt = time.Time{}
+			record.RecoveryAttempts = 0
+			record.Failures = 0
+			record.Paused = false
+		}
+		if record.RecoveryStartedAt.IsZero() {
+			record.RecoveryStartedAt = started
+		}
+		record.RecoveryAttempts++
+		record.RecoveryRevision, record.RecoveryPolicy = revision, policy
+		// Reserve starts before network work. A crash cannot renew this allowance.
+		data, beginErr := json.Marshal(record)
+		if beginErr == nil {
+			_, beginErr = s.cache.db.Exec(`INSERT INTO discovery(id,data) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`, data)
+		}
+		d.mu.Lock()
+		d.record = record
+		d.mu.Unlock()
+		ctx, cancel := context.WithTimeout(s.ctx, min(3*time.Minute, max(0, time.Until(record.RecoveryStartedAt.Add(discoveryElapsedLimit)))))
+		defer cancel()
 		if record.Pending && !refreshMetadata && current {
 			slog.Debug("Discovery refresh continuing")
 		} else {
 			slog.Info("Discovery refresh started", "tmdb_enabled", s.tmdbConfigured())
 		}
-		loaded, err := s.buildDiscovery(ctx, revision, refreshMetadata)
+		loaded, err := record, beginErr
+		if err == nil {
+			loaded, err = s.buildDiscovery(ctx, revision, refreshMetadata)
+		} else {
+			loaded.Revision = revision
+			loaded.Version, loaded.SearchVersion, loaded.HadMetadata = 1, discoverySearchVersion, s.tmdbConfigured()
+			loaded.PreferencesUpdatedAt = policy
+		}
 		run.err = err
-		if !s.cache.libraryRevision().Equal(revision) || !loaded.PreferencesUpdatedAt.Equal(s.preferencesSnapshot().updatedAt) || s.ctx.Err() != nil {
+		if s.ctx.Err() != nil {
+			return
+		}
+		if !s.cache.libraryRevision().Equal(revision) || !loaded.PreferencesUpdatedAt.Equal(s.preferencesSnapshot().updatedAt) {
 			return
 		}
 		if err != nil {
 			s.markDiscoveryFailure(&loaded, err, loaded.Failures+1)
 		} else {
 			loaded.Failures = 0
+			loaded.RecoveryStartedAt = time.Time{}
+			loaded.RecoveryAttempts = 0
 			loaded.Paused = false
 			if loaded.Pending {
 				loaded.NextAttempt = time.Now().Add(time.Minute)
@@ -401,6 +437,9 @@ func (s *Server) startDiscovery(revision time.Time, refreshMetadata bool) (*disc
 				priorFailures := record.Failures
 				if refreshMetadata || !current {
 					priorFailures = 0
+				}
+				if loaded.RecoveryStartedAt.IsZero() && !refreshMetadata && current {
+					loaded.RecoveryStartedAt = record.RecoveryStartedAt
 				}
 				s.markDiscoveryFailure(&loaded, errors.Join(err, publishErr), max(loaded.Failures, priorFailures+1))
 				s.rememberDiscoveryFailure(loaded)
@@ -429,7 +468,10 @@ func (s *Server) startDiscovery(revision time.Time, refreshMetadata bool) (*disc
 
 func (s *Server) markDiscoveryFailure(record *discoveryRecord, err error, failures int) {
 	record.Failures = failures
-	record.Paused = retryPaused(err) || failures > discoveryRetryLimit
+	if record.RecoveryStartedAt.IsZero() {
+		record.RecoveryStartedAt = time.Now()
+	}
+	record.Paused = retryPaused(err) || recoveryExhausted(max(failures, record.RecoveryAttempts), record.RecoveryStartedAt, discoveryRetryLimit+1, discoveryElapsedLimit)
 	record.Error = "Discovery refresh could not finish. Showing saved available titles."
 	record.NextAttempt = time.Time{}
 	if record.Paused {
@@ -464,7 +506,7 @@ func (s *Server) rememberDiscoveryFailure(record discoveryRecord) {
 // Caller holds discoveryService.mu; shutdown stops the timer before waiting.
 func (s *Server) scheduleDiscoveryRetryLocked(notBefore time.Time) {
 	d := s.discoveryService
-	if d.closed || d.record.Paused || d.record.Error == "" && !d.record.Pending || d.record.Failures > discoveryRetryLimit || d.record.NextAttempt.IsZero() || d.retryTimer != nil {
+	if d.closed || d.record.Paused || d.record.Error == "" && !d.record.Pending || recoveryExhausted(max(d.record.Failures, d.record.RecoveryAttempts), d.record.RecoveryStartedAt, discoveryRetryLimit+1, discoveryElapsedLimit) || d.record.NextAttempt.IsZero() || d.retryTimer != nil {
 		return
 	}
 	delay := max(0, time.Until(maxTime(d.record.NextAttempt, notBefore)))
@@ -699,6 +741,9 @@ func (s *Server) buildDiscovery(ctx context.Context, revision time.Time, refresh
 		record.Paused = false
 		record.Pending = false
 		record.Cursors = make(map[string]int)
+	}
+	if record.RecoveryStartedAt.IsZero() {
+		record.RecoveryStartedAt = time.Now()
 	}
 	if refreshMetadata {
 		// Keep the saved lists until each replacement arrives. Mark them due so
@@ -1055,6 +1100,25 @@ func (s *Server) discoveryImage(w http.ResponseWriter, r *http.Request) {
 	if known && s.blockedItem(item) || !known && s.preferencesSnapshot().blocked {
 		blocked(w)
 		return
+	}
+	if !result.available && known {
+		// A failed metadata download should still use the library's artwork.
+		// Keep the metadata retry lifetime so a recovered TMDB image can win.
+		ttl := result.ttl
+		result = s.artwork.get(r.Context(), item.Logo)
+		result.ttl = min(result.ttl, ttl)
+		d.mu.Lock()
+		_, exists = d.record.Assets[r.PathValue("id")]
+		d.mu.Unlock()
+		if !exists {
+			http.NotFound(w, r)
+			return
+		}
+		item, known = s.cache.item(asset.ItemID)
+		if known && s.blockedItem(item) || !known && s.preferencesSnapshot().blocked {
+			blocked(w)
+			return
+		}
 	}
 	writeArtwork(w, result)
 }

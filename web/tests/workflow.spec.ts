@@ -224,6 +224,7 @@ async function mockApi(
     capacity?: boolean;
     producerEnded?: boolean;
     sessionDuration?: number;
+    subtitles?: { id: string; label: string; language: string; url: string }[];
     initialSessionDuration?: number;
     starting?: boolean | (() => boolean);
     refreshing?: boolean;
@@ -439,6 +440,16 @@ async function mockApi(
         contentType: "application/json",
         body: JSON.stringify(body),
       });
+    if (
+      method === "POST" &&
+      (path === "/api/browse/retry" ||
+        /^\/api\/series\/[^/]+\/episodes\/retry$/.test(path))
+    ) {
+      events.push(
+        `RETRY:${path}:${JSON.stringify(route.request().postDataJSON())}`,
+      );
+      return route.fulfill({ status: 204 });
+    }
     if (path === "/api/auth") {
       return json(
         options.user
@@ -737,6 +748,7 @@ async function mockApi(
             options.sessionDuration ??
             1800,
           offset,
+          subtitles: options.subtitles,
         },
         201,
       );
@@ -758,6 +770,7 @@ async function mockApi(
           1800,
         offset: sessionOffsets.get(id!) ?? 0,
         playbackRate: sessionRates.get(id!) ?? 1,
+        subtitles: options.subtitles,
       });
     }
     if (/^\/api\/sessions\/session-\d+$/.test(path) && method === "DELETE") {
@@ -2237,6 +2250,220 @@ test("cached thumbnails reveal after repeated section switches and failed artwor
     "/artwork-title.svg",
   );
   await expect(fallback.locator(".artwork-reveal")).toHaveClass(/is-revealed/);
+});
+
+test("history artwork falls through TMDB and library failures and resets when discovery changes", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const svg =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="180"><rect width="120" height="180" fill="#752535"/></svg>';
+  const titles = [
+    "tmdb",
+    "library",
+    "broken-tmdb",
+    "broken-library",
+    "legacy",
+  ].map((id) => ({
+    ...movie,
+    id: `art-${id}`,
+    name: `Artwork ${id}`,
+    ...(id === "legacy"
+      ? {}
+      : { image: `/api/images/art-${id}?v=0123456789abcdef` }),
+  }));
+  const legacyLive = { ...live, id: "art-live", name: "Legacy channel" };
+  const history = createHistoryFixture();
+  history.seed(
+    [...titles, legacyLive].map((title, index) => ({
+      title,
+      item: title,
+      watchedAt: Date.now() - index * 1000,
+      position: title.kind === "live" ? 0 : 300,
+      duration: title.kind === "live" ? 0 : 3600,
+      completed: false,
+    })),
+  );
+  const saved = history.read();
+  const discovery = {
+    configured: true,
+    refreshing: false,
+    trendingMovies: titles.slice(0, 4).map((item, index) => ({
+      item,
+      name: item.name,
+      ...(index === 1
+        ? {}
+        : {
+            backdrop: `/history-art/${item.id}-backdrop.svg`,
+            poster: `/history-art/${item.id}-poster.svg`,
+          }),
+    })),
+    trendingSeries: [],
+    exploreMovies: [],
+    exploreSeries: [],
+  };
+  const api = await mockApi(page, {
+    history,
+    catalogItems: [...titles, legacyLive],
+    discoveryResponse: discovery,
+  });
+  await page.addInitScript(() => {
+    const failures: Record<string, string[]> = {};
+    (
+      window as unknown as { historyImageFailures: typeof failures }
+    ).historyImageFailures = failures;
+    document.addEventListener(
+      "error",
+      (event) => {
+        if (!(event.target instanceof HTMLImageElement)) return;
+        const card = event.target.closest(
+          ".discovery-continue-card, .discovery-recent-open",
+        );
+        const label = card?.getAttribute("aria-label");
+        if (label)
+          (failures[label] ??= []).push(event.target.getAttribute("src") || "");
+      },
+      true,
+    );
+  });
+  const requests: string[] = [];
+  await page.route(/\/history-art\/|\/api\/images\//, (route) => {
+    const url = new URL(route.request().url());
+    requests.push(url.pathname + url.search);
+    const broken =
+      url.pathname.includes("broken-library") ||
+      (url.pathname.startsWith("/history-art/") &&
+        url.pathname.includes("broken-tmdb"));
+    return route.fulfill({
+      status: broken ? 404 : 200,
+      contentType: "image/svg+xml",
+      body: broken ? "" : svg,
+    });
+  });
+  await page.goto("/?view=dashboard");
+  const continuing = page.getByRole("region", {
+    name: "Continue watching",
+    exact: true,
+  });
+  const recent = page.getByRole("region", {
+    name: "Recently played",
+    exact: true,
+  });
+  const check = async (
+    title: (typeof titles)[number] | typeof legacyLive,
+    expected: string,
+    resumeExpected = expected,
+  ) => {
+    for (const [rail, label, source] of [
+      [recent, `Open ${title.name}`, expected],
+      ...(title.kind === "live"
+        ? []
+        : [[continuing, `Resume ${title.name}`, resumeExpected]]),
+    ] as const) {
+      const card = rail.getByRole("button", { name: label, exact: true });
+      await card.scrollIntoViewIfNeeded();
+      await expect(card.locator("img")).toHaveAttribute("src", source);
+      await expect(card.locator(".artwork-reveal")).toHaveClass(/is-revealed/);
+    }
+  };
+  await check(
+    titles[0],
+    discovery.trendingMovies[0].poster!,
+    discovery.trendingMovies[0].backdrop!,
+  );
+  await check(titles[1], titles[1].image!);
+  await check(titles[2], titles[2].image!);
+  await check(titles[3], "/artwork-title.svg");
+  await check(titles[4], `/api/images/${titles[4].id}`);
+  await check(legacyLive, `/api/images/${legacyLive.id}`);
+  expect(requests).toContain(titles[1].image);
+  expect(requests).not.toContain(`/api/images/${titles[1].id}`);
+  const failures = await page.evaluate(
+    () =>
+      (window as unknown as { historyImageFailures: Record<string, string[]> })
+        .historyImageFailures,
+  );
+  for (const prefix of ["Open", "Resume"]) {
+    expect(failures[`${prefix} ${titles[2].name}`]).toEqual([
+      `/history-art/${titles[2].id}-${prefix === "Open" ? "poster" : "backdrop"}.svg`,
+    ]);
+    expect(failures[`${prefix} ${titles[3].name}`]).toEqual([
+      `/history-art/${titles[3].id}-${prefix === "Open" ? "poster" : "backdrop"}.svg`,
+      titles[3].image,
+    ]);
+  }
+  const initialDiscoveryReads = api.events.filter(
+    (event) => event === "DISCOVERY",
+  ).length;
+  expect(initialDiscoveryReads).toBeLessThanOrEqual(2);
+  expect(history.read()).toEqual(saved);
+
+  // A mobile refresh changes the same mounted cards: failed preferred and
+  // library URLs are identical, so each card must try that URL only once.
+  await page.setViewportSize({ width: 390, height: 844 });
+  discovery.trendingMovies[3].backdrop = titles[3].image;
+  discovery.trendingMovies[3].poster = titles[3].image;
+  const refresh = async () => {
+    const response = page.waitForResponse("**/api/discovery");
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await response;
+  };
+  await refresh();
+  await check(titles[3], "/artwork-title.svg");
+  const deduplicated = await page.evaluate(
+    () =>
+      (window as unknown as { historyImageFailures: Record<string, string[]> })
+        .historyImageFailures,
+  );
+  for (const prefix of ["Open", "Resume"])
+    expect(deduplicated[`${prefix} ${titles[3].name}`].slice(2)).toEqual([
+      titles[3].image,
+    ]);
+
+  // Reuse an already loaded URL to exercise cached-image reveal after reset.
+  discovery.trendingMovies[3].backdrop = discovery.trendingMovies[0].backdrop;
+  discovery.trendingMovies[3].poster = discovery.trendingMovies[0].poster;
+  await refresh();
+  await check(
+    titles[3],
+    discovery.trendingMovies[0].poster!,
+    discovery.trendingMovies[0].backdrop!,
+  );
+  await page.waitForTimeout(500);
+  expect(api.events.filter((event) => event === "DISCOVERY")).toHaveLength(
+    initialDiscoveryReads + 2,
+  );
+  expect(history.read()).toEqual(saved);
+  expect(api.mutations).toEqual([]);
+});
+
+test("playing a library title retains its versioned artwork in history", async ({
+  page,
+}) => {
+  const title = { ...movie, image: "/api/images/movie-1?v=0123456789abcdef" };
+  const api = await mockApi(page, { catalogItems: [title] });
+  await page.route("**/api/images/**", (route) =>
+    route.fulfill({
+      contentType: "image/svg+xml",
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="180"/>',
+    }),
+  );
+  await page.goto("/?section=movie");
+  await page
+    .getByRole("button", { name: `Open ${title.name}`, exact: true })
+    .click();
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await expect(page.locator("video")).toHaveAttribute("src", /index\.m3u8/);
+  await playableVideo(page, 300);
+  await expect.poll(() => api.history.read()[0]?.title.image).toBe(title.image);
+  await page
+    .getByRole("button", { name: "Stop playback", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Home", exact: true }).click();
+  for (const name of ["Continue watching", "Recently played"])
+    await expect(
+      page.getByRole("region", { name, exact: true }).locator("img"),
+    ).toHaveAttribute("src", title.image);
 });
 
 test("channel details contain the full guide with a static cinema background", async ({
@@ -3754,45 +3981,6 @@ test("season episodes load on demand and returning shows cached results while ch
   await expect(page.getByRole("button", { name: /First Light/ })).toBeVisible();
   await expect.poll(() => requested).toEqual(["first", "2", "1"]);
   expect(api.events).not.toContain("POST");
-});
-
-test("open episode details respect freshness and paused retries at 1280px", async ({
-  page,
-}) => {
-  const viewport = { width: 1280, height: 900 };
-  await page.setViewportSize(viewport);
-  await page.clock.install();
-  const api = await mockApi(page);
-  let calls = 0;
-  await page.route("**/api/series/series-1/episodes?*", async (route) => {
-    calls++;
-    await route.fulfill({
-      json: {
-        items: calls === 1 ? [episodes[0]] : episodes.slice(0, 2),
-        season: 1,
-        seasons: [1],
-        refreshing: false,
-        stale: calls === 2,
-        refreshAfterSeconds: calls === 1 ? 1 : calls === 2 ? 0 : 86400,
-      },
-    });
-  });
-  await page.goto("/?section=series");
-  await page.getByRole("button", { name: "Open Night Shift" }).click();
-  await expect(page.getByRole("button", { name: /First Light/ })).toBeVisible();
-  await page.clock.fastForward(1000);
-  await expect(page.getByRole("button", { name: /After Hours/ })).toBeVisible();
-  expect(calls).toBe(2);
-  await page.clock.fastForward(60_000);
-  expect(calls).toBe(2);
-  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await expect.poll(() => calls).toBe(3);
-  expect(api.events).not.toContain("POST");
-  // Reload to discard Motion's real animation timeline after virtual time jumps.
-  await page.goto("/?section=series");
-  await expect(
-    page.getByRole("button", { name: "Open Night Shift" }),
-  ).toBeVisible();
 });
 
 test("an empty Home offers a VOD entry point and responsive navigation", async ({
@@ -5826,6 +6014,7 @@ test.describe("Chrome iPad viewport recovery", () => {
     page,
     browserName,
   }) => {
+    await page.emulateMedia({ reducedMotion: "reduce" });
     const api = await mockApi(page);
     await page.goto("/?view=search&section=movie&search=Coast");
     await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
@@ -6783,7 +6972,7 @@ test("invalidated later pages stay hidden during provider backoff", async ({
           total: 2,
           hasMore: false,
           revision: 2,
-          stale: true,
+          stale: !ready,
           refreshing: false,
         };
       if (params.get("page") === "1")
@@ -7027,8 +7216,19 @@ test("direct player retries retain errors while resolving titles and episodes at
   const episodesGate = new Promise<void>((resolve) => {
     releaseEpisodes = resolve;
   });
+  let stoppedResponse = true;
   await page.route("**/api/series/series-1/episodes?*", async (route) => {
     await episodesGate;
+    if (stoppedResponse) {
+      stoppedResponse = false;
+      return route.fulfill({
+        json: {
+          items: [],
+          retryStopped: true,
+          refreshError: "Episode recovery stopped",
+        },
+      });
+    }
     return route.fallback();
   });
   try {
@@ -7040,11 +7240,19 @@ test("direct player retries retain errors while resolving titles and episodes at
   } finally {
     releaseEpisodes();
   }
+  await expect(alert).toContainText("Episode recovery stopped");
+  await expect(retry).not.toHaveAttribute("aria-busy", "true");
+  await retry.click();
   await expect(
     page.getByRole("region", { name: "Player", exact: true }),
   ).toBeVisible();
   await expect(alert).toHaveCount(0);
   expect(api.sessionItemIds).toEqual(["episode-1"]);
+  expect(
+    api.events.filter((event) =>
+      event.startsWith("RETRY:/api/series/series-1/episodes/retry:"),
+    ),
+  ).toHaveLength(2);
 });
 
 for (const width of [1440, 390]) {
@@ -7525,4 +7733,437 @@ test("history undo pauses for hover and focus and expires across navigation", as
   await page.getByRole("button", { name: "Home", exact: true }).click();
   await expect(undo).toHaveCount(0);
   expect(api.history.read()).toEqual([]);
+});
+
+test("manual library and episode retries reset only failed work and keep cached content", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  let browseRecovered = false;
+  let episodesRecovered = false;
+  let episodeReads = 0;
+  const resets: { path: string; body: unknown }[] = [];
+  await mockApi(page, {
+    browseResponse: async (params) => ({
+      items: params.get("kind") === "movie" ? [movie] : [series],
+      page: 1,
+      total: 1,
+      hasMore: false,
+      stale: !browseRecovered,
+      refreshing: false,
+      ...(!browseRecovered
+        ? { retryStopped: true, refreshError: "Listing recovery stopped" }
+        : {}),
+    }),
+    episodesResponse: () => {
+      episodeReads++;
+      return {
+        items: [episodes[0]],
+        seasons: [1],
+        season: 1,
+        refreshing: false,
+        refreshAfterSeconds: 1,
+        ...(!episodesRecovered
+          ? { retryStopped: true, refreshError: "Episode recovery stopped" }
+          : {}),
+      };
+    },
+  });
+  await page.route("**/api/**/retry", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    resets.push({ path, body: route.request().postDataJSON() });
+    if (path === "/api/browse/retry") browseRecovered = true;
+    else episodesRecovered = true;
+    await route.fulfill({ status: 204 });
+  });
+  await page.clock.install();
+  await page.goto("/?section=movie");
+  const cached = page.getByRole("button", {
+    name: "Open The Quiet Coast",
+    exact: true,
+  });
+  await expect(cached).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText(
+    "Listing recovery stopped",
+  );
+  await page.getByRole("button", { name: "Retry page", exact: true }).click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(cached).toBeVisible();
+  expect(resets).toEqual([
+    {
+      path: "/api/browse/retry",
+      body: { kind: "movie", category: "*", search: "", page: 1 },
+    },
+  ]);
+  await navigateLibrary(page, "series");
+  await page
+    .getByRole("button", { name: "Open Night Shift", exact: true })
+    .click();
+  const episode = page.getByRole("button", {
+    name: "Play First Light",
+    exact: true,
+  });
+  await expect(episode).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText(
+    "Episode recovery stopped",
+  );
+  await page
+    .getByRole("button", { name: "Retry episodes", exact: true })
+    .click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(episode).toBeVisible();
+  expect(resets[1]).toEqual({
+    path: "/api/series/series-1/episodes/retry",
+    body: { season: "first" },
+  });
+  const settled = episodeReads;
+  await page.clock.fastForward(60 * 60 * 1000);
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event("focus"));
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(episodeReads).toBe(settled);
+  await page.clock.resume();
+  await page.goto("/?section=live");
+});
+
+test("in-flight listing and episode recovery expires and navigation cancels pending polls", async ({
+  page,
+}) => {
+  let browseReads = 0;
+  let episodeReads = 0;
+  await mockApi(page, {
+    browseResponse: async (params) => {
+      browseReads++;
+      return {
+        items: params.get("kind") === "movie" ? [movie] : [series],
+        page: 1,
+        total: 1,
+        hasMore: false,
+        stale: true,
+        refreshing: true,
+      };
+    },
+    episodesResponse: () => {
+      episodeReads++;
+      return {
+        items: [episodes[0]],
+        seasons: [1],
+        season: 1,
+        refreshing: true,
+      };
+    },
+  });
+  await page.clock.install();
+  await page.goto("/?section=movie");
+  await expect(
+    page.getByRole("button", { name: "Open The Quiet Coast" }),
+  ).toBeVisible();
+  await page.clock.fastForward(180001);
+  await expect(page.getByRole("button", { name: "Retry page" })).toBeVisible();
+  const exhausted = browseReads;
+  await page.clock.fastForward(60000);
+  expect(browseReads).toBe(exhausted);
+  await navigateLibrary(page, "series");
+  await page.getByRole("button", { name: "Open Night Shift" }).click();
+  await expect(
+    page.getByRole("button", { name: "Play First Light" }),
+  ).toBeVisible();
+  await page.clock.fastForward(180001);
+  await expect(
+    page.getByRole("button", { name: "Retry episodes" }),
+  ).toBeVisible();
+  const finished = episodeReads;
+  await navigateLibrary(page, "live");
+  const cancelled = browseReads;
+  await page.clock.fastForward(60000);
+  expect(episodeReads).toBe(finished);
+  expect(browseReads).toBe(cancelled);
+});
+
+test("fatal session recovery preserves position, releases sessions, and exhausts across generations", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  let fail = false;
+  let failedPolls = 0;
+  await page.route("**/api/sessions/session-*", async (route) => {
+    if (route.request().method() !== "GET" || !fail) return route.fallback();
+    failedPolls++;
+    fail = false;
+    const id = new URL(route.request().url()).pathname.split("/").at(-1);
+    return route.fulfill({
+      json: {
+        id,
+        url: `/api/streams/${id}/0/index.m3u8`,
+        state: "failed",
+        offset: 0,
+        duration: 1800,
+        error: "Upstream disconnected",
+        retryable: true,
+      },
+    });
+  });
+  await page.goto("/?view=player&section=movie&item=movie-1");
+  await expect(page.locator("video")).toHaveAttribute("src", /session-1/);
+  await playableVideo(page, 42);
+  fail = true;
+  await expect.poll(() => api.sessionStarts).toEqual([0, 42]);
+  await expect(page.locator("video")).toHaveAttribute("src", /session-2/);
+  fail = false;
+  await playableVideo(page, 0);
+  fail = true;
+  await expect.poll(() => api.sessionStarts).toEqual([0, 42, 42]);
+  await expect(page.locator("video")).toHaveAttribute("src", /session-3/);
+  await playableVideo(page, 0);
+  fail = true;
+  await expect.poll(() => failedPolls).toBe(3);
+  await expect(
+    page.getByRole("button", { name: "Try again", exact: true }),
+  ).not.toHaveAttribute("aria-busy", "true");
+  expect(
+    api.events.filter((event) => event === "POST" || event === "DELETE"),
+  ).toEqual(["POST", "DELETE", "POST", "DELETE", "POST", "DELETE"]);
+  const stopped = failedPolls;
+  await page.waitForTimeout(2200);
+  expect(failedPolls).toBe(stopped);
+  expect(api.sessionStarts).toHaveLength(3);
+  fail = false;
+  await page.getByRole("button", { name: "Try again", exact: true }).click();
+  await expect.poll(() => api.sessionStarts.length).toBe(4);
+  await expect(page.locator("video")).toHaveAttribute("src", /session-4/);
+  await page
+    .getByRole("button", { name: "Stop playback", exact: true })
+    .click();
+  await expect(page.locator("video")).toHaveCount(0);
+});
+
+test("paused playback and a cooldown beyond the recovery budget do not restart automatically", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  let fail = false;
+  await page.route("**/api/sessions/session-*", async (route) => {
+    if (route.request().method() !== "GET" || !fail) return route.fallback();
+    return route.fulfill({
+      json: {
+        id: "session-1",
+        url: "/api/streams/session-1/0/index.m3u8",
+        state: "failed",
+        duration: 1800,
+        offset: 0,
+        error: "Provider cooldown",
+        retryable: true,
+        retryAfterSeconds: 2147484,
+      },
+    });
+  });
+  await page.goto("/?view=player&section=movie&item=movie-1");
+  await expect(page.locator("video")).toHaveAttribute("src", /session-1/);
+  await playableVideo(page, 42);
+  await page.getByRole("button", { name: "Pause", exact: true }).click();
+  fail = true;
+  await expect(page.getByRole("alert")).toContainText("Provider cooldown");
+  await expect(
+    page.getByRole("button", { name: "Try again", exact: true }),
+  ).not.toHaveAttribute("aria-busy", "true");
+  await page.getByRole("button", { name: "Try again", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Provider cooldown is still active",
+  );
+  await page.waitForTimeout(1200);
+  expect(api.sessionStarts).toEqual([0]);
+  await page
+    .getByRole("button", { name: "Stop playback", exact: true })
+    .click();
+  await expect(page.locator("video")).toHaveCount(0);
+});
+
+test("an uncertain session creation failure waits for an explicit retry", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  let attempts = 0;
+  await page.route("**/api/sessions", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    attempts++;
+    if (attempts === 1)
+      return route.fulfill({
+        status: 503,
+        json: { error: "Creation outcome unavailable" },
+      });
+    return route.fallback();
+  });
+  await page.goto("/?view=player&section=movie&item=movie-1");
+  await expect(page.getByRole("alert")).toContainText(
+    "Creation outcome unavailable",
+  );
+  const retry = page.getByRole("button", { name: "Try again", exact: true });
+  await expect(retry).not.toHaveAttribute("aria-busy", "true");
+  await page.waitForTimeout(2200);
+  expect(attempts).toBe(1);
+  await retry.click();
+  await expect.poll(() => api.sessionStarts).toEqual([0]);
+  expect(attempts).toBe(2);
+  await page
+    .getByRole("button", { name: "Stop playback", exact: true })
+    .click();
+  await expect(page.locator("video")).toHaveCount(0);
+});
+
+test("subtitle failures stop across timeline changes and CC retry restores captions without restarting video", async ({
+  page,
+}) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const api = await mockApi(page, {
+    subtitles: [
+      {
+        id: "english",
+        label: "English",
+        language: "en",
+        url: "/api/sessions/session-1/subtitles/english",
+      },
+    ],
+  });
+  let reads = 0;
+  let recovered = false;
+  let cooldown = false;
+  await page.route(
+    "**/api/sessions/session-1/subtitles/english?*",
+    async (route) => {
+      reads++;
+      if (cooldown)
+        return route.fulfill({
+          status: 429,
+          headers: { "Retry-After": "60" },
+          json: { error: "Subtitle host cooldown" },
+        });
+      return recovered
+        ? route.fulfill({
+            json: {
+              cues: [{ start: 0, end: 1800, text: "Captions recovered" }],
+            },
+          })
+        : route.fulfill({
+            status: 503,
+            json: { error: "Subtitle host unavailable" },
+          });
+    },
+  );
+  await page.goto("/?view=player&section=movie&item=movie-1");
+  await expect(page.locator("video")).toHaveAttribute("src", /session-1/);
+  await playableVideo(page, 42);
+  await page.locator("video").evaluate((video) =>
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      get: () => 4,
+    }),
+  );
+  await page.clock.install();
+  const cc = page.getByRole("button", { name: "Subtitles", exact: true });
+  await cc.click();
+  await page
+    .getByRole("menuitemradio", { name: "English", exact: true })
+    .click();
+  await expect.poll(() => reads).toBe(1);
+  for (let attempt = 2; attempt <= 3; attempt++) {
+    await page.clock.runFor(5001);
+    await expect.poll(() => reads).toBe(attempt);
+  }
+  await page.clock.fastForward(60000);
+  await page.locator("video").evaluate((element) => {
+    const video = element as HTMLVideoElement;
+    video.currentTime = 100;
+    video.dispatchEvent(new Event("seeked"));
+    video.dispatchEvent(new Event("loadedmetadata"));
+    window.dispatchEvent(new Event("focus"));
+  });
+  expect(reads).toBe(3);
+  expect(api.sessionItemIds).toEqual([movie.id]);
+  expect(api.events.filter((event) => event === "DELETE")).toEqual([]);
+  await expect(page.locator("video")).toHaveAttribute("src", /session-1/);
+  await cc.click();
+  const menu = page.getByRole("menu", { name: "Subtitles", exact: true });
+  await expect(menu).toContainText("Subtitles temporarily unavailable");
+  recovered = true;
+  await menu.getByRole("menuitem", { name: "Try again", exact: true }).click();
+  await expect.poll(() => reads).toBe(4);
+  await expect
+    .poll(() =>
+      page
+        .locator("video")
+        .evaluate((element) =>
+          Array.from((element as HTMLVideoElement).textTracks).some((track) =>
+            Array.from(track.cues || []).some(
+              (cue) => (cue as VTTCue).text === "Captions recovered",
+            ),
+          ),
+        ),
+    )
+    .toBe(true);
+  cooldown = true;
+  await page.locator("video").evaluate((video) => {
+    (video as HTMLVideoElement).currentTime = 150;
+  });
+  await expect.poll(() => reads).toBe(5);
+  await cc.click();
+  await menu.getByRole("menuitem", { name: "Try again", exact: true }).click();
+  await page.clock.fastForward(30001);
+  expect(reads).toBe(5);
+  expect(api.sessionItemIds).toEqual([movie.id]);
+  await page
+    .getByRole("button", { name: "Stop playback", exact: true })
+    .click();
+  await expect
+    .poll(() => api.events.filter((event) => event === "DELETE").length)
+    .toBe(1);
+  await page.clock.resume();
+  await page.goto("/?section=live");
+});
+
+test("a recovery session that starts near the deadline is released when the total budget expires", async ({
+  page,
+}) => {
+  let recovering = false;
+  let failed = false;
+  const api = await mockApi(page, { starting: () => recovering });
+  await page.route("**/api/sessions/session-1", async (route) => {
+    if (route.request().method() !== "GET" || !failed) return route.fallback();
+    recovering = true;
+    return route.fulfill({
+      json: {
+        id: "session-1",
+        url: "/api/streams/session-1/0/index.m3u8",
+        state: "failed",
+        duration: 1800,
+        offset: 0,
+        error: "Short cooldown",
+        retryable: true,
+        retryAfterSeconds: 58,
+      },
+    });
+  });
+  await page.goto("/?view=player&section=movie&item=movie-1");
+  await expect(page.locator("video")).toHaveAttribute("src", /session-1/);
+  await playableVideo(page, 42);
+  await page.clock.install();
+  failed = true;
+  await page.clock.runFor(2001);
+  await expect(page.getByRole("alert")).toContainText("Short cooldown");
+  await page.clock.fastForward(58001);
+  await expect.poll(() => api.sessionStarts).toEqual([0, 42]);
+  await page.clock.fastForward(2001);
+  await expect(page.getByRole("alert")).toContainText(
+    "This stream took too long to start",
+  );
+  await expect
+    .poll(() => api.events.filter((event) => event === "DELETE").length)
+    .toBe(2);
+  await expect(
+    page.getByRole("button", { name: "Try again", exact: true }),
+  ).not.toHaveAttribute("aria-busy", "true");
+  await page.clock.fastForward(60000);
+  expect(api.sessionStarts).toHaveLength(2);
+  await page.clock.resume();
+  await page.goto("/?section=live");
 });

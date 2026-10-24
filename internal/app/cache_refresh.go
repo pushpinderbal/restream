@@ -21,6 +21,8 @@ type cacheStatus struct {
 	Stale               bool
 	Refreshing          bool
 	RefreshAfterSeconds int
+	RetryStopped        bool
+	RefreshError        string
 }
 
 func listingKey(q model.BrowseQuery) string {
@@ -133,6 +135,7 @@ func (s *store) setBrowsePage(q model.BrowseQuery, p model.BrowsePage, library t
 		return err
 	}
 	delete(s.retryFallback, pageKey(q))
+	delete(s.activeCacheAttempts, pageKey(q))
 	for _, item := range p.Items {
 		s.byID[item.ID] = item
 	}
@@ -141,37 +144,54 @@ func (s *store) setBrowsePage(q model.BrowseQuery, p model.BrowsePage, library t
 
 type cacheRetryState struct {
 	failures int
+	attempts int
 	next     time.Time
 	paused   bool
+	started  time.Time
+	active   bool
 }
 
 func (s *store) cacheRetry(key string) (cacheRetryState, error) {
 	s.mu.RLock()
 	fallback, found := s.retryFallback[key]
+	active := s.activeCacheAttempts[key]
 	s.mu.RUnlock()
 	if found {
+		fallback.active = active
 		return fallback, nil
 	}
 	var state cacheRetryState
-	var at int64
-	err := s.db.QueryRow(`SELECT failures,retry_at,paused FROM cache_retries WHERE entry=?`, key).Scan(&state.failures, &at, &state.paused)
+	var at, started int64
+	err := s.db.QueryRow(`SELECT failures,retry_at,paused,started_at,attempts FROM cache_retries WHERE entry=?`, key).Scan(&state.failures, &at, &state.paused, &started, &state.attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return state, nil
 	}
+	state.active = active
 	state.next = time.Unix(0, at)
+	if started > 0 {
+		state.started = time.Unix(0, started)
+	}
 	return state, err
 }
 func (s *store) cacheFailed(key string, failure error) error {
-	if errors.Is(failure, context.Canceled) || errors.Is(failure, errCacheChanged) || errors.Is(failure, errCacheRetry) || errors.Is(failure, errSeriesRemoved) {
+	defer func() { s.mu.Lock(); delete(s.activeCacheAttempts, key); s.mu.Unlock() }()
+	if errors.Is(failure, context.Canceled) {
+		return nil
+	}
+	if errors.Is(failure, errCacheChanged) || errors.Is(failure, errCacheRetry) || errors.Is(failure, errSeriesRemoved) {
 		return nil
 	}
 	state, err := s.cacheRetry(key)
 	if err != nil {
 		return err
 	}
+	if state.started.IsZero() {
+		state.started = time.Now()
+	}
 	state.failures++
+	state.attempts = max(state.attempts, state.failures)
 	state.next = time.Now().Add(retryCooldown(failure, state.failures))
-	state.paused = retryPaused(failure)
+	state.paused = retryPaused(failure) || recoveryExhausted(state.attempts, state.started, recoveryAttemptLimit, recoveryElapsedLimit)
 	var limited interface{ RetryDelay() time.Duration }
 	if errors.As(failure, &limited) && limited.RetryDelay() > 0 {
 		if err = s.setPortalCooldown(state.next); err != nil {
@@ -179,7 +199,7 @@ func (s *store) cacheFailed(key string, failure error) error {
 			return err
 		}
 	}
-	_, err = s.db.Exec(`INSERT INTO cache_retries(entry,failures,retry_at,paused) VALUES(?,?,?,?) ON CONFLICT(entry) DO UPDATE SET failures=excluded.failures,retry_at=excluded.retry_at,paused=excluded.paused`, key, state.failures, state.next.UnixNano(), state.paused)
+	_, err = s.db.Exec(`INSERT INTO cache_retries(entry,failures,retry_at,paused,started_at,attempts) VALUES(?,?,?,?,?,?) ON CONFLICT(entry) DO UPDATE SET failures=excluded.failures,retry_at=excluded.retry_at,paused=excluded.paused,started_at=excluded.started_at,attempts=excluded.attempts`, key, state.failures, state.next.UnixNano(), state.paused, state.started.UnixNano(), state.attempts)
 	if err != nil {
 		// A disk error must not turn each browser request into another fetch.
 		s.rememberCacheRetry(key, state)
@@ -206,7 +226,71 @@ func (s *Server) cacheEligible(key string) (bool, error) {
 	s.cache.mu.RLock()
 	cooldown := s.cache.portalCooldownUntil
 	s.cache.mu.RUnlock()
-	return !retry.paused && !time.Now().Before(maxTime(retry.next, cooldown)), nil
+	return !retry.exhausted() && !time.Now().Before(maxTime(retry.next, cooldown)), nil
+}
+
+func (r cacheRetryState) stopped() bool { return !r.active && r.exhausted() }
+func (r cacheRetryState) exhausted() bool {
+	return r.paused || recoveryExhausted(max(r.attempts, r.failures), r.started, recoveryAttemptLimit, recoveryElapsedLimit)
+}
+
+// Save the episode start before provider work so a slow request/restart cannot
+// manufacture a fresh elapsed-time allowance.
+func (s *store) beginCacheAttempt(key string) error {
+	state, err := s.cacheRetry(key)
+	if err != nil {
+		return err
+	}
+	if state.started.IsZero() {
+		state.started = time.Now()
+	}
+	state.attempts++
+	_, err = s.db.Exec(`INSERT INTO cache_retries(entry,failures,retry_at,paused,started_at,attempts) VALUES(?,0,0,0,?,1) ON CONFLICT(entry) DO UPDATE SET attempts=attempts+1,started_at=CASE WHEN started_at=0 THEN excluded.started_at ELSE started_at END`, key, state.started.UnixNano())
+	if err != nil {
+		state.paused = true
+		s.rememberCacheRetry(key, state)
+	} else {
+		s.mu.Lock()
+		if s.activeCacheAttempts == nil {
+			s.activeCacheAttempts = map[string]bool{}
+		}
+		s.activeCacheAttempts[key] = true
+		s.mu.Unlock()
+	}
+	return err
+}
+
+func (s *Server) cacheAttemptTimeout(key string) time.Duration {
+	state, err := s.cache.cacheRetry(key)
+	if err != nil || state.started.IsZero() {
+		return 2 * time.Minute
+	}
+	return min(2*time.Minute, max(0, time.Until(state.started.Add(recoveryElapsedLimit))))
+}
+
+func (s *Server) failedCacheStatus(key string) cacheStatus {
+	state, err := s.cache.cacheRetry(key)
+	if err != nil {
+		return cacheStatus{Stale: true, RetryStopped: true, RefreshError: "Could not read recovery state. Retry this request."}
+	}
+	if state.active {
+		return cacheStatus{Stale: true, Refreshing: true, RefreshAfterSeconds: 1}
+	}
+	status := cacheStatus{Stale: true}
+	if state.failures > 0 || state.stopped() {
+		status.RetryStopped = state.stopped()
+		status.RefreshError = "Refresh failed. Showing saved data."
+		if status.RetryStopped {
+			status.RefreshError = "Automatic retries stopped. Retry to try again."
+		}
+	}
+	s.cache.mu.RLock()
+	cooldown := s.cache.portalCooldownUntil
+	s.cache.mu.RUnlock()
+	if !status.RetryStopped {
+		status.RefreshAfterSeconds = max(1, int(time.Until(maxTime(state.next, cooldown)).Seconds())+1)
+	}
+	return status
 }
 
 // Register before spawning so shutdown waits for every server-owned refresh.
@@ -257,7 +341,10 @@ func (s *Server) refreshBrowsePage(ctx context.Context, provider model.BrowsePro
 		if !eligible {
 			return nil, errCacheRetry
 		}
-		requestCtx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
+		if err := s.cache.beginCacheAttempt(key); err != nil {
+			return nil, err
+		}
+		requestCtx, cancel := context.WithTimeout(s.ctx, s.cacheAttemptTimeout(key))
 		defer cancel()
 		if !s.browseCategoryAllowed(q.Kind, q.Category) {
 			return nil, nil
@@ -354,6 +441,12 @@ func (s *Server) loadBrowseRange(ctx context.Context, provider model.BrowseProvi
 		}
 		if !ok || saved.Stale {
 			eligible, err = s.cacheEligible(pageKey(current))
+			if err == nil && !eligible {
+				state, readErr := s.cache.cacheRetry(pageKey(current))
+				err = readErr
+				// Joining an already reserved final attempt does not admit more work.
+				eligible = state.active
+			}
 			break
 		}
 		if !saved.HasMore {

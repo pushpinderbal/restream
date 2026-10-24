@@ -37,15 +37,17 @@ type Config struct {
 type Resolver func(context.Context, model.Item) (model.Source, error)
 
 type Session struct {
-	ID             string          `json:"id"`
-	URL            string          `json:"url"`
-	State          string          `json:"state"`
-	Duration       float64         `json:"duration"`
-	Offset         float64         `json:"offset"`
-	PlaybackRate   float64         `json:"playbackRate"`
-	Error          string          `json:"error,omitempty"`
-	Subtitles      []SubtitleTrack `json:"subtitles,omitempty"`
-	SubtitleOffset *float64        `json:"subtitleOffset,omitempty"`
+	ID                string          `json:"id"`
+	URL               string          `json:"url"`
+	State             string          `json:"state"`
+	Duration          float64         `json:"duration"`
+	Offset            float64         `json:"offset"`
+	PlaybackRate      float64         `json:"playbackRate"`
+	Error             string          `json:"error,omitempty"`
+	Retryable         bool            `json:"retryable"`
+	RetryAfterSeconds int             `json:"retryAfterSeconds,omitempty"`
+	Subtitles         []SubtitleTrack `json:"subtitles,omitempty"`
+	SubtitleOffset    *float64        `json:"subtitleOffset,omitempty"`
 }
 
 type generation struct {
@@ -83,19 +85,20 @@ func WithLogger(ctx context.Context, logger *slog.Logger) context.Context {
 }
 
 type Manager struct {
-	mu       sync.Mutex
-	outputMu sync.Mutex
-	cfg      Config
-	encoder  string
-	resolve  Resolver
-	dir      string
-	sessions map[string]*entry
-	stopping int
-	next     uint64
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	closed   bool
+	mu                sync.Mutex
+	outputMu          sync.Mutex
+	subtitleCooldowns subtitleCooldowns
+	cfg               Config
+	encoder           string
+	resolve           Resolver
+	dir               string
+	sessions          map[string]*entry
+	stopping          int
+	next              uint64
+	ctx               context.Context
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
+	closed            bool
 }
 
 func New(cfg Config, resolve Resolver) (*Manager, error) {
@@ -215,6 +218,8 @@ func (m *Manager) launchLocked(e *entry, pos float64, prior <-chan struct{}) {
 	e.session.State = "starting"
 	e.session.Offset = pos
 	e.session.Error = ""
+	e.session.Retryable = false
+	e.session.RetryAfterSeconds = 0
 	e.session.Subtitles = nil
 	e.session.SubtitleOffset = nil
 	e.session.URL = "/api/streams/" + e.session.ID + "/" + strconv.FormatUint(number, 10) + "/index.m3u8"
@@ -428,19 +433,19 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 	defer startupCancel()
 	source, err := m.resolve(startupCtx, e.item)
 	if err != nil {
-		m.fail(e, g, ctx, "resolve", errorClass(err), started)
+		m.fail(e, g, ctx, "resolve", errorClass(err), started, err)
 		return
 	}
 	u, err := url.Parse(source.URL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
-		m.fail(e, g, ctx, "source_validation", "invalid_url", started)
+		m.fail(e, g, ctx, "source_validation", "invalid_url", started, nil)
 		return
 	}
 	m.outputMu.Lock()
 	err = os.MkdirAll(g.dir, 0700)
 	m.outputMu.Unlock()
 	if err != nil {
-		m.fail(e, g, ctx, "output_directory", errorClass(err), started)
+		m.fail(e, g, ctx, "output_directory", errorClass(err), started, nil)
 		return
 	}
 	// Reuse title metadata on seek, but resolve fresh provider links as they may expire.
@@ -465,7 +470,7 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 		mode = e.transcodeMode
 	}
 	if e.item.Kind != "live" && (cached.hls || len(source.Subtitles) > 0) {
-		subtitles := newSubtitleState(ctx, source, cached.origin, filepath.Join(g.dir, "subtitles"), &m.outputMu)
+		subtitles := newSubtitleState(ctx, source, cached.origin, filepath.Join(g.dir, "subtitles"), &m.outputMu, &m.subtitleCooldowns)
 		m.mu.Lock()
 		g.subtitles = subtitles
 		m.mu.Unlock()
@@ -511,7 +516,7 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 		var hs strings.Builder
 		for k, v := range source.Headers {
 			if !validHeader(k, v) {
-				m.fail(e, g, ctx, "source_validation", "invalid_header", started)
+				m.fail(e, g, ctx, "source_validation", "invalid_header", started, nil)
 				return
 			}
 			hs.WriteString(k)
@@ -546,7 +551,7 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 	stderr := &boundedOutput{limit: 16 * 1024}
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
-		m.fail(e, g, ctx, "ffmpeg_start", errorClass(err), started)
+		m.fail(e, g, ctx, "ffmpeg_start", errorClass(err), started, nil)
 		return
 	}
 	done := make(chan error, 1)
@@ -578,9 +583,11 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 				if reason == "upstream_not_found" {
 					message = failureMessage(reason)
 				}
-				m.update(e, g, func(s *Session) { s.State = "failed"; s.Error = message })
+				m.update(e, g, func(s *Session) {
+					s.State, s.Error, s.Retryable = "failed", message, retryableFailure("ffmpeg_exit", reason)
+				})
 			} else if ctx.Err() == nil {
-				m.fail(e, g, ctx, "ffmpeg_exit", exitClass(err, stderr.String()), started)
+				m.fail(e, g, ctx, "ffmpeg_exit", exitClass(err, stderr.String()), started, nil)
 			}
 			return
 		case <-tick.C:
@@ -594,7 +601,7 @@ func (m *Manager) run(ctx context.Context, e *entry, g *generation, pos float64,
 			if !ready {
 				g.cancel()
 				<-done
-				m.fail(e, g, context.Background(), "ffmpeg_startup", "timeout", started)
+				m.fail(e, g, context.Background(), "ffmpeg_startup", "timeout", started, nil)
 				return
 			}
 		}
@@ -624,12 +631,34 @@ func playable(dir string) bool {
 	return false
 }
 
-func (m *Manager) fail(e *entry, g *generation, ctx context.Context, stage, reason string, started time.Time) {
+func (m *Manager) fail(e *entry, g *generation, ctx context.Context, stage, reason string, started time.Time, cause error) {
 	if ctx.Err() != nil {
 		return
 	}
 	m.logFailure(e, stage, reason, started)
-	m.update(e, g, func(s *Session) { s.State = "failed"; s.Error = failureMessage(reason) })
+	m.update(e, g, func(s *Session) {
+		s.State, s.Error, s.Retryable = "failed", failureMessage(reason), retryableFailure(stage, reason)
+		var permanent interface{ Permanent() bool }
+		if errors.As(cause, &permanent) && permanent.Permanent() {
+			s.Retryable = false
+		}
+		var limited interface{ RetryDelay() time.Duration }
+		if errors.As(cause, &limited) {
+			s.RetryAfterSeconds = int(math.Ceil(max(0, limited.RetryDelay().Seconds())))
+		}
+	})
+}
+
+func retryableFailure(stage, reason string) bool {
+	if stage == "source_validation" || stage == "output_directory" || stage == "ffmpeg_start" {
+		return false
+	}
+	switch reason {
+	case "upstream_not_found", "protocol_rejected", "extension_rejected", "missing_stream", "unsupported_codec", "encoder_failed", "invalid_media", "permission_denied", "not_found", "canceled":
+		return false
+	default:
+		return true
+	}
 }
 
 func failureMessage(reason string) string {

@@ -63,17 +63,19 @@ type Server struct {
 }
 
 type refreshState struct {
-	Queued           bool       `json:"queued"`
-	Running          bool       `json:"running"`
-	StartedAt        *time.Time `json:"startedAt,omitempty"`
-	FinishedAt       *time.Time `json:"finishedAt,omitempty"`
-	NextRefreshAt    *time.Time `json:"nextRefreshAt,omitempty"`
-	LastSuccessfulAt *time.Time `json:"lastSuccessfulAt,omitempty"`
-	IntervalSeconds  float64    `json:"intervalSeconds"`
-	Error            string     `json:"error,omitempty"`
-	Failures         int        `json:"failures"`
-	Paused           bool       `json:"paused"`
-	Configuration    string     `json:"-"`
+	Queued            bool       `json:"queued"`
+	Running           bool       `json:"running"`
+	StartedAt         *time.Time `json:"startedAt,omitempty"`
+	FinishedAt        *time.Time `json:"finishedAt,omitempty"`
+	NextRefreshAt     *time.Time `json:"nextRefreshAt,omitempty"`
+	LastSuccessfulAt  *time.Time `json:"lastSuccessfulAt,omitempty"`
+	IntervalSeconds   float64    `json:"intervalSeconds"`
+	Error             string     `json:"error,omitempty"`
+	Failures          int        `json:"failures"`
+	Paused            bool       `json:"paused"`
+	Configuration     string     `json:"-"`
+	RecoveryStartedAt *time.Time `json:"recoveryStartedAt,omitempty"`
+	RecoveryAttempts  int        `json:"recoveryAttempts,omitempty"`
 }
 
 func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) {
@@ -148,10 +150,12 @@ func New(cfg Config, provider model.Provider, streams Streams) (*Server, error) 
 	mux.HandleFunc("GET /api/catalog", s.catalog)
 	mux.HandleFunc("GET /api/categories", s.categories)
 	mux.HandleFunc("GET /api/browse", s.browse)
+	mux.HandleFunc("POST /api/browse/retry", s.retryBrowse)
 	mux.HandleFunc("GET /api/discovery", s.discover)
 	mux.HandleFunc("GET /api/discovery/images/{id}/{type}", s.discoveryImage)
 	mux.HandleFunc("GET /api/epg", s.epg)
 	mux.HandleFunc("GET /api/series/{id}/episodes", s.episodes)
+	mux.HandleFunc("POST /api/series/{id}/episodes/retry", s.retryEpisodes)
 	mux.HandleFunc("GET /api/items/{id}", s.item)
 	mux.HandleFunc("GET /api/images/{id}", s.image)
 	mux.HandleFunc("POST /api/sessions", s.start)
@@ -423,6 +427,8 @@ func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
 		if !state.Running && !state.Queued {
 			state.Queued = true
 			state.Failures, state.Paused, state.Error = 0, false, ""
+			state.RecoveryStartedAt = nil
+			state.RecoveryAttempts = 0
 			now := time.Now().UTC()
 			state.NextRefreshAt = &now
 			kind := "epg"
@@ -542,7 +548,7 @@ func (s *Server) episodes(w http.ResponseWriter, r *http.Request) {
 		blocked(w)
 		return
 	}
-	respond(w, 200, map[string]any{"items": publicItems(items), "refreshing": status.Refreshing, "stale": status.Stale, "refreshAfterSeconds": status.RefreshAfterSeconds})
+	respond(w, 200, map[string]any{"items": publicItems(items), "refreshing": status.Refreshing, "stale": status.Stale, "refreshAfterSeconds": status.RefreshAfterSeconds, "retryStopped": status.RetryStopped, "refreshError": status.RefreshError})
 }
 func safeEpisodeLogID(id string) string {
 	value, ok := strings.CutPrefix(id, "series:")
@@ -591,7 +597,7 @@ func (s *Server) doRefresh(catalog, epg bool) error {
 	if catalog {
 		started := time.Now()
 		slog.Info("Portal metadata refresh started")
-		ctx, cancel := context.WithTimeout(s.ctx, refreshAttemptTimeout)
+		ctx, cancel := context.WithTimeout(s.ctx, s.scheduledAttemptTimeout(catalog))
 		items, err := s.provider.Catalog(ctx)
 		if err == nil {
 			err = s.cache.setCatalog(items)
@@ -632,7 +638,7 @@ func (s *Server) doRefresh(catalog, epg bool) error {
 	if epg && s.ctx.Err() == nil {
 		started := time.Now()
 		slog.Info("Program guide refresh started")
-		ctx, cancel := context.WithTimeout(s.ctx, refreshAttemptTimeout)
+		ctx, cancel := context.WithTimeout(s.ctx, s.scheduledAttemptTimeout(false))
 		programs, err := s.provider.EPG(ctx)
 		cancel()
 		if err == nil {
@@ -685,47 +691,37 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 		fail(w, 503, "unconfigured", "Connect your provider in Settings first.")
 		return
 	}
-	q := model.BrowseQuery{Kind: r.URL.Query().Get("kind"), Category: r.URL.Query().Get("category"), Search: strings.TrimSpace(r.URL.Query().Get("search")), Page: 1}
-	if q.Kind != "movie" && q.Kind != "series" {
-		fail(w, 400, "invalid", "Choose movies or series.")
+	q, through, valid := s.parseBrowseQuery(w, r)
+	if !valid {
 		return
-	}
-	if len(q.Search) > 120 || len(q.Category) > 80 {
-		fail(w, 400, "invalid", "Search or category is too long.")
-		return
-	}
-	if q.Category == "" {
-		q.Category = "*"
-	}
-	if raw := r.URL.Query().Get("page"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > 10000 {
-			fail(w, 400, "invalid", "Invalid page.")
-			return
-		}
-		q.Page = n
 	}
 	if !s.browseCategoryAllowed(q.Kind, q.Category) {
 		respond(w, 200, model.BrowsePage{Items: []model.Item{}, Page: q.Page})
 		return
 	}
-
-	s.cache.mu.RLock()
-	q.SourceType = s.cache.browseSourceTypeLocked(q)
-	s.cache.mu.RUnlock()
-	through := q.Page
-	if raw := r.URL.Query().Get("through"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < q.Page || n > 10000 || n-q.Page >= 100 {
-			fail(w, 400, "invalid", "Invalid page range.")
-			return
-		}
-		through = n
-	}
 	page, err := s.loadBrowseRange(r.Context(), provider, q, through)
 	if err != nil {
 		fail(w, 502, "upstream", "Could not load this page from the portal. Try again.")
 		return
+	}
+	if page.Stale {
+		for n := q.Page; n <= through; n++ {
+			current := q
+			current.Page = n
+			status := s.failedCacheStatus(pageKey(current))
+			page.RetryStopped = page.RetryStopped || status.RetryStopped
+			page.Refreshing = page.Refreshing || status.Refreshing
+			if status.RefreshError != "" {
+				page.RefreshError = status.RefreshError
+			}
+			if page.RefreshAfterSeconds == 0 || status.RefreshAfterSeconds < page.RefreshAfterSeconds {
+				page.RefreshAfterSeconds = status.RefreshAfterSeconds
+			}
+		}
+		if page.RetryStopped {
+			page.RefreshAfterSeconds = 0
+			page.Refreshing = false
+		}
 	}
 	page.Items = publicItems(s.visibleItems(page.Items, false))
 	respond(w, 200, page)
@@ -733,6 +729,9 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	if s.provider == nil || s.streams == nil {
 		fail(w, 503, "unconfigured", "Connect your provider in Settings first.")
+		return
+	}
+	if s.providerCoolingDown(w) {
 		return
 	}
 	var body struct {
@@ -932,4 +931,41 @@ func (s *Server) image(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeArtwork(w, result)
+}
+
+func (s *Server) parseBrowseQuery(w http.ResponseWriter, r *http.Request) (model.BrowseQuery, int, bool) {
+	q := model.BrowseQuery{Kind: r.URL.Query().Get("kind"), Category: r.URL.Query().Get("category"), Search: strings.TrimSpace(r.URL.Query().Get("search")), Page: 1}
+	if q.Kind != "movie" && q.Kind != "series" {
+		fail(w, 400, "invalid", "Choose movies or series.")
+		return q, 0, false
+	}
+	if len(q.Search) > 120 || len(q.Category) > 80 {
+		fail(w, 400, "invalid", "Search or category is too long.")
+		return q, 0, false
+	}
+	if q.Category == "" {
+		q.Category = "*"
+	}
+	if raw := r.URL.Query().Get("page"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 10000 {
+			fail(w, 400, "invalid", "Invalid page.")
+			return q, 0, false
+		}
+		q.Page = n
+	}
+
+	s.cache.mu.RLock()
+	q.SourceType = s.cache.browseSourceTypeLocked(q)
+	s.cache.mu.RUnlock()
+	through := q.Page
+	if raw := r.URL.Query().Get("through"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < q.Page || n > 10000 || n-q.Page >= 100 {
+			fail(w, 400, "invalid", "Invalid page range.")
+			return q, 0, false
+		}
+		through = n
+	}
+	return q, through, true
 }

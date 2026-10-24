@@ -3,11 +3,13 @@ package stream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +22,82 @@ import (
 
 	"github.com/pushpinderbal/restream/internal/model"
 )
+
+func TestSubtitleCooldownIsSharedByTracksAndKeepsPlaybackUsable(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			var calls atomic.Int32
+			var recovered atomic.Bool
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if !recovered.Load() {
+					w.Header().Set("Retry-After", "90")
+					w.WriteHeader(status)
+					return
+				}
+				fmt.Fprint(w, "WEBVTT\n\n00:00:00.000 --> 00:00:03.000\nRecovered captions\n")
+			}))
+			defer provider.Close()
+			redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, provider.URL+"/one.vtt", http.StatusFound)
+			}))
+			defer redirector.Close()
+			other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, "WEBVTT\n\n00:00:00.000 --> 00:00:03.000\nOther captions\n")
+			}))
+			defer other.Close()
+			state := newSubtitleState(context.Background(), model.Source{}, 0, t.TempDir(), &sync.Mutex{}, &subtitleCooldowns{})
+			state.tracks = []providerSubtitle{
+				{source: model.SubtitleSource{URL: redirector.URL + "/one.vtt"}},
+				{source: model.SubtitleSource{URL: provider.URL + "/two.vtt"}},
+				{source: model.SubtitleSource{URL: other.URL + "/other.vtt"}},
+			}
+			m := &Manager{sessions: map[string]*entry{"session": {
+				session: Session{ID: "session", State: "ready"},
+				gen:     &generation{number: 1, subtitles: state},
+			}}}
+			get := func(track string, want int) *httptest.ResponseRecorder {
+				t.Helper()
+				w := httptest.NewRecorder()
+				m.serveSubtitles(w, httptest.NewRequest("GET", "/?start=0", nil), "session", "1", track)
+				if w.Code != want {
+					t.Fatalf("track %s: status %d, body %s", track, w.Code, w.Body.String())
+				}
+				return w
+			}
+			first := get("0", http.StatusTooManyRequests)
+			seconds, err := strconv.Atoi(first.Header().Get("Retry-After"))
+			if err != nil || seconds < 89 {
+				t.Fatalf("provider wait was lost: %q", first.Header().Get("Retry-After"))
+			}
+			get("0", http.StatusTooManyRequests)
+			get("1", http.StatusTooManyRequests)
+			get("2", http.StatusOK)
+			replacement := newSubtitleState(context.Background(), model.Source{}, 0, t.TempDir(), &sync.Mutex{}, state.cooldowns)
+			target, _ := url.Parse(provider.URL + "/one.vtt")
+			_, _, err = replacement.fetch(context.Background(), target, model.SubtitleSource{URL: target.String()})
+			var limited *subtitleCooldownError
+			if !errors.As(err, &limited) {
+				t.Fatalf("replacement generation lost the provider cooldown: %v", err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("retries or track changes bypassed provider cooldown: %d calls", calls.Load())
+			}
+			if current, _ := m.Get("session"); current.State != "ready" {
+				t.Fatalf("subtitle failure interrupted playback: %+v", current)
+			}
+			recovered.Store(true)
+			u, _ := url.Parse(provider.URL)
+			state.cooldowns.mu.Lock()
+			delete(state.cooldowns.hosts, u.Scheme+"://"+u.Host)
+			state.cooldowns.mu.Unlock()
+			get("0", http.StatusOK)
+			if calls.Load() != 2 {
+				t.Fatalf("retry after cooldown did not recover: %d calls", calls.Load())
+			}
+		})
+	}
+}
 
 func subtitleFixture(t *testing.T) (string, float64) {
 	t.Helper()
@@ -263,7 +341,7 @@ func TestProviderSubtitleCredentialsStayOnOrigin(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var filesMu sync.Mutex
-	s := newSubtitleState(ctx, model.Source{URL: portal.URL + "/master.m3u8", Headers: map[string]string{"Authorization": "Bearer private", "Cookie": "private=identity"}}, 0, t.TempDir(), &filesMu)
+	s := newSubtitleState(ctx, model.Source{URL: portal.URL + "/master.m3u8", Headers: map[string]string{"Authorization": "Bearer private", "Cookie": "private=identity"}}, 0, t.TempDir(), &filesMu, &subtitleCooldowns{})
 	if len(s.discover(true, "/api/streams/session/1/")) != 1 {
 		t.Fatal("track not discovered")
 	}

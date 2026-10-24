@@ -581,10 +581,12 @@ function App() {
     status?.epgUpdatedAt,
     status?.preferencesUpdatedAt,
   ]);
+  const browseRequest = useRef({ page: 1, refreshRange: false });
   const fetchPage = useCallback(
-    (page: number, generation: number, refreshRange = false) => {
+    (page: number, generation: number, refreshRange = false, retry = false) => {
       if (tab === "live" || discoveryContext || searchContext || settingsOpen)
         return;
+      browseRequest.current = { page, refreshRange };
       browseAbort.current?.abort();
       const controller = new AbortController();
       browseAbort.current = controller;
@@ -606,6 +608,7 @@ function App() {
           setHasMore(result.hasMore);
         },
         refreshRange,
+        retry,
       )
         .catch((cause) => {
           if (isCurrent()) setBrowseError(message(cause));
@@ -1095,15 +1098,38 @@ function App() {
       throw new Error("This title is no longer available.");
     return item;
   };
+  const failedEpisodeRequests = useRef(new Set<string>());
   const dashboardEpisode = async (
     title: Item,
     wanted?: Pick<Item, "id" | "season" | "episode">,
     signal?: AbortSignal,
   ) => {
-    const result = await request<{ items: Item[] }>(
-      `/api/series/${encodeURIComponent(title.id)}/episodes?season=${wanted?.season || (wanted ? 1 : "first")}`,
-      { signal },
-    );
+    const season = wanted?.season || (wanted ? 1 : "first");
+    const path = `/api/series/${encodeURIComponent(title.id)}/episodes`;
+    const key = `${title.id}:${season}`;
+    if (failedEpisodeRequests.current.delete(key)) {
+      try {
+        await request<void>(`${path}/retry`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ season }),
+          signal,
+        });
+      } catch (cause) {
+        failedEpisodeRequests.current.add(key);
+        throw cause;
+      }
+    }
+    const result = await request<{
+      items: Item[];
+      retryStopped?: boolean;
+      refreshError?: string;
+    }>(`${path}?season=${season}`, { signal }).catch((cause) => {
+      if (!signal?.aborted) failedEpisodeRequests.current.add(key);
+      throw cause;
+    });
+    if (result.retryStopped || result.refreshError)
+      failedEpisodeRequests.current.add(key);
     const episodes = (result.items || [])
       .filter((item) => item.kind === "episode")
       .sort(
@@ -1120,7 +1146,10 @@ function App() {
             (item.season || 1) === (wanted.season || 1),
         )
       : episodes[0];
-    if (!episode) throw new Error("This episode is no longer available.");
+    if (!episode)
+      throw new Error(
+        result.refreshError || "This episode is no longer available.",
+      );
     return episode;
   };
   const startDashboardPlayback = async (
@@ -1883,8 +1912,10 @@ function App() {
                             loadingLabel="Retrying…"
                             onClick={() =>
                               fetchPage(
-                                browsePage + 1,
+                                browseRequest.current.page,
                                 browseGeneration.current,
+                                browseRequest.current.refreshRange,
+                                true,
                               )
                             }
                           >
@@ -1984,6 +2015,7 @@ function PlayerPage({
   );
   const [episodesError, setEpisodesError] = useState("");
   const [episodeRetry, setEpisodeRetry] = useState(0);
+  const appliedEpisodeRetry = useRef(0);
   const [season, setSeason] = useState<number | null>(null);
   const [requestedSeason, setRequestedSeason] = useState<number | null>(
     episodeDestination?.season ?? null,
@@ -2000,15 +2032,23 @@ function PlayerPage({
   useEffect(() => {
     if (item.kind !== "series") return;
     const controller = new AbortController();
+    const signal = AbortSignal.any([
+      controller.signal,
+      AbortSignal.timeout(180000),
+    ]);
+    const deadline = Date.now() + 180000;
     setEpisodesLoading(true);
     const key = `${item.id}:${refreshRevision}:${requestedSeason ?? "first"}`;
-    const apply = (result: {
-      items: Item[];
-      seasons?: number[];
-      season?: number;
-    }) => {
+    const apply = (
+      result: {
+        items: Item[];
+        seasons?: number[];
+        season?: number;
+      },
+      cached = false,
+    ) => {
       if (!controller.signal.aborted) {
-        setEpisodesError("");
+        if (!cached) setEpisodesError("");
         setEpisodes(result.items);
         setSeasonOptions(
           result.seasons ??
@@ -2025,20 +2065,31 @@ function PlayerPage({
           result.items[0];
         setSeason(result.season ?? target?.season ?? requestedSeason ?? 1);
         setEpisode(target || null);
-        setEpisodesLoading(false);
+        if (!cached) setEpisodesLoading(false);
       }
     };
     const cached = episodeCache.current.get(key);
-    if (cached) apply(cached);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let loading = false;
+    if (cached) apply(cached, true);
     const load = async () => {
-      if (loading || document.hidden || controller.signal.aborted) return;
-      clearTimeout(timer);
-      loading = true;
       try {
-        const deadline = Date.now() + 180000;
+        if (episodeRetry > appliedEpisodeRetry.current) {
+          appliedEpisodeRetry.current = episodeRetry;
+          await request<void>(
+            `/api/series/${encodeURIComponent(item.id)}/episodes/retry`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ season: requestedSeason ?? "first" }),
+              signal,
+            },
+          );
+        }
+        let attempts = 0;
         for (;;) {
+          if (Date.now() >= deadline || attempts++ >= 60)
+            throw new Error(
+              "Episodes are taking longer than expected. Please retry.",
+            );
           const result = await request<{
             items: Item[];
             seasons?: number[];
@@ -2046,9 +2097,11 @@ function PlayerPage({
             refreshing?: boolean;
             stale?: boolean;
             refreshAfterSeconds?: number;
+            retryStopped?: boolean;
+            refreshError?: string;
           }>(
             `/api/series/${encodeURIComponent(item.id)}/episodes?season=${requestedSeason ?? "first"}`,
-            { signal: controller.signal },
+            { signal },
           );
           if (controller.signal.aborted) return;
           episodeCache.current.set(key, result);
@@ -2058,38 +2111,26 @@ function PlayerPage({
               result,
             );
           apply(result);
-          if (!result.refreshing || Date.now() >= deadline) {
-            const seconds = result.refreshAfterSeconds ?? 15 * 60;
-            if (seconds > 0) {
-              const delay = Math.max(result.stale ? 60 : 1, seconds);
-              timer = setTimeout(() => void load(), delay * 1000);
-            }
-            return;
-          }
-          await waitForRefresh(controller.signal);
+          if (
+            result.retryStopped ||
+            (result.refreshError && !result.refreshing)
+          )
+            throw new Error(
+              result.refreshError ||
+                "Episodes could not be refreshed. Please retry.",
+            );
+          if (!result.refreshing) return;
+          await waitForRefresh(signal);
         }
       } catch (cause) {
         if (!controller.signal.aborted) {
           setEpisodesError(message(cause));
           setEpisodesLoading(false);
         }
-      } finally {
-        loading = false;
       }
     };
-    const resume = () => {
-      if (document.hidden) clearTimeout(timer);
-      else void load();
-    };
     void load();
-    window.addEventListener("focus", resume);
-    document.addEventListener("visibilitychange", resume);
-    return () => {
-      controller.abort();
-      clearTimeout(timer);
-      window.removeEventListener("focus", resume);
-      document.removeEventListener("visibilitychange", resume);
-    };
+    return () => controller.abort();
   }, [item.id, item.kind, episodeRetry, refreshRevision, requestedSeason]);
 
   useEffect(() => {
@@ -2311,7 +2352,8 @@ function PlayerPage({
                 <Skeleton key={index} className="h-19 w-full" />
               ))}
             </div>
-          ) : episodesError && !shownEpisodes.length ? (
+          ) : null}
+          {episodesError && (
             <AnimatedAlert>
               <span>{episodesError}</span>
               <LoadingButton
@@ -2322,7 +2364,8 @@ function PlayerPage({
                 Retry episodes
               </LoadingButton>
             </AnimatedAlert>
-          ) : shownEpisodes.length ? (
+          )}
+          {shownEpisodes.length ? (
             <div className="episode-list">
               {shownEpisodes.map((value) => (
                 <button
@@ -2367,9 +2410,9 @@ function PlayerPage({
                 </button>
               ))}
             </div>
-          ) : (
+          ) : !episodesLoading && !episodesError ? (
             <p className="episode-empty">No episodes</p>
-          )}
+          ) : null}
         </div>
       )}
     </article>
@@ -2467,6 +2510,53 @@ function PlaybackPlayer({
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
   const retryMessage = useRef("");
+  const recovery = useRef({ attempts: 0, startedAt: 0 });
+  const recoveryTimer = useRef<number | undefined>(undefined);
+  const stopPlaybackRef = useRef<(() => void) | null>(null);
+  const wantsPlayback = useRef(true);
+  const failureHandled = useRef(false);
+  const retryNotBefore = useRef(0);
+  const recoverPlayback = useCallback(
+    (failure: string, retryable = true, delay = 1000) => {
+      if (failureHandled.current) return;
+      failureHandled.current = true;
+      const current = latestSession.current;
+      if (
+        activeItem.kind !== "live" &&
+        current &&
+        video.current &&
+        attachedUrlRef.current === current.url
+      )
+        playbackStart.current = current.offset + video.current.currentTime;
+      stopPlaybackRef.current?.();
+      setBuffering(false);
+      setError(failure);
+      const budget = recovery.current;
+      if (!budget.startedAt) budget.startedAt = Date.now();
+      retryNotBefore.current = Date.now() + delay;
+      const wait = Math.max(1000, delay);
+      if (
+        !retryable ||
+        !wantsPlayback.current ||
+        budget.attempts >= 2 ||
+        Date.now() + wait >= budget.startedAt + 60000
+      ) {
+        setRetrying(false);
+        return;
+      }
+      budget.attempts++;
+      retryMessage.current = failure;
+      setRetrying(true);
+      recoveryTimer.current = window.setTimeout(() => {
+        if (wantsPlayback.current && Date.now() < budget.startedAt + 60000)
+          setPlayAttempt((value) => value + 1);
+        else setRetrying(false);
+      }, wait);
+    },
+    [activeItem.kind],
+  );
+  useEffect(() => () => window.clearTimeout(recoveryTimer.current), []);
+
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
   const [position, setPosition] = useState(0);
@@ -2484,6 +2574,8 @@ function PlaybackPlayer({
   const feedbackSequence = useRef(0);
   useLayoutEffect(() => {
     if (isPresent) return;
+    wantsPlayback.current = false;
+    window.clearTimeout(recoveryTimer.current);
     saveProgressRef.current();
     onFlushProgress();
     pendingPlayUrlRef.current = null;
@@ -2491,11 +2583,14 @@ function PlaybackPlayer({
   }, [isPresent, onFlushProgress]);
   useEffect(() => {
     if (!isPresent) return;
+    failureHandled.current = false;
     historyRecorded.current = false;
     historyFinished.current = false;
     let alive = true;
     let timer: number | undefined;
     let heartbeat: number | undefined;
+    let startupTimer: number | undefined;
+    const pollController = new AbortController();
     let pollBusy = false;
     let pollRequested = false;
     let currentId: string | null = null;
@@ -2536,6 +2631,8 @@ function PlaybackPlayer({
       clearMediaRef.current?.();
       if (timer) clearTimeout(timer);
       if (heartbeat) clearInterval(heartbeat);
+      window.clearTimeout(startupTimer);
+      pollController.abort();
       if (currentId && !releasedRef.current) {
         releasedRef.current = true;
         releasePromiseRef.current = releaseSession(currentId, keepalive);
@@ -2546,6 +2643,18 @@ function PlaybackPlayer({
       if (sessionId.current === currentId) sessionId.current = null;
       onSessionChange();
     };
+    stopPlaybackRef.current = stop;
+    const startupDeadline = Math.min(
+      Date.now() + 60000,
+      recovery.current.startedAt
+        ? recovery.current.startedAt + 60000
+        : Infinity,
+    );
+    const startupSignal = () =>
+      AbortSignal.any([
+        pollController.signal,
+        AbortSignal.timeout(Math.max(1, startupDeadline - Date.now())),
+      ]);
     releasedRef.current = false;
     pendingPlayUrlRef.current = null;
     // Download the decoder while the provider and FFmpeg prepare the stream.
@@ -2562,10 +2671,23 @@ function PlaybackPlayer({
     setViewerFinished(false);
     void priorTransition.then(() => {
       if (!alive) return;
+      if (
+        recovery.current.startedAt &&
+        Date.now() >= recovery.current.startedAt + 60000
+      ) {
+        recoverPlayback("Playback recovery stopped. Please try again.", false);
+        return;
+      }
       postStarted = true;
-      return jsonRequest<Session>("/api/sessions", "POST", {
-        itemId: activeItem.id,
-        start: playbackStart.current,
+      return request<Session>("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: activeItem.id,
+          start: playbackStart.current,
+        }),
+        // An unknown creation outcome is never automatically replayed.
+        signal: AbortSignal.timeout(Math.max(1, startupDeadline - Date.now())),
       })
         .then((value) => {
           postDone = true;
@@ -2578,18 +2700,47 @@ function PlaybackPlayer({
             return;
           }
           currentId = value.id;
+          if (recovery.current.startedAt && Date.now() >= startupDeadline) {
+            recoverPlayback(
+              "Playback recovery stopped. Please try again.",
+              false,
+            );
+            return;
+          }
           setRetrying(false);
           sessionId.current = value.id;
           setSession(value);
           pendingPlayUrlRef.current = value.url;
           onSessionChange();
           if (value.state === "failed") {
-            setError(value.error || "This stream is unavailable.");
+            recoverPlayback(
+              value.error || "This stream is unavailable.",
+              value.retryable !== false,
+              (value.retryAfterSeconds || 0) * 1000,
+            );
             return;
           }
+          if (value.state === "starting")
+            startupTimer = window.setTimeout(
+              () => {
+                if (alive)
+                  recoverPlayback(
+                    "This stream took too long to start.",
+                    Date.now() < startupDeadline,
+                  );
+              },
+              Math.max(0, startupDeadline - Date.now()),
+            );
           const poll = () => {
             if (timer) clearTimeout(timer);
             if (!alive || releasedRef.current) return;
+            if (
+              latestSession.current?.state === "starting" &&
+              Date.now() >= startupDeadline
+            ) {
+              recoverPlayback("This stream took too long to start.");
+              return;
+            }
             if (seekingRef.current) {
               timer = window.setTimeout(poll, 300);
               return;
@@ -2599,9 +2750,24 @@ function PlaybackPlayer({
             const version = seekVersion.current;
             void request<Session>(
               `/api/sessions/${encodeURIComponent(value.id)}`,
+              {
+                signal:
+                  latestSession.current?.state === "starting"
+                    ? startupSignal()
+                    : pollController.signal,
+              },
             )
               .then((next) => {
                 if (!alive || version !== seekVersion.current) return;
+                if (
+                  latestSession.current?.state === "starting" &&
+                  Date.now() >= startupDeadline
+                ) {
+                  recoverPlayback("This stream took too long to start.", false);
+                  return;
+                }
+                if (next.state !== "starting")
+                  window.clearTimeout(startupTimer);
                 setSession((current) =>
                   current &&
                   current.id === next.id &&
@@ -2618,12 +2784,24 @@ function PlaybackPlayer({
                     : next,
                 );
                 if (next.state === "failed") {
-                  clearMediaRef.current?.();
-                  setError(next.error || "This stream failed.");
+                  recoverPlayback(
+                    next.error || "This stream failed.",
+                    next.retryable !== false,
+                    (next.retryAfterSeconds || 0) * 1000,
+                  );
                 }
               })
               .catch((cause) => {
-                if (alive) setError(message(cause));
+                if (alive)
+                  recoverPlayback(
+                    message(cause),
+                    !(
+                      cause instanceof ApiError &&
+                      cause.status < 500 &&
+                      cause.status !== 429
+                    ),
+                    cause instanceof ApiError ? cause.retryAfterMs : 0,
+                  );
               })
               .finally(() => {
                 pollBusy = false;
@@ -2647,21 +2825,39 @@ function PlaybackPlayer({
             if (!releasedRef.current)
               void request<void>(
                 `/api/sessions/${encodeURIComponent(value.id)}/heartbeat`,
-                { method: "POST" },
+                {
+                  method: "POST",
+                  signal:
+                    latestSession.current?.state === "starting"
+                      ? startupSignal()
+                      : pollController.signal,
+                },
               ).catch((cause) => {
-                if (alive && !releasedRef.current) setError(message(cause));
+                if (alive && !releasedRef.current)
+                  recoverPlayback(
+                    message(cause),
+                    !(
+                      cause instanceof ApiError &&
+                      cause.status < 500 &&
+                      cause.status !== 429
+                    ),
+                    cause instanceof ApiError ? cause.retryAfterMs : 0,
+                  );
               });
           }, 15000);
         })
         .catch((cause) => {
           postDone = true;
           if (alive) {
-            setRetrying(false);
-            setError(
+            recoverPlayback(
               cause instanceof ApiError &&
                 (cause.status === 409 || cause.code === "capacity")
                 ? noRoom
                 : message(cause),
+              cause instanceof ApiError &&
+                cause.status === 429 &&
+                cause.code === "cooldown",
+              cause instanceof ApiError ? cause.retryAfterMs : 0,
             );
           } else finishTransition();
         });
@@ -2684,6 +2880,7 @@ function PlaybackPlayer({
     onSessionChange,
     onFlushProgress,
     isPresent,
+    recoverPlayback,
   ]);
   useEffect(() => {
     seekingRef.current = seeking;
@@ -2762,9 +2959,17 @@ function PlaybackPlayer({
           hls.on(Hls.Events.ERROR, (_event, data) => {
             if (data.fatal) {
               // HLS may still finish its error dispatch before releasing context.
-              queueMicrotask(clearMedia);
-              setBuffering(false);
-              setError("Playback stopped. Please try this stream again.");
+              const retryable =
+                data.details !== Hls.ErrorDetails.MANIFEST_PARSING_ERROR &&
+                data.details !==
+                  Hls.ErrorDetails.MANIFEST_INCOMPATIBLE_CODECS_ERROR;
+              queueMicrotask(() => {
+                if (!disposed)
+                  recoverPlayback(
+                    "Playback stopped. Please try this stream again.",
+                    retryable,
+                  );
+              });
             }
           });
           hls.loadSource(playbackUrl);
@@ -2780,9 +2985,7 @@ function PlaybackPlayer({
     const onMediaError = () => {
       // HLS.js owns its error recovery; native-only playback has no decoder.
       if (disposed || hls) return;
-      queueMicrotask(clearMedia);
-      setBuffering(false);
-      setError("The video could not be played.");
+      recoverPlayback("The video could not be played.");
     };
     element.addEventListener("error", onMediaError);
     // Prefer HLS.js. Native support claims do not guarantee stream compatibility.
@@ -2792,7 +2995,13 @@ function PlaybackPlayer({
       clearMedia();
       if (clearMediaRef.current === clearMedia) clearMediaRef.current = null;
     };
-  }, [playbackUrl, activeItem.kind, isPresent, viewerFinished]);
+  }, [
+    playbackUrl,
+    activeItem.kind,
+    isPresent,
+    viewerFinished,
+    recoverPlayback,
+  ]);
 
   const subtitles = useProviderSubtitles(
     video,
@@ -2929,6 +3138,7 @@ function PlaybackPlayer({
     const element = video.current;
     if (!element) return;
     if (element.paused) {
+      wantsPlayback.current = true;
       try {
         await element.play();
         if (!releasedRef.current && !element.paused)
@@ -2941,6 +3151,8 @@ function PlaybackPlayer({
         setError("Playback could not start. Try pressing play again.");
       }
     } else {
+      wantsPlayback.current = false;
+      window.clearTimeout(recoveryTimer.current);
       pendingPlayUrlRef.current = null;
       element.pause();
       setPlaybackFeedback({ id: ++feedbackSequence.current, action: "pause" });
@@ -2969,6 +3181,8 @@ function PlaybackPlayer({
     }
   };
   const finishPlayback = () => {
+    wantsPlayback.current = false;
+    window.clearTimeout(recoveryTimer.current);
     saveProgress(true);
     historyFinished.current = true;
     onFlushProgress();
@@ -3139,6 +3353,8 @@ function PlaybackPlayer({
                 <PlayButton
                   onClick={() => {
                     playbackStart.current = 0;
+                    recovery.current = { attempts: 0, startedAt: 0 };
+                    wantsPlayback.current = true;
                     setPlayAttempt((value) => value + 1);
                   }}
                 >
@@ -3189,9 +3405,33 @@ function PlaybackPlayer({
               loading={retrying}
               loadingLabel="Retrying…"
               onClick={() => {
+                window.clearTimeout(recoveryTimer.current);
+                const delay = Math.max(0, retryNotBefore.current - Date.now());
+                if (delay >= 60000) {
+                  setRetrying(false);
+                  setError(
+                    "Provider cooldown is still active. Try again later.",
+                  );
+                  return;
+                }
+                recovery.current = {
+                  attempts: 0,
+                  startedAt: delay ? Date.now() : 0,
+                };
+                wantsPlayback.current = true;
                 retryMessage.current = error;
                 setRetrying(true);
-                setPlayAttempt((value) => value + 1);
+                if (delay)
+                  recoveryTimer.current = window.setTimeout(() => {
+                    if (
+                      wantsPlayback.current &&
+                      Date.now() >= retryNotBefore.current &&
+                      Date.now() < recovery.current.startedAt + 60000
+                    )
+                      setPlayAttempt((value) => value + 1);
+                    else setRetrying(false);
+                  }, delay);
+                else setPlayAttempt((value) => value + 1);
               }}
             >
               Try again

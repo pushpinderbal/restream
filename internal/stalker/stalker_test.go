@@ -868,6 +868,7 @@ func TestPlaintextAuthorizationRecovery(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			handshakes := 0
 			denials := 0
+			recovered := false
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				q := r.URL.Query()
 				key := q.Get("type") + "/" + q.Get("action")
@@ -879,7 +880,7 @@ func TestPlaintextAuthorizationRecovery(t *testing.T) {
 				if r.Header.Get("Authorization") != fmt.Sprintf("Bearer token-%d", handshakes) {
 					t.Errorf("stale token: %s", key)
 				}
-				if key == tc.target && (tc.persistent || denials == 0) {
+				if key == tc.target && !recovered && (tc.persistent || denials == 0) {
 					denials++
 					w.Header().Set("Content-Type", "text/html")
 					_, _ = w.Write([]byte(tc.body))
@@ -922,9 +923,15 @@ func TestPlaintextAuthorizationRecovery(t *testing.T) {
 			if tc.persistent && (!strings.Contains(e.Error(), "authorization failed") || handshakes != 2 || denials != 2) {
 				t.Fatalf("persistent denial did not stop once: %v, handshakes=%d denials=%d", e, handshakes, denials)
 			}
-			var permanent interface{ Permanent() bool }
-			if tc.persistent && (!errors.As(e, &permanent) || !permanent.Permanent()) {
-				t.Fatalf("persistent denial must pause background retries: %v", e)
+			var auth *AuthenticationError
+			if tc.persistent {
+				if !errors.As(e, &auth) {
+					t.Fatalf("persistent denial must allow bounded later recovery: %v", e)
+				}
+				recovered = true
+				if _, e = c.Categories(context.Background()); e != nil || handshakes != 3 {
+					t.Fatalf("later recovery: error=%v handshakes=%d", e, handshakes)
+				}
 			}
 			if tc.html && (handshakes != 1 || denials != 1 || !strings.Contains(e.Error(), "invalid data")) {
 				t.Fatalf("HTML triggered auth retry: %v, handshakes=%d denials=%d", e, handshakes, denials)
@@ -1009,7 +1016,7 @@ func TestBulkEPGFailuresDoNotFanOut(t *testing.T) {
 	}
 	custom := &http.Client{Timeout: 2 * time.Second}
 	c, e = New(Config{PortalURL: "https://example.test/server/load.php", MAC: "aa:bb", HTTPClient: custom, RequestTimeout: time.Minute, EPGHours: 24})
-	if e != nil || c.http != custom || c.cfg.EPGHours != 24 {
+	if e != nil || c.http == custom || c.http.Timeout != custom.Timeout || c.http.Jar == nil || custom.Jar != nil || c.cfg.EPGHours != 24 {
 		t.Fatalf("client override: %+v %v", c, e)
 	}
 	for _, cfg := range []Config{{PortalURL: "https://example.test", MAC: "aa:bb", RequestTimeout: -time.Second}, {PortalURL: "https://example.test", MAC: "aa:bb", EPGHours: 169}, {PortalURL: "https://example.test", MAC: "aa:bb", EPGHours: -1}} {
@@ -1019,29 +1026,63 @@ func TestBulkEPGFailuresDoNotFanOut(t *testing.T) {
 	}
 }
 
-func TestRetryAfterCancellationPreservesCooldown(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		w.Header().Set("Retry-After", time.Now().Add(3*time.Second).UTC().Format(http.TimeFormat))
-		w.WriteHeader(http.StatusTooManyRequests)
-	}))
-	defer srv.Close()
-	c, e := New(Config{PortalURL: srv.URL + "/server/load.php", MAC: "aa:bb", RequestInterval: time.Nanosecond})
-	if e != nil {
-		t.Fatal(e)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	_, e = c.Catalog(ctx)
-	if !errors.Is(e, context.DeadlineExceeded) || calls.Load() != 1 {
-		t.Fatalf("first call=%v, requests=%d", e, calls.Load())
-	}
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel2()
-	_, e = c.EPG(ctx2)
-	if !errors.Is(e, context.DeadlineExceeded) || calls.Load() != 1 {
-		t.Fatalf("cooldown lost: error=%v requests=%d", e, calls.Load())
+func TestRetryAfterBeyondDeadlineReturnsCooldown(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		for _, header := range []string{
+			time.Now().Add(3 * time.Second).UTC().Format(http.TimeFormat),
+			"9223372036854775807",
+			"18446744073709551616",
+		} {
+			t.Run(fmt.Sprintf("%d/%s", status, header), func(t *testing.T) {
+				var calls atomic.Int32
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if status == http.StatusServiceUnavailable {
+						var js any
+						switch r.URL.Query().Get("action") {
+						case "handshake":
+							js = map[string]any{"token": "session"}
+						case "get_profile":
+							js = map[string]any{"id": 1}
+						}
+						if js != nil {
+							_ = json.NewEncoder(w).Encode(map[string]any{"js": js})
+							return
+						}
+					}
+					calls.Add(1)
+					w.Header().Set("Retry-After", header)
+					w.WriteHeader(status)
+				}))
+				defer srv.Close()
+				cfg := Config{PortalURL: srv.URL + "/server/load.php", MAC: "aa:bb", RequestInterval: time.Nanosecond, RequestTimeout: 50 * time.Millisecond}
+				c, e := New(cfg)
+				if e != nil {
+					t.Fatal(e)
+				}
+				var saved time.Time
+				c.ConfigureCooldown(time.Time{}, func(until time.Time) error { saved = until; return nil })
+				_, e = c.Catalog(context.Background())
+				var limited *RateLimitError
+				if !errors.As(e, &limited) || limited.RetryDelay() < time.Second || calls.Load() != 1 || !saved.After(time.Now()) {
+					t.Fatalf("first call=%v, requests=%d saved=%v", e, calls.Load(), saved)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+				defer cancel()
+				_, e = c.EPG(ctx)
+				if !errors.As(e, &limited) || calls.Load() != 1 {
+					t.Fatalf("cooldown lost: error=%v requests=%d", e, calls.Load())
+				}
+				restored, e := New(cfg)
+				if e != nil {
+					t.Fatal(e)
+				}
+				restored.ConfigureCooldown(saved, nil)
+				_, e = restored.Catalog(context.Background())
+				if !errors.As(e, &limited) || calls.Load() != 1 {
+					t.Fatalf("restored cooldown lost: error=%v requests=%d", e, calls.Load())
+				}
+			})
+		}
 	}
 }
 
@@ -1161,7 +1202,8 @@ func TestCooldownPersistsBeforeCancellationAndRestores(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	_, e = c.Catalog(ctx)
-	if !errors.Is(e, context.DeadlineExceeded) || saves != 1 || time.Until(saved) < time.Second || calls.Load() != 1 {
+	var limited *RateLimitError
+	if !errors.As(e, &limited) || saves != 1 || time.Until(saved) < time.Second || calls.Load() != 1 {
 		t.Fatalf("deadline=%v saves=%d calls=%d error=%v", saved, saves, calls.Load(), e)
 	}
 	restored, e := New(config)
@@ -1172,7 +1214,7 @@ func TestCooldownPersistsBeforeCancellationAndRestores(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel2()
 	_, e = restored.Catalog(ctx2)
-	if !errors.Is(e, context.DeadlineExceeded) || calls.Load() != 1 {
+	if !errors.As(e, &limited) || calls.Load() != 1 {
 		t.Fatalf("restored deadline ignored: calls=%d error=%v", calls.Load(), e)
 	}
 }

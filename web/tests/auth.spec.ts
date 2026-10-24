@@ -33,7 +33,7 @@ async function mock(page: Page, initial: Auth) {
     if (expired && url.pathname === "/api/browse")
       return route.fulfill({
         status: 401,
-        json: { error: "Sign in required" },
+        json: { code: "unauthorized", error: "Sign in required" },
       });
     const bodies: Record<string, unknown> = {
       "/api/settings": {

@@ -45,21 +45,15 @@ func (s *Server) loadEpisodeListWithTTL(r *http.Request, series model.Item, key 
 		return items, status, err
 	}
 	if !eligible {
-		retry, err := s.cache.cacheRetry(entry)
-		if err != nil {
-			return items, status, err
-		}
-		s.cache.mu.RLock()
-		cooldown := s.cache.portalCooldownUntil
-		s.cache.mu.RUnlock()
-		status.RefreshAfterSeconds = max(1, int(time.Until(maxTime(retry.next, cooldown)).Seconds())+1)
-		if retry.paused {
-			status.RefreshAfterSeconds = 0
-		}
+		status = s.failedCacheStatus(entry)
 		if cached {
 			return items, status, nil
 		}
-		return nil, status, errCacheRetry
+		if !status.Refreshing {
+			return nil, status, errCacheRetry
+		}
+		// Cold callers join the final reserved flight instead of reporting failure
+		// while another viewer's request is still capable of succeeding.
 	}
 	result := s.cacheFlight(&s.episodeFlights, entry+"\x00"+revision.Format(time.RFC3339Nano), func() (any, error) {
 		if saved, fresh := s.cache.getEpisodes(key, ttl); fresh {
@@ -72,7 +66,10 @@ func (s *Server) loadEpisodeListWithTTL(r *http.Request, series model.Item, key 
 		if !eligible {
 			return nil, errCacheRetry
 		}
-		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
+		if err := s.cache.beginCacheAttempt(entry); err != nil {
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(s.ctx, s.cacheAttemptTimeout(entry))
 		defer cancel()
 		started := time.Now()
 		loaded, err := load(ctx)
@@ -168,6 +165,10 @@ func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series m
 			status.Stale = status.Stale || episodeStatus.Stale
 			status.Refreshing = status.Refreshing || episodeStatus.Refreshing
 			status.RefreshAfterSeconds = min(status.RefreshAfterSeconds, episodeStatus.RefreshAfterSeconds)
+			status.RetryStopped = status.RetryStopped || episodeStatus.RetryStopped
+			if episodeStatus.RefreshError != "" {
+				status.RefreshError = episodeStatus.RefreshError
+			}
 			if err != nil {
 				seasonFailure(w, err)
 				return
@@ -187,7 +188,7 @@ func (s *Server) seasonEpisodes(w http.ResponseWriter, r *http.Request, series m
 		blocked(w)
 		return
 	}
-	respond(w, 200, map[string]any{"items": publicItems(items), "seasons": seasons, "season": number, "refreshing": status.Refreshing, "stale": status.Stale, "refreshAfterSeconds": status.RefreshAfterSeconds})
+	respond(w, 200, map[string]any{"items": publicItems(items), "seasons": seasons, "season": number, "refreshing": status.Refreshing, "stale": status.Stale, "refreshAfterSeconds": status.RefreshAfterSeconds, "retryStopped": status.RetryStopped, "refreshError": status.RefreshError})
 }
 
 func seasonFailure(w http.ResponseWriter, err error) {

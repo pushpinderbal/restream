@@ -94,7 +94,7 @@ function refreshState(state?: RefreshState) {
   if (!state) return "—";
   if (state.running) return "Running";
   if (state.queued) return "Queued";
-  if (state.paused) return "Paused";
+  if (state.paused) return state.nextRefreshAt ? "Waiting" : "Paused";
   if (state.error) return "Failed";
   return "Idle";
 }

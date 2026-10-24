@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pushpinderbal/restream/internal/model"
 )
 
 func historyRequest(t *testing.T, handler http.Handler, user *AuthUser, method, path string, body any) *httptest.ResponseRecorder {
@@ -114,6 +117,114 @@ func undoHistory(t *testing.T, handler http.Handler, user *AuthUser, scope, toke
 		t.Fatal(err)
 	}
 	return result
+}
+
+func TestWatchHistoryRefreshesDisplayArtworkFromCachedLibraryWithoutWrites(t *testing.T) {
+	s, err := New(Config{DataDir: t.TempDir(), WebDir: t.TempDir()}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p := &fixtureProvider{}
+	s.provider = p
+	scope := historySnapshotFor(t, s, nil).Scope
+	movies := []model.Item{}
+	expected := map[string]watchHistoryEntry{}
+	for _, scenario := range []struct {
+		id, storedImage string
+	}{
+		{"missing", ""},
+		{"expired-metadata", "/api/discovery/images/expired/poster"},
+		{"old-library", "/api/images/movie:old-library"},
+		{"versioned-library", "/api/images/movie:versioned-library?v=0123456789abcdef"},
+		{"current-metadata", "/api/discovery/images/current/poster?v=0123456789abcdef"},
+	} {
+		id := "movie:" + scenario.id
+		item := model.Item{ID: id, Kind: "movie", Name: "Current library name", Logo: "https://private.invalid/" + scenario.id + "?token=private", Command: "private-command"}
+		movies = append(movies, item)
+		body := historyRecordBody(scope, "movie", id, "")
+		title := body["title"].(historyItem)
+		title.Image = scenario.storedImage
+		body["title"], body["item"] = title, title
+		response := historyRequest(t, s, nil, "POST", "/api/watch-history/record", body)
+		var recorded struct {
+			Entry watchHistoryEntry `json:"entry"`
+		}
+		if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &recorded) != nil {
+			t.Fatalf("record artwork snapshot: %d %s", response.Code, response.Body)
+		}
+		entry := recorded.Entry
+		entry.Title.Image = publicItems([]model.Item{item})[0].Image
+		if scenario.id == "current-metadata" {
+			entry.Title.Image = scenario.storedImage
+		}
+		entry.Item.Image = entry.Title.Image
+		expected[id] = entry
+	}
+	if err := seedBrowsePage(s.cache, model.BrowseQuery{Kind: "movie", Category: "*", Page: 1}, model.BrowsePage{Items: movies, Page: 1}); err != nil {
+		t.Fatal(err)
+	}
+	live := model.Item{ID: "live:channel", Kind: "live", Name: "Channel", Logo: "https://private.invalid/live.jpg"}
+	if err := s.cache.setCatalog([]model.Item{live}); err != nil {
+		t.Fatal(err)
+	}
+	liveEntry := recordHistoryFor(t, s, nil, scope, "live", live.ID, "")
+	liveEntry.Title.Image = publicItems([]model.Item{live})[0].Image
+	liveEntry.Item.Image = liveEntry.Title.Image
+	expected[live.ID] = liveEntry
+	series := model.Item{ID: "series:show", Kind: "series", Name: "Show", Logo: "https://private.invalid/show.jpg"}
+	episode := model.Item{ID: "episode:show:1", Kind: "episode", Name: "Episode", Logo: "https://private.invalid/episode.jpg"}
+	if err := seedBrowsePage(s.cache, model.BrowseQuery{Kind: "series", Category: "*", Page: 1}, model.BrowsePage{Items: []model.Item{series}, Page: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.cache.setEpisodesAtRevision(series.ID, []model.Item{episode}, s.cache.libraryRevision()); err != nil {
+		t.Fatal(err)
+	}
+	seriesEntry := recordHistoryFor(t, s, nil, scope, "series", series.ID, episode.ID)
+	seriesEntry.Title.Image = publicItems([]model.Item{series})[0].Image
+	seriesEntry.Item.Image = publicItems([]model.Item{episode})[0].Image
+	expected[series.ID] = seriesEntry
+	s.discoveryService.mu.Lock()
+	s.discoveryService.record.Assets = map[string]discoveryAsset{"current": {ItemID: "movie:current-metadata", Poster: "/poster.jpg"}}
+	s.discoveryService.mu.Unlock()
+	before, err := readWatchHistory(s.cache.db, scope, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var changesBefore, changesAfter int64
+	if err := s.cache.db.QueryRow(`SELECT total_changes()`).Scan(&changesBefore); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		got := historySnapshotFor(t, s, nil)
+		if len(got.Entries) != len(expected) {
+			t.Fatalf("history entries changed: %+v", got)
+		}
+		for _, entry := range got.Entries {
+			if !reflect.DeepEqual(entry, expected[entry.Title.ID]) {
+				t.Fatalf("display repair altered playback metadata: got=%+v want=%+v", entry, expected[entry.Title.ID])
+			}
+		}
+		encoded, _ := json.Marshal(got)
+		if strings.Contains(string(encoded), "private") {
+			t.Fatal("history exposed provider artwork credentials")
+		}
+	}
+	after, err := readWatchHistory(s.cache.db, scope, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.cache.db.QueryRow(`SELECT total_changes()`).Scan(&changesAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) || changesAfter != changesBefore {
+		t.Fatal("history display read wrote to storage")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.catalogs+p.epgs+p.episodeCalls+p.browseCalls+p.categoryCalls != 0 {
+		t.Fatal("history display read requested provider metadata")
+	}
 }
 
 func TestWatchHistoryRuntimePersistenceAndProviderIsolation(t *testing.T) {
@@ -307,6 +418,15 @@ func TestWatchHistoryRejectsInvalidPayloadsAndReportsStorageFailure(t *testing.T
 		}
 		if strings.Contains(got.Body.String(), "secret") {
 			t.Fatal("validation leaked submitted secrets")
+		}
+	}
+	for _, image := range []string{"/api/images/movie:1?token=secret", "/api/images/movie:1?v=0123456789ABCDEF", "/api/images/movie:1?v=0123456789abcdef&extra=1", "/api/images/movie:1#fragment", "/api/images/movie:1\\secret", "/api/images/movie:1\r\nsecret", "/api/images/movie:1/path", "/api/discovery/images/id/arbitrary"} {
+		body := historyRecordBody(scope, "movie", "movie:1", "")
+		title := body["title"].(historyItem)
+		title.Image = image
+		body["title"] = title
+		if got := historyRequest(t, s, nil, "POST", "/api/watch-history/record", body); got.Code != 400 {
+			t.Fatalf("noncanonical artwork accepted: %q status=%d", image, got.Code)
 		}
 	}
 	for _, timestamp := range []int64{0, -1, time.Now().Add(time.Hour).UnixMilli()} {

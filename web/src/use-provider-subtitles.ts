@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
-import { request, type Session, type SubtitleTrack } from "./api";
+import { ApiError, request, type Session, type SubtitleTrack } from "./api";
 
 type Preference = { language?: string; label: string } | null;
 type Cue = { start: number; end: number; text: string };
@@ -244,6 +244,14 @@ export function useProviderSubtitles(
   const [embedded, setEmbedded] = useState<EmbeddedTrack[]>([]);
   const [explicit, setExplicit] = useState<{ url: string; id: string }>();
   const providerElement = useRef<HTMLTrackElement | null>(null);
+  const recovery = useRef({
+    key: "",
+    attempts: 0,
+    deadline: 0,
+    nextAt: 0,
+    stopped: false,
+  });
+  const cooldown = useRef({ key: "", until: 0 });
   const providerTracks = session?.subtitles || [];
   const tracks = [
     ...providerTracks,
@@ -454,11 +462,36 @@ export function useProviderSubtitles(
     let controller: AbortController | undefined;
     let loadedBucket = -1;
     let pendingBucket = -1;
-    let retryAfter = 0;
+    let retryTimer: number | undefined;
     let disposed = false;
+    // Seeking may detach and reattach this effect; only a new session, chosen
+    // track, or explicit CC retry starts another failed-subtitle recovery.
+    const key = `${session?.id}:${provider.id}:${attempt}`;
+    const cooldownKey = `${session?.id}:${provider.id}`;
+    if (cooldown.current.key !== cooldownKey)
+      cooldown.current = { key: cooldownKey, until: 0 };
+    if (recovery.current.key !== key) {
+      const nextAt = Math.max(0, cooldown.current.until);
+      const deadline = nextAt > Date.now() ? Date.now() + 30000 : 0;
+      recovery.current = {
+        key,
+        attempts: 0,
+        deadline,
+        nextAt,
+        stopped: !!deadline && nextAt >= deadline,
+      };
+    }
+    const budget = recovery.current;
+    if (budget.stopped) setStatus("error");
 
     const load = () => {
-      if (disposed || element.readyState === 0) return;
+      if (disposed || element.readyState === 0 || budget.stopped) return;
+      if (budget.deadline && Date.now() >= budget.deadline) {
+        budget.stopped = true;
+        setFailedProvider(provider.url);
+        setStatus("error");
+        return;
+      }
       const absolute = Math.max(0, offset + element.currentTime);
       const bucket = Math.floor(absolute / 30) * 30;
       // Retain a small window of cues, including when pausing or seeking locally.
@@ -473,20 +506,33 @@ export function useProviderSubtitles(
       }
       if (
         bucket === loadedBucket ||
-        bucket === pendingBucket ||
-        Date.now() < retryAfter
+        pendingBucket !== -1 ||
+        Date.now() < budget.nextAt
       )
         return;
+      if (!budget.deadline) budget.deadline = Date.now() + 30000;
+      if (budget.attempts >= 3) {
+        budget.stopped = true;
+        setStatus("error");
+        return;
+      }
+      budget.attempts++;
+      window.clearTimeout(retryTimer);
       controller?.abort();
       const current = new AbortController();
       controller = current;
       pendingBucket = bucket;
       setStatus("loading");
       void request<{ cues: Cue[] }>(`${provider.url}?start=${bucket}`, {
-        signal: current.signal,
+        signal: AbortSignal.any([
+          current.signal,
+          AbortSignal.timeout(Math.max(1, budget.deadline - Date.now())),
+        ]),
       })
         .then((response) => {
           if (disposed || current.signal.aborted) return;
+          if (Date.now() >= budget.deadline)
+            throw new Error("Subtitle recovery timed out");
           for (const cue of response.cues) {
             if (
               !Number.isFinite(cue.start) ||
@@ -507,14 +553,27 @@ export function useProviderSubtitles(
           }
           positionCues();
           loadedBucket = bucket;
+          budget.attempts = 0;
+          budget.deadline = 0;
+          budget.nextAt = 0;
           setFailedProvider(undefined);
           setStatus("ready");
         })
-        .catch(() => {
+        .catch((cause) => {
           if (!disposed && !current.signal.aborted) {
-            retryAfter = Date.now() + 5000;
+            const retryAfter =
+              cause instanceof ApiError ? cause.retryAfterMs : 0;
+            cooldown.current.until = Math.max(
+              cooldown.current.until,
+              Date.now() + retryAfter,
+            );
+            const delay = Math.max(5000, retryAfter);
+            budget.nextAt = Date.now() + delay;
+            budget.stopped =
+              budget.attempts >= 3 || budget.nextAt >= budget.deadline;
             setFailedProvider(provider.url);
             setStatus("error");
+            if (!budget.stopped) retryTimer = window.setTimeout(load, delay);
           }
         })
         .finally(() => {
@@ -529,12 +588,13 @@ export function useProviderSubtitles(
     element.addEventListener("timeupdate", load);
     element.addEventListener("seeked", load);
     element.addEventListener("loadedmetadata", metadataLoaded);
-    const retry = window.setInterval(load, 5000);
+    if (!budget.stopped && budget.nextAt > Date.now())
+      retryTimer = window.setTimeout(load, budget.nextAt - Date.now());
     load();
     return () => {
       disposed = true;
       controller?.abort();
-      clearInterval(retry);
+      window.clearTimeout(retryTimer);
       resize.disconnect();
       visibility.disconnect();
       element.removeEventListener("timeupdate", load);

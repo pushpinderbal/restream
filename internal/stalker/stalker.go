@@ -13,6 +13,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"path"
 	"regexp"
@@ -22,6 +23,7 @@ import (
 	"unicode"
 
 	"github.com/pushpinderbal/restream/internal/model"
+	"golang.org/x/net/publicsuffix"
 )
 
 type Config struct {
@@ -44,6 +46,7 @@ type Client struct {
 	epgIDs          map[string]string
 	discovery       *url.URL
 	nextRequest     time.Time
+	cooldownUntil   time.Time
 	currentInterval time.Duration
 	successStreak   int
 	retryBackoff    func(int) time.Duration
@@ -85,6 +88,9 @@ func (c *Client) ConfigureCooldown(until time.Time, save func(time.Time) error) 
 	if until.After(c.nextRequest) {
 		c.nextRequest = until
 	}
+	if until.After(c.cooldownUntil) {
+		c.cooldownUntil = until
+	}
 	c.saveCooldown = save
 }
 
@@ -94,6 +100,13 @@ type PermanentError struct{ Message string }
 
 func (e *PermanentError) Error() string   { return e.Message }
 func (e *PermanentError) Permanent() bool { return true }
+
+// AuthenticationError reports a rejected or expired portal session after the
+// client's bounded authentication attempt. A caller may recover later, within
+// its own attempt and elapsed-time limits; it is not a configuration diagnosis.
+type AuthenticationError struct{ Message string }
+
+func (e *AuthenticationError) Error() string { return e.Message }
 
 type portalHTTPError struct {
 	action string
@@ -114,7 +127,7 @@ func (e *portalHTTPError) Error() string {
 
 func (e *portalHTTPError) Permanent() bool {
 	switch e.status {
-	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone, http.StatusUnprocessableEntity:
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone, http.StatusUnprocessableEntity:
 		return true
 	}
 	return false
@@ -185,10 +198,13 @@ func New(cfg Config) (*Client, error) {
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = defaultUA
 	}
-	h := cfg.HTTPClient
-	if h == nil {
-		h = &http.Client{Timeout: cfg.RequestTimeout}
+	h := &http.Client{Timeout: cfg.RequestTimeout}
+	if cfg.HTTPClient != nil {
+		*h = *cfg.HTTPClient
 	}
+	// Keep each MAG session's affinity cookies isolated, including when callers
+	// reuse an HTTP client. The standard jar enforces domain/path/secure scope.
+	h.Jar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	c := &Client{cfg: cfg, endpoint: u, http: h, loc: loc, mu: newRequestGate(), currentInterval: cfg.RequestInterval, retryBackoff: jitterBackoff}
 	if rootURL.Path == "" || rootURL.Path == "/" {
 		c.discovery = &rootURL
@@ -197,6 +213,8 @@ func New(cfg Config) (*Client, error) {
 }
 
 func (c *Client) request(ctx context.Context, typ, action string, q url.Values) (json.RawMessage, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.RequestTimeout)
+	defer cancel()
 	if e := c.lock(ctx); e != nil {
 		return nil, e
 	}
@@ -222,13 +240,15 @@ func (c *Client) request(ctx context.Context, typ, action string, q url.Values) 
 		return nil, e
 	}
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		return nil, &PermanentError{Message: fmt.Sprintf("portal %s/%s authorization failed", typ, action)}
+		c.token = ""
+		return nil, &AuthenticationError{Message: fmt.Sprintf("portal %s/%s authorization failed", typ, action)}
 	}
 	if status < 200 || status >= 300 {
 		return nil, &portalHTTPError{action: action, status: status}
 	}
 	if invalidResponse(js) {
-		return nil, &PermanentError{Message: fmt.Sprintf("portal %s/%s authorization expired", typ, action)}
+		c.token = ""
+		return nil, &AuthenticationError{Message: fmt.Sprintf("portal %s/%s authorization expired", typ, action)}
 	}
 	return js, nil
 }
@@ -239,6 +259,10 @@ func nullOrFalse(js json.RawMessage) bool {
 }
 
 func (c *Client) lock(ctx context.Context) error {
+	// Metadata snapshots share the request gate too. Bound their queue time
+	// even when the caller did not supply a deadline of its own.
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.RequestTimeout)
+	defer cancel()
 	return c.mu.acquire(ctx)
 }
 
@@ -256,7 +280,7 @@ func (c *Client) login(ctx context.Context) error {
 	}
 	if status < 200 || status >= 300 {
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {
-			return &PermanentError{Message: "portal handshake authorization failed"}
+			return &AuthenticationError{Message: "portal handshake authorization failed"}
 		}
 		return &portalHTTPError{action: "handshake", status: status}
 	}
@@ -266,7 +290,7 @@ func (c *Client) login(ctx context.Context) error {
 	}
 	token := str(v, "token")
 	if token == "" {
-		return &PermanentError{Message: "portal handshake returned no token"}
+		return &AuthenticationError{Message: "portal handshake returned no token"}
 	}
 	q = url.Values{"hd": {"1"}, "stb_type": {"MAG250"}, "auth_second_step": {"1"}, "sn": {c.cfg.SerialNumber}, "device_id": {c.cfg.DeviceID}, "device_id2": {c.cfg.DeviceID2}}
 	profile, status, e := c.call(ctx, "stb", "get_profile", q, token)
@@ -274,7 +298,7 @@ func (c *Client) login(ctx context.Context) error {
 		return e
 	}
 	if status == http.StatusUnauthorized || status == http.StatusForbidden || (status >= 200 && status < 300 && invalidToken(profile)) {
-		return &PermanentError{Message: "portal stb/get_profile authorization failed"}
+		return &AuthenticationError{Message: "portal stb/get_profile authorization failed"}
 	}
 	if status < 200 || status >= 300 {
 		return &portalHTTPError{action: "get_profile", status: status}
@@ -307,12 +331,12 @@ func (c *Client) discover(ctx context.Context) error {
 			break
 		}
 		next, e := final.Parse(resp.Header.Get("Location"))
-		if e != nil || next.Host != target.Host || (next.Scheme != "http" && next.Scheme != "https") {
+		if e != nil || !strings.EqualFold(next.Host, target.Host) || (next.Scheme != "http" && next.Scheme != "https") || next.User != nil {
 			break
 		}
 		final = next
 	}
-	if final.Host != target.Host {
+	if !strings.EqualFold(final.Host, target.Host) {
 		return nil
 	}
 	p := strings.TrimRight(final.Path, "/")
@@ -344,7 +368,7 @@ func (c *Client) call(ctx context.Context, typ, action string, q url.Values, tok
 	req.Header.Set("User-Agent", c.cfg.UserAgent)
 	req.Header.Set("X-User-Agent", "Model: MAG250; Link: Ethernet")
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Cookie", "mac="+url.QueryEscape(c.cfg.MAC)+"; stb_lang=en; timezone="+url.QueryEscape(c.cfg.Timezone)+"; sn="+url.QueryEscape(c.cfg.SerialNumber))
+	req.Header.Set("Cookie", c.identityCookies())
 	req.Header.Set("Referer", c.endpoint.Scheme+"://"+c.endpoint.Host+"/")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -356,6 +380,9 @@ func (c *Client) call(ctx context.Context, typ, action string, q url.Values, tok
 	defer resp.Body.Close()
 	b, e := io.ReadAll(io.LimitReader(resp.Body, c.cfg.MaxResponseBytes+1))
 	if e != nil {
+		if ctx.Err() != nil {
+			return nil, resp.StatusCode, ctx.Err()
+		}
 		return nil, resp.StatusCode, fmt.Errorf("portal %s response failed", action)
 	}
 	if int64(len(b)) > c.cfg.MaxResponseBytes {
@@ -382,6 +409,7 @@ func (c *Client) doRateLimited(ctx context.Context, req *http.Request, action st
 	boundedClient := *h
 	boundedClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	requestType := req.URL.Query().Get("type")
+	readOnly := strings.HasPrefix(action, "get_")
 	requestAttrs := []any{"type", requestType, "action", action}
 	if action == "get_ordered_list" {
 		if page, e := strconv.Atoi(req.URL.Query().Get("p")); e == nil && page >= 0 {
@@ -389,50 +417,87 @@ func (c *Client) doRateLimited(ctx context.Context, req *http.Request, action st
 		}
 	}
 	for attempt := 0; attempt <= 3; attempt++ {
+		if e := ctx.Err(); e != nil {
+			return nil, e
+		}
+		// A saved Retry-After may be much longer than this operation's budget.
+		// Return it to the caller without sleeping until the request times out.
+		if deadline, ok := ctx.Deadline(); ok && c.cooldownUntil.After(deadline) {
+			return nil, &RateLimitError{Action: action, RetryAfter: time.Until(c.cooldownUntil)}
+		}
 		if e := c.waitRequest(ctx); e != nil {
 			return nil, e
 		}
-		resp, e := boundedClient.Do(req)
+		// Client.Do adds jar cookies to the request. Clone each attempt so a 429
+		// retry uses the latest jar state without duplicating stale cookies.
+		resp, e := boundedClient.Do(req.Clone(ctx))
 		if e != nil {
 			c.successStreak = 0
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			if readOnly && attempt < 3 {
+				c.nextRequest = maxTime(c.nextRequest, time.Now().Add(c.retryBackoff(attempt)))
+				continue
+			}
 			return nil, fmt.Errorf("portal %s request failed", action)
 		}
-		if resp.StatusCode != http.StatusTooManyRequests {
+		coolingDown := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable && strings.TrimSpace(resp.Header.Get("Retry-After")) != ""
+		if !coolingDown && readOnly && attempt < 3 && (resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) {
+			_ = resp.Body.Close()
+			c.successStreak = 0
+			c.nextRequest = maxTime(c.nextRequest, time.Now().Add(c.retryBackoff(attempt)))
+			continue
+		}
+		if !coolingDown {
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				c.recordSuccess()
 			} else {
 				c.successStreak = 0
 			}
 			if attempt > 0 && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				slog.Debug("Portal request resumed after rate limit", append(requestAttrs, "attempts", attempt+1)...)
+				slog.Debug("Portal request resumed after transient failure", append(requestAttrs, "attempts", attempt+1)...)
 			}
 			return resp, nil
 		}
 		_ = resp.Body.Close()
-		c.increaseInterval()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			c.increaseInterval()
+		} else {
+			c.successStreak = 0
+		}
 		delay := c.retryDelay(resp.Header.Get("Retry-After"), attempt)
 		until := time.Now().Add(max(delay, c.currentInterval))
 		if until.After(c.nextRequest) {
 			c.nextRequest = until
 		}
+		c.cooldownUntil = c.nextRequest
 		message := "Portal rate limited; retrying same request"
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			message = "Portal temporarily unavailable; honoring retry cooldown"
+		}
 		if attempt == 3 {
 			message = "Portal retry budget exhausted"
 		}
-		slog.Warn(message, append(requestAttrs, "attempt", attempt+1, "max_attempts", 4, "retry_delay", delay, "request_interval", c.currentInterval, "cooldown_until", c.nextRequest.UTC(), "retry_same_page", attempt < 3)...)
+		retry := attempt < 3 && (readOnly || resp.StatusCode == http.StatusTooManyRequests)
+		slog.Warn(message, append(requestAttrs, "http_status", resp.StatusCode, "attempt", attempt+1, "max_attempts", 4, "retry_delay", delay, "request_interval", c.currentInterval, "cooldown_until", c.nextRequest.UTC(), "retry_same_page", retry)...)
 		if c.saveCooldown != nil {
 			if e := c.saveCooldown(c.nextRequest); e != nil {
 				return nil, errors.New("portal cooldown could not be saved")
 			}
 		}
-		if attempt == 3 {
+		if !retry {
 			return nil, &RateLimitError{Action: action, RetryAfter: time.Until(c.nextRequest)}
 		}
 	}
 	return nil, errors.New("portal retry limit exceeded")
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 // The request gate also guards the adaptive interval and streak.
@@ -1560,18 +1625,31 @@ func (c *Client) Resolve(ctx context.Context, it model.Item) (model.Source, erro
 func (c *Client) playbackHeaders(ctx context.Context, u *url.URL) (map[string]string, error) {
 	headers := map[string]string{"User-Agent": c.cfg.UserAgent, "Referer": c.endpoint.Scheme + "://" + c.endpoint.Host + "/"}
 	// Playback endpoints on the same portal often require the MAG identity.
-	if strings.EqualFold(u.Host, c.endpoint.Host) {
+	if sameOrigin(u, c.endpoint) {
 		if e := c.lock(ctx); e != nil {
 			return nil, e
 		}
+		defer c.mu.release()
 		token := c.token
-		c.mu.release()
-		headers["Cookie"] = "mac=" + url.QueryEscape(c.cfg.MAC) + "; stb_lang=en; timezone=" + url.QueryEscape(c.cfg.Timezone)
+		cookieRequest := &http.Request{Header: make(http.Header)}
+		cookieRequest.Header.Set("Cookie", c.identityCookies())
+		for _, cookie := range c.http.Jar.Cookies(u) {
+			cookieRequest.AddCookie(cookie)
+		}
+		headers["Cookie"] = cookieRequest.Header.Get("Cookie")
 		if token != "" {
 			headers["Authorization"] = "Bearer " + token
 		}
 	}
 	return headers, nil
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+}
+
+func (c *Client) identityCookies() string {
+	return "mac=" + url.QueryEscape(c.cfg.MAC) + "; stb_lang=en; timezone=" + url.QueryEscape(c.cfg.Timezone) + "; sn=" + url.QueryEscape(c.cfg.SerialNumber)
 }
 
 // A VOD catalog row can be a movie shell whose command names the movie ID.
