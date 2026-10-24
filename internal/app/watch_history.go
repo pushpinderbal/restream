@@ -9,11 +9,16 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
+
+	"github.com/pushpinderbal/restream/internal/model"
 )
 
 const historyUndoLifetime = 5 * time.Minute
+
+var historyImagePathRE = regexp.MustCompile(`^/api/(?:images/[^/?#\\\s]+|discovery/images/[^/?#\\\s]+/(?:poster|backdrop))(?:\?v=[0-9a-f]{16})?$`)
 
 // History deliberately stores a display-only whitelist, never provider commands,
 // stream URLs, credentials, or sessions.
@@ -72,7 +77,7 @@ func validHistoryID(id string) bool {
 	return strings.TrimSpace(id) != "" && len(id) <= 1024 && !strings.ContainsRune(id, '\x00')
 }
 func (i historyItem) valid() bool {
-	imageValid := i.Image == "" || ((strings.HasPrefix(i.Image, "/api/images/") || strings.HasPrefix(i.Image, "/api/discovery/images/")) && !strings.ContainsAny(i.Image, "?#\\\r\n"))
+	imageValid := i.Image == "" || historyImagePathRE.MatchString(i.Image)
 	return validHistoryID(i.ID) && (validHistoryKind(i.Kind) || i.Kind == "episode") && strings.TrimSpace(i.Name) != "" && len(i.Name) <= 4096 && len(i.Category) <= 4096 && len(i.CategoryID) <= 1024 && len(i.Image) <= 4096 && i.Season >= 0 && i.Episode >= 0 && imageValid
 }
 func validHistoryNumber(n float64) bool {
@@ -129,6 +134,26 @@ func readWatchHistory(q historyQuerier, scope, userID string) (historySnapshot, 
 	return result, rows.Err()
 }
 
+func (s *Server) historyDisplayImage(display *historyItem) {
+	item, known := s.cache.item(display.ID)
+	if !known || item.Kind != display.Kind {
+		return
+	}
+	if strings.HasPrefix(display.Image, "/api/discovery/images/") {
+		path, _, _ := strings.Cut(display.Image, "?")
+		id, imageType, ok := strings.Cut(strings.TrimPrefix(path, "/api/discovery/images/"), "/")
+		s.discoveryService.mu.Lock()
+		asset, exists := s.discoveryService.record.Assets[id]
+		s.discoveryService.mu.Unlock()
+		if ok && exists && asset.ItemID == item.ID && (imageType == "poster" && asset.Poster != "" || imageType == "backdrop" && asset.Backdrop != "") {
+			return
+		}
+	}
+	// History is a snapshot of playback, but its display image can follow the
+	// current cached library without fetching or rewriting the saved entry.
+	display.Image = publicItems([]model.Item{item})[0].Image
+}
+
 func (s *Server) watchHistory(w http.ResponseWriter, r *http.Request) {
 	scope := s.historyScope(r)
 	if scope == "" {
@@ -140,6 +165,10 @@ func (s *Server) watchHistory(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			fail(w, 500, "history_storage", "Unable to load watch history.")
 			return
+		}
+		for i := range result.Entries {
+			s.historyDisplayImage(&result.Entries[i].Title)
+			s.historyDisplayImage(&result.Entries[i].Item)
 		}
 		respond(w, 200, result)
 		return

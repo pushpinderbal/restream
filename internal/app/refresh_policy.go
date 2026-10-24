@@ -6,7 +6,17 @@ import (
 	"time"
 )
 
-const refreshAttemptTimeout = 5 * time.Minute
+const (
+	refreshAttemptTimeout = 5 * time.Minute
+	recoveryAttemptLimit  = 3
+	recoveryElapsedLimit  = 5 * time.Minute
+	discoveryElapsedLimit = 30 * time.Minute
+)
+
+// Recovery never renews itself from a read, focus event, or process restart.
+func recoveryExhausted(failures int, started time.Time, attempts int, elapsed time.Duration) bool {
+	return failures >= attempts || !started.IsZero() && time.Since(started) >= elapsed
+}
 
 // Jitter spreads recovery work across instances. A provider's Retry-After is
 // always a floor, even when it exceeds our ordinary backoff cap.

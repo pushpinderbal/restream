@@ -1,10 +1,13 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +20,92 @@ import (
 
 	"github.com/pushpinderbal/restream/internal/model"
 )
+
+func TestDiscoveryArtworkFallsBackToLibraryAndPreservesCachedMetadata(t *testing.T) {
+	var jpegData bytes.Buffer
+	if err := jpeg.Encode(&jpegData, image.NewRGBA(image.Rect(0, 0, 1, 1)), nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []struct {
+		name            string
+		invalidTMDB     bool
+		missingLibrary  bool
+		staleTMDB       bool
+		invalidateAsset bool
+	}{
+		{name: "failed metadata uses library"},
+		{name: "invalid metadata uses library", invalidTMDB: true},
+		{name: "both unavailable use placeholder", missingLibrary: true},
+		{name: "stale metadata survives failure", staleTMDB: true},
+		{name: "removed asset stays unavailable during library fallback", invalidateAsset: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			s, ts := discoveryTestServer(t, Config{}, &fixtureProvider{})
+			item := model.Item{ID: "movie:1", Kind: "movie", Name: "Film", Logo: "https://library.invalid/poster.jpg"}
+			if err := seedBrowsePage(s.cache, model.BrowseQuery{Kind: "movie", Category: "*", Page: 1}, model.BrowsePage{Items: []model.Item{item}, Page: 1}); err != nil {
+				t.Fatal(err)
+			}
+			s.discoveryService.mu.Lock()
+			s.discoveryService.record.Assets = map[string]discoveryAsset{"poster": {ItemID: item.ID, Poster: "/poster.jpg"}}
+			s.discoveryService.mu.Unlock()
+			var tmdbCalls, libraryCalls atomic.Int32
+			s.artwork.client.Transport = discoveryTransport(func(r *http.Request) (*http.Response, error) {
+				if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" || r.Header.Get("X-MAC") != "" {
+					t.Error("artwork download included private provider headers")
+				}
+				status, body := http.StatusServiceUnavailable, []byte("unavailable")
+				if r.URL.Host == "image.tmdb.org" {
+					tmdbCalls.Add(1)
+					if scenario.invalidTMDB {
+						status, body = http.StatusOK, []byte("<html>not artwork</html>")
+					}
+				} else if r.URL.String() == item.Logo {
+					libraryCalls.Add(1)
+					if scenario.invalidateAsset {
+						s.discoveryService.mu.Lock()
+						delete(s.discoveryService.record.Assets, "poster")
+						s.discoveryService.mu.Unlock()
+					}
+					if !scenario.missingLibrary {
+						status, body = http.StatusOK, jpegData.Bytes()
+					}
+				} else {
+					t.Errorf("unexpected artwork URL: %s", r.URL)
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(body)), Request: r}, nil
+			})
+			wantBody, wantMIME := jpegData.String(), "image/jpeg"
+			if scenario.missingLibrary {
+				wantBody, wantMIME = defaultArtwork, "image/svg+xml"
+			}
+			if scenario.staleTMDB {
+				wantBody, wantMIME = string(artworkPixel(t)), "image/gif"
+				if err := s.artwork.save("https://image.tmdb.org/t/p/w500/poster.jpg", artworkEntry{image: imageData{data: []byte(wantBody), mime: wantMIME}, validated: time.Now().Add(-31 * 24 * time.Hour)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for range 2 {
+				got := getArtwork(t, ts.URL+"/api/discovery/images/poster/poster")
+				if scenario.invalidateAsset {
+					if got.status != 404 {
+						t.Fatalf("removed asset returned artwork: status=%d", got.status)
+					}
+					continue
+				}
+				if got.status != 200 || got.mime != wantMIME || got.body != wantBody || got.cache != "private, max-age=300" {
+					t.Fatalf("unexpected discovery artwork: status=%d mime=%s cache=%s", got.status, got.mime, got.cache)
+				}
+			}
+			wantLibraryCalls := int32(1)
+			if scenario.staleTMDB {
+				wantLibraryCalls = 0
+			}
+			if tmdbCalls.Load() != 1 || libraryCalls.Load() != wantLibraryCalls {
+				t.Fatalf("cache ignored: metadata requests=%d library requests=%d", tmdbCalls.Load(), libraryCalls.Load())
+			}
+		})
+	}
+}
 
 func TestArtworkFallbackSharedFailureAndRecovery(t *testing.T) {
 	pixel, err := base64.StdEncoding.DecodeString("R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=")

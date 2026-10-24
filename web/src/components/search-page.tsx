@@ -94,6 +94,9 @@ export function SearchPage({
     controllers.current.clear();
     pages.current.clear();
   }, []);
+  const pageRequests = useRef(
+    new Map<string, { page: number; refreshRange: boolean }>(),
+  );
   const loadPage = useCallback(
     (
       kind: "movie" | "series",
@@ -101,7 +104,14 @@ export function SearchPage({
       query: string,
       run: number,
       refreshRange = false,
+      retry = false,
     ) => {
+      const failed = pageRequests.current.get(kind);
+      if (retry && failed) {
+        page = failed.page;
+        refreshRange = failed.refreshRange;
+      }
+      pageRequests.current.set(kind, { page, refreshRange });
       const controller = new AbortController();
       controllers.current.get(kind)?.abort();
       controllers.current.set(kind, controller);
@@ -143,6 +153,7 @@ export function SearchPage({
           }));
         },
         refreshRange,
+        retry,
       )
         .catch((cause: unknown) => {
           update((previous) => ({
@@ -235,10 +246,6 @@ export function SearchPage({
       {showResults &&
         sections.map(({ kind, label, action }) => {
           const result = state.results[kind];
-          const nextPage = () => {
-            if (kind !== "live")
-              loadPage(kind, result.page + 1, value.trim(), generation.current);
-          };
           const items = result.items.filter(isVisible);
           const selectedIndex = items.findIndex(
             (item) => item.id === selectedId,
@@ -325,7 +332,16 @@ export function SearchPage({
                     aria-label={`Retry ${action}`}
                     loading={result.loading}
                     loadingLabel="Retrying…"
-                    onClick={nextPage}
+                    onClick={() =>
+                      loadPage(
+                        kind as "movie" | "series",
+                        result.page + 1,
+                        value.trim(),
+                        generation.current,
+                        false,
+                        true,
+                      )
+                    }
                   >
                     Retry
                   </LoadingButton>

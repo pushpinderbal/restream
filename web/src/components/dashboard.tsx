@@ -650,7 +650,9 @@ export function Dashboard({
               >
                 {continueWatching.map((entry) => {
                   const metadata = featureCandidates.find(
-                    (title) => title.item.id === entry.title.id,
+                    (title) =>
+                      title.item.id === entry.title.id &&
+                      title.item.kind === entry.title.kind,
                   );
                   const remaining =
                     entry.duration && entry.position
@@ -671,8 +673,16 @@ export function Dashboard({
                         <Artwork
                           item={{
                             ...entry.title,
-                            image: metadata?.backdrop || entry.title.image,
+                            image:
+                              metadata?.backdrop ||
+                              metadata?.poster ||
+                              entry.title.image,
                           }}
+                          fallbackImage={
+                            entry.title.image?.startsWith("/api/images/")
+                              ? entry.title.image
+                              : `/api/images/${encodeURIComponent(entry.title.id)}`
+                          }
                         />
                         <span className="discovery-resume-symbol">
                           <Play
@@ -852,71 +862,91 @@ export function Dashboard({
                 label="Recently played"
                 className="discovery-recent-grid"
               >
-                {recent.map((entry) => (
-                  <div
-                    key={entry.title.id}
-                    className={`discovery-recent-card${entry.title.kind === "live" ? " is-live" : ""}`}
-                  >
-                    <button
-                      type="button"
-                      className="discovery-recent-open"
-                      aria-label={`Open ${entry.title.name}`}
-                      disabled={!configured || opening === entry.title.id}
-                      onClick={() => void open(entry)}
+                {recent.map((entry) => {
+                  const metadata = featureCandidates.find(
+                    (title) =>
+                      title.item.id === entry.title.id &&
+                      title.item.kind === entry.title.kind,
+                  );
+                  return (
+                    <div
+                      key={entry.title.id}
+                      className={`discovery-recent-card${entry.title.kind === "live" ? " is-live" : ""}`}
                     >
-                      <div className="discovery-recent-art">
-                        <Artwork item={entry.title} />
-                      </div>
-                      <div className="discovery-recent-copy">
-                        <span>
-                          {entry.title.kind === "live"
-                            ? "Live TV"
-                            : entry.title.kind === "series"
-                              ? episodeLabel(entry.item)
-                              : "Movie"}
-                        </span>
-                        <h3>{entry.title.name}</h3>
-                        {entry.title.kind === "series" && (
-                          <p>{entry.item.name}</p>
-                        )}
-                        <time
-                          dateTime={new Date(entry.watchedAt).toISOString()}
-                        >
-                          {new Date(entry.watchedAt).toLocaleDateString(
-                            undefined,
-                            { month: "short", day: "numeric" },
-                          )}
-                        </time>
-                        {opening === entry.title.id && (
-                          <span
-                            className="discovery-opening"
-                            role="status"
-                            aria-label="Opening title"
-                          >
-                            <Spinner size="small" className="app-spinner" />
+                      <button
+                        type="button"
+                        className="discovery-recent-open"
+                        aria-label={`Open ${entry.title.name}`}
+                        disabled={!configured || opening === entry.title.id}
+                        onClick={() => void open(entry)}
+                      >
+                        <div className="discovery-recent-art">
+                          <Artwork
+                            item={{
+                              ...entry.title,
+                              image:
+                                metadata?.poster ||
+                                metadata?.backdrop ||
+                                entry.title.image,
+                            }}
+                            fallbackImage={
+                              entry.title.image?.startsWith("/api/images/")
+                                ? entry.title.image
+                                : `/api/images/${encodeURIComponent(entry.title.id)}`
+                            }
+                          />
+                        </div>
+                        <div className="discovery-recent-copy">
+                          <span>
+                            {entry.title.kind === "live"
+                              ? "Live TV"
+                              : entry.title.kind === "series"
+                                ? episodeLabel(entry.item)
+                                : "Movie"}
                           </span>
-                        )}
-                      </div>
-                    </button>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      className="discovery-remove"
-                      aria-label={`Remove ${entry.title.name} from history`}
-                      onClick={() => {
-                        if (opening === entry.title.id) {
-                          pending.current?.abort();
-                          operation.current++;
-                          setOpening("");
-                        }
-                        setError("");
-                        onRemove(entry);
-                      }}
-                    >
-                      <X size={13} aria-hidden="true" />
-                    </Button>
-                  </div>
-                ))}
+                          <h3>{entry.title.name}</h3>
+                          {entry.title.kind === "series" && (
+                            <p>{entry.item.name}</p>
+                          )}
+                          <time
+                            dateTime={new Date(entry.watchedAt).toISOString()}
+                          >
+                            {new Date(entry.watchedAt).toLocaleDateString(
+                              undefined,
+                              { month: "short", day: "numeric" },
+                            )}
+                          </time>
+                          {opening === entry.title.id && (
+                            <span
+                              className="discovery-opening"
+                              role="status"
+                              aria-label="Opening title"
+                            >
+                              <Spinner size="small" className="app-spinner" />
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        className="discovery-remove"
+                        aria-label={`Remove ${entry.title.name} from history`}
+                        onClick={() => {
+                          if (opening === entry.title.id) {
+                            pending.current?.abort();
+                            operation.current++;
+                            setOpening("");
+                          }
+                          setError("");
+                          onRemove(entry);
+                        }}
+                      >
+                        <X size={13} aria-hidden="true" />
+                      </Button>
+                    </div>
+                  );
+                })}
               </ContentRail>
               {recent.length === 0 && (
                 <p className="discovery-side-empty">No history</p>

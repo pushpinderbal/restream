@@ -61,6 +61,12 @@ export type BrowsePage = {
   revision?: number;
   stale?: boolean;
   refreshing?: boolean;
+  retryStopped?: boolean;
+  refreshError?: string;
+  refreshAfterSeconds?: number;
+  // The last requested range is retained locally for a targeted manual reset.
+  retryPage?: number;
+  retryThrough?: number;
 };
 export type DiscoveryTitle = {
   tmdbId?: number;
@@ -150,6 +156,8 @@ export type Session = {
   offset: number;
   playbackRate?: number;
   error?: string;
+  retryable?: boolean;
+  retryAfterSeconds?: number;
   subtitles?: SubtitleTrack[];
   subtitleOffset?: number;
 };
@@ -169,13 +177,31 @@ export class ApiError extends Error {
     message: string,
     public status: number,
     public code?: string,
+    public retryAfterMs = 0,
   ) {
     super(message);
   }
 }
 
+function retryAfterMilliseconds(value: string | null) {
+  if (!value) return 0;
+  const seconds = Number(value);
+  return (
+    Math.max(
+      0,
+      Number.isFinite(seconds)
+        ? seconds * 1000
+        : Date.parse(value) - Date.now(),
+    ) || 0
+  );
+}
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, init);
+  // Send mutations once; each read and write has a finite, cancellable deadline.
+  const signal = init?.signal
+    ? AbortSignal.any([init.signal, AbortSignal.timeout(30000)])
+    : AbortSignal.timeout(30000);
+  const response = await fetch(path, { ...init, signal });
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as {
       error?: string;
@@ -183,7 +209,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } | null;
     if (
       path !== "/api/auth" &&
-      (response.status === 401 ||
+      ((response.status === 401 && body?.code === "unauthorized") ||
         (response.status === 403 && body?.code === "forbidden"))
     )
       window.dispatchEvent(
@@ -193,6 +219,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
       body?.error || `Request failed (${response.status})`,
       response.status,
       body?.code,
+      retryAfterMilliseconds(response.headers.get("Retry-After")),
     );
   }
   if (response.status === 204) return undefined as T;
@@ -210,6 +237,7 @@ export function releaseSession(id: string, keepalive = false) {
   return fetch(`/api/sessions/${encodeURIComponent(id)}`, {
     method: "DELETE",
     keepalive,
+    signal: AbortSignal.timeout(10000),
   })
     .then(() => {})
     .catch(() => {});
@@ -243,21 +271,58 @@ export async function loadBrowsePage(
   signal: AbortSignal,
   apply: (result: BrowsePage) => void,
   refreshRange = false,
+  retry = false,
 ) {
   const deadline = Date.now() + 180000;
-  let through = refreshRange ? previous?.page || 0 : 0;
+  signal = AbortSignal.any([signal, AbortSignal.timeout(180000)]);
+  if (retry) {
+    await request<void>("/api/browse/retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        kind: params.get("kind"),
+        category: params.get("category"),
+        search: params.get("search"),
+        page: previous?.retryPage || page,
+        ...(previous?.retryThrough ? { through: previous.retryThrough } : {}),
+      }),
+      signal,
+    });
+    if (previous?.retryThrough) refreshRange = true;
+  }
+  let through = refreshRange ? Math.max(previous?.page || 0, page) : 0;
+  let attempts = 0;
+  const checkBudget = () => {
+    signal.throwIfAborted();
+    if (Date.now() >= deadline || attempts++ >= 60)
+      throw new Error("Refresh is taking longer than expected. Please retry.");
+  };
   for (;;) {
+    checkBudget();
     let result: BrowsePage;
     if (through) {
       const chunks: BrowsePage[] = [];
       // The API bounds each range to 100 raw pages. Keep larger loaded views
       // intact and publish only when every chunk has the same revision.
       for (let start = 1; start <= through; start += 100) {
+        if (start > 1) checkBudget();
         params.set("page", String(start));
         params.set("through", String(Math.min(start + 99, through)));
+        if (previous) {
+          previous.retryPage = start;
+          previous.retryThrough = Math.min(start + 99, through);
+        }
         const chunk = await request<BrowsePage>(`/api/browse?${params}`, {
           signal,
         });
+        if (
+          chunk.retryStopped ||
+          (!chunk.refreshing && (chunk.stale || chunk.refreshError))
+        )
+          throw new Error(
+            chunk.refreshError ||
+              "This listing could not be refreshed. Please retry.",
+          );
         chunks.push(chunk);
         if (!chunk.hasMore) break;
       }
@@ -267,12 +332,25 @@ export async function loadBrowsePage(
         items: distinctItems(chunks.flatMap((chunk) => chunk.items)),
         stale: changed || chunks.some((chunk) => chunk.stale),
         refreshing: changed || chunks.some((chunk) => chunk.refreshing),
+        retryStopped: chunks.some((chunk) => chunk.retryStopped),
+        refreshError: chunks.find((chunk) => chunk.refreshError)?.refreshError,
       };
     } else {
       params.set("page", String(page));
+      if (previous) {
+        previous.retryPage = page;
+        previous.retryThrough = undefined;
+      }
       result = await request<BrowsePage>(`/api/browse?${params}`, { signal });
     }
     if (signal.aborted) return;
+    if (result.retryStopped || (result.refreshError && !result.refreshing)) {
+      if (!previous && result.items.length) apply(result);
+      throw new Error(
+        result.refreshError ||
+          "This listing could not be refreshed. Please retry.",
+      );
+    }
     if (
       !through &&
       previous &&

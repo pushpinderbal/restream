@@ -65,7 +65,9 @@ function historyItem(value: unknown): Item | null {
       typeof item.categoryId === "string" ? item.categoryId : undefined,
     image:
       typeof item.image === "string" &&
-      /^\/api\/(?:discovery\/)?images\/[^?#]+$/.test(item.image)
+      /^\/api\/(?:images\/[^/?#\\\s]+|discovery\/images\/[^/?#\\\s]+\/(?:poster|backdrop))(?:\?v=[0-9a-f]{16})?$/.test(
+        item.image,
+      )
         ? item.image
         : undefined,
     season:

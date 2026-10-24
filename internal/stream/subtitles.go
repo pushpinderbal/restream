@@ -34,6 +34,11 @@ const (
 
 var errSubtitle = errors.New("provider subtitles unavailable")
 
+type subtitleCooldownError struct{ until time.Time }
+
+func (e *subtitleCooldownError) Error() string             { return "provider subtitles are cooling down" }
+func (e *subtitleCooldownError) RetryDelay() time.Duration { return max(0, time.Until(e.until)) }
+
 // Input seeking retains keyframe preroll in copy mode. HLS playback normalizes
 // the first video DTS to zero, so captions need that actual media origin rather
 // than the requested seek position. Decode only one packet; never log source URLs.
@@ -107,8 +112,41 @@ type subtitleCacheEntry struct {
 	used time.Time
 }
 
+// Keep provider waits across track changes, seeks, and replacement sessions.
+// Subtitle failures remain independent of the video transport.
+type subtitleCooldowns struct {
+	mu    sync.Mutex
+	hosts map[string]time.Time
+}
+
+func (c *subtitleCooldowns) check(u *url.URL) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	host := strings.ToLower(u.Scheme + "://" + u.Host)
+	if until := c.hosts[host]; until.After(time.Now()) {
+		return &subtitleCooldownError{until: until}
+	}
+	delete(c.hosts, host)
+	return nil
+}
+
+func (c *subtitleCooldowns) hold(u *url.URL, until time.Time) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.hosts == nil {
+		c.hosts = make(map[string]time.Time)
+	}
+	host := strings.ToLower(u.Scheme + "://" + u.Host)
+	if previous := c.hosts[host]; previous.After(until) {
+		return previous
+	}
+	c.hosts[host] = until
+	return until
+}
+
 type subtitleState struct {
 	mu        sync.Mutex
+	cooldowns *subtitleCooldowns
 	filesMu   *sync.Mutex
 	ctx       context.Context
 	source    model.Source
@@ -119,8 +157,8 @@ type subtitleState struct {
 	cacheSize int
 }
 
-func newSubtitleState(ctx context.Context, source model.Source, origin float64, dir string, filesMu *sync.Mutex) *subtitleState {
-	return &subtitleState{ctx: ctx, source: source, origin: origin, dir: dir, cache: map[string]subtitleCacheEntry{}, filesMu: filesMu}
+func newSubtitleState(ctx context.Context, source model.Source, origin float64, dir string, filesMu *sync.Mutex, cooldowns *subtitleCooldowns) *subtitleState {
+	return &subtitleState{ctx: ctx, source: source, origin: origin, dir: dir, cache: map[string]subtitleCacheEntry{}, cooldowns: cooldowns, filesMu: filesMu}
 }
 
 func subtitleHeaders(original string, target *url.URL, headers map[string]string) map[string]string {
@@ -147,6 +185,9 @@ func subtitleURL(base *url.URL, ref string) (*url.URL, error) {
 }
 
 func (s *subtitleState) fetch(ctx context.Context, target *url.URL, source model.SubtitleSource) ([]byte, *url.URL, error) {
+	if err := s.cooldowns.check(target); err != nil {
+		return nil, nil, err
+	}
 	origin, err := url.Parse(source.URL)
 	if err != nil {
 		return nil, nil, errSubtitle
@@ -168,6 +209,9 @@ func (s *subtitleState) fetch(ctx context.Context, target *url.URL, source model
 		if len(via) >= 5 || (next.URL.Scheme != "http" && next.URL.Scheme != "https") || next.URL.User != nil {
 			return errSubtitle
 		}
+		if err := s.cooldowns.check(next.URL); err != nil {
+			return err
+		}
 		if !strings.EqualFold(next.URL.Host, origin.Host) || next.URL.Scheme != origin.Scheme {
 			for k := range next.Header {
 				if !strings.EqualFold(k, "User-Agent") {
@@ -179,9 +223,30 @@ func (s *subtitleState) fetch(ctx context.Context, target *url.URL, source model
 	}}
 	resp, err := client.Do(req)
 	if err != nil {
+		var limited *subtitleCooldownError
+		if errors.As(err, &limited) {
+			return nil, nil, limited
+		}
 		return nil, nil, errSubtitle
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("Retry-After") != "" {
+		delay := 5 * time.Second
+		value := strings.TrimSpace(resp.Header.Get("Retry-After"))
+		if seconds, err := strconv.ParseUint(value, 10, 64); err == nil {
+			if seconds > uint64(math.MaxInt64/int64(time.Second)) {
+				delay = time.Duration(math.MaxInt64)
+			} else {
+				delay = max(delay, time.Duration(seconds)*time.Second)
+			}
+		} else if value != "" && strings.Trim(value, "0123456789") == "" {
+			delay = time.Duration(math.MaxInt64)
+		} else if deadline, err := http.ParseTime(value); err == nil {
+			delay = max(delay, time.Until(deadline))
+		}
+		until := s.cooldowns.hold(resp.Request.URL, time.Now().Add(delay))
+		return nil, nil, &subtitleCooldownError{until: until}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, errSubtitle
 	}
@@ -461,7 +526,11 @@ func (m *Manager) serveSubtitles(w http.ResponseWriter, r *http.Request, id, gen
 	defer stop()
 	cues, err := state.cues(ctx, index, start)
 	if err != nil {
-		if state.ctx.Err() != nil || errors.Is(err, ErrNotFound) {
+		var limited *subtitleCooldownError
+		if errors.As(err, &limited) {
+			w.Header().Set("Retry-After", strconv.FormatInt(int64(math.Ceil(limited.RetryDelay().Seconds())), 10))
+			http.Error(w, "Provider subtitles are cooling down", http.StatusTooManyRequests)
+		} else if state.ctx.Err() != nil || errors.Is(err, ErrNotFound) {
 			http.NotFound(w, r)
 		} else {
 			http.Error(w, "Provider subtitles are temporarily unavailable", http.StatusBadGateway)

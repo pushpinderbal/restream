@@ -78,6 +78,7 @@ type store struct {
 	libraryInvalidatedAt                               time.Time
 	portalCooldownUntil                                time.Time
 	retryFallback                                      map[string]cacheRetryState
+	activeCacheAttempts                                map[string]bool
 	catalogJSON, epgJSON                               []byte
 	catalogETag, epgETag                               string
 }
@@ -122,6 +123,44 @@ func openStore(dir, portal, mac string) (*store, error) {
  CREATE TABLE IF NOT EXISTS scheduled_refresh(kind TEXT PRIMARY KEY,data BLOB NOT NULL);
  CREATE TABLE IF NOT EXISTS cache_retries(entry TEXT PRIMARY KEY,failures INTEGER NOT NULL,retry_at INTEGER NOT NULL,paused INTEGER NOT NULL DEFAULT 0);`); err != nil {
 		return fail(err)
+	}
+	// Older databases retain their failure counts; elapsed limits also survive restart.
+	var hasStarted, hasAttempts bool
+	rows, err := db.Query(`PRAGMA table_info(cache_retries)`)
+	if err != nil {
+		return fail(err)
+	}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var def any
+		if err = rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+			rows.Close()
+			return fail(err)
+		}
+		hasStarted = hasStarted || name == "started_at"
+		hasAttempts = hasAttempts || name == "attempts"
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return fail(err)
+	}
+	rows.Close()
+	if !hasStarted {
+		if _, err = db.Exec(`ALTER TABLE cache_retries ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fail(err)
+		}
+		if _, err = db.Exec(`UPDATE cache_retries SET started_at=? WHERE failures>0`, time.Now().UnixNano()); err != nil {
+			return fail(err)
+		}
+	}
+	if !hasAttempts {
+		if _, err = db.Exec(`ALTER TABLE cache_retries ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fail(err)
+		}
+		if _, err = db.Exec(`UPDATE cache_retries SET attempts=failures`); err != nil {
+			return fail(err)
+		}
 	}
 	if err = os.Chmod(path, 0600); err != nil {
 		return fail(err)
@@ -639,6 +678,7 @@ func (s *store) invalidateLibrary() error {
 	s.libraryRefreshedAt = now
 	s.libraryInvalidatedAt = now
 	s.retryFallback = nil
+	s.activeCacheAttempts = nil
 	return nil
 }
 
@@ -765,6 +805,7 @@ func (s *store) setEpisodeListAtRevision(seriesID, key string, items []model.Ite
 	s.episodes[key] = items
 	s.episodesAt[key] = time.Now()
 	delete(s.retryFallback, "episodes:"+key)
+	delete(s.activeCacheAttempts, "episodes:"+key)
 	for _, i := range items {
 		if i.Kind == "season" {
 			continue

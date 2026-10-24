@@ -35,8 +35,9 @@ const defaultArtwork = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320
 var fallbackArtwork = imageData{data: []byte(defaultArtwork), mime: "image/svg+xml"}
 
 type artworkResult struct {
-	image imageData
-	ttl   time.Duration
+	image     imageData
+	ttl       time.Duration
+	available bool
 }
 
 type artworkEntry struct {
@@ -130,7 +131,9 @@ func (c *artworkCache) close() {
 	c.workers.Wait()
 }
 
-func (c *artworkCache) fallback() artworkResult { return artworkResult{fallbackArtwork, c.failureTTL} }
+func (c *artworkCache) fallback() artworkResult {
+	return artworkResult{image: fallbackArtwork, ttl: c.failureTTL}
+}
 
 func (c *artworkCache) get(ctx context.Context, rawURL string) artworkResult {
 	u, err := url.Parse(rawURL)
@@ -243,7 +246,7 @@ func (c *artworkCache) result(e artworkEntry) artworkResult {
 	if ttl <= 0 {
 		ttl = c.failureTTL
 	}
-	return artworkResult{e.image, ttl}
+	return artworkResult{image: e.image, ttl: ttl, available: true}
 }
 
 func (c *artworkCache) read(key string) (artworkEntry, error) {

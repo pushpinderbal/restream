@@ -237,6 +237,8 @@ func (rt *Runtime) updateSettings(w http.ResponseWriter, r *http.Request) {
 		record := oldServer.discoveryService.record
 		record.NextAttempt = time.Time{}
 		record.Failures = 0
+		record.RecoveryStartedAt = time.Time{}
+		record.RecoveryAttempts = 0
 		record.Paused = false
 		record.Pending = false
 		record.Cursors = nil

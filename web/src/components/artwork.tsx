@@ -4,28 +4,48 @@ import { SkeletonReveal } from "./spectrumui/skeleton-reveal";
 
 export function Artwork({
   item,
+  fallbackImage,
   className = "",
 }: {
   item: Item;
+  fallbackImage?: string;
   className?: string;
 }) {
+  const fallback = `/artwork-${item.kind === "live" ? "live" : "title"}.svg`;
+  const sources = [
+    ...new Set(
+      [item.image, fallbackImage].filter(
+        (source): source is string => !!source && source !== fallback,
+      ),
+    ),
+    fallback,
+  ];
   // Source changes get their own load state; a late effect must never reset a
   // cached image after its load event has already fired.
   return (
     <ArtworkImage
-      key={`${item.id}:${item.image || ""}`}
+      key={JSON.stringify([item.id, item.kind, sources])}
       item={item}
+      sources={sources}
       className={className}
     />
   );
 }
 
-function ArtworkImage({ item, className }: { item: Item; className: string }) {
+function ArtworkImage({
+  item,
+  sources,
+  className,
+}: {
+  item: Item;
+  sources: string[];
+  className: string;
+}) {
   const element = useRef<HTMLImageElement>(null);
-  const [failed, setFailed] = useState(false);
+  const [sourceIndex, setSourceIndex] = useState(0);
   const [loaded, setLoaded] = useState(false);
-  const fallback = `/artwork-${item.kind === "live" ? "live" : "title"}.svg`;
-  const source = !failed && item.image ? item.image : fallback;
+  const fallback = sources[sources.length - 1];
+  const source = sources[sourceIndex];
   const channelLogoLoaded =
     item.kind === "live" && source !== fallback && loaded;
 
@@ -53,7 +73,7 @@ function ArtworkImage({ item, className }: { item: Item; className: string }) {
           if (source === fallback) setLoaded(true);
           else {
             setLoaded(false);
-            setFailed(true);
+            setSourceIndex(sourceIndex + 1);
           }
         }}
       />

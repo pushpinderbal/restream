@@ -367,11 +367,73 @@ func TestMissingUpstreamStreamHasSpecificSessionError(t *testing.T) {
 			if got.Error != "The provider could not find this stream (HTTP 404)." {
 				t.Fatalf("session error: %q", got.Error)
 			}
+			if got.Retryable {
+				t.Fatal("a missing upstream stream should not automatically restart")
+			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("missing upstream did not fail stream")
+}
+
+type recoveryFailure struct {
+	permanent bool
+	delay     time.Duration
+}
+
+func (e recoveryFailure) Error() string             { return "private upstream diagnostic" }
+func (e recoveryFailure) Permanent() bool           { return e.permanent }
+func (e recoveryFailure) RetryDelay() time.Duration { return e.delay }
+
+func TestPlaybackFailureRecoveryMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		failure   error
+		retryable bool
+		delay     int
+	}{
+		{name: "temporary", failure: errors.New("temporary upstream failure"), retryable: true},
+		{name: "configuration", failure: recoveryFailure{permanent: true}},
+		{name: "provider cooldown", failure: recoveryFailure{delay: 90 * time.Second}, retryable: true, delay: 90},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			m, err := New(Config{MaxStreams: 1}, func(context.Context, model.Item) (model.Source, error) {
+				calls++
+				return model.Source{}, tc.failure
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			first, err := m.Start(context.Background(), model.Item{ID: "movie:1", Kind: "movie"}, 42)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failed := waitState(t, m, first.ID, "failed")
+			if failed.Retryable != tc.retryable || failed.RetryAfterSeconds != tc.delay || failed.Offset != 42 {
+				t.Fatalf("incorrect recovery metadata: %+v", failed)
+			}
+			if failed.Error != "Unable to start this stream." {
+				t.Fatalf("upstream diagnostics leaked into the session: %q", failed.Error)
+			}
+			if calls != 1 || m.Active() != 0 {
+				t.Fatalf("failed session retried itself or held capacity: calls=%d active=%d", calls, m.Active())
+			}
+			if err := m.Stop(first.ID); err != nil {
+				t.Fatal(err)
+			}
+			second, err := m.Start(context.Background(), model.Item{ID: "movie:1", Kind: "movie"}, 42)
+			if err != nil || second.ID == first.ID {
+				t.Fatalf("could not explicitly replace the failed session: %+v %v", second, err)
+			}
+			waitState(t, m, second.ID, "failed")
+			if calls != 2 {
+				t.Fatalf("replacement should resolve once: %d calls", calls)
+			}
+		})
+	}
 }
 
 func TestStopKeepsSlotUntilResolverExits(t *testing.T) {

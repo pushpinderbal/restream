@@ -50,6 +50,8 @@ Restream supports configuration through the UI and environment variables. Enviro
 
 See [.env.example](.env.example) for the full list and required values. Copy and adapt it to `.env` for Compose or Docker's `--env-file .env`, or set the variables directly in your environment.
 
+If your provider is temporarily unavailable, Restream keeps saved listings visible and limits its recovery attempts. Use the affected page's retry button to try again, or **Try again** in the player after playback recovery stops. To refresh the whole library and guide, open **Account → Settings → Status → Refresh now**. Provider waiting periods still apply, and scheduled updates continue at your configured interval.
+
 ## Local development
 
 Install [mise](https://mise.jdx.dev/getting-started.html), then run:

@@ -61,6 +61,38 @@ func (s *Server) initScheduledRefresh() error {
 		if saved.Configuration == configuration {
 			*state = saved.State
 		}
+		if (state.Failures > 0 || state.Running) && state.RecoveryStartedAt == nil {
+			state.RecoveryStartedAt = state.StartedAt
+			if state.RecoveryStartedAt == nil {
+				state.RecoveryStartedAt = state.FinishedAt
+			}
+		}
+		if state.RecoveryAttempts == 0 {
+			state.RecoveryAttempts = state.Failures
+			if state.Running {
+				state.RecoveryAttempts++
+			}
+		}
+		if state.RecoveryStartedAt != nil && state.RecoveryAttempts > 0 && !state.Paused && recoveryExhausted(state.RecoveryAttempts, *state.RecoveryStartedAt, recoveryAttemptLimit, recoveryElapsedLimit) {
+			state.Paused = true
+			base := state.RecoveryStartedAt
+			if state.FinishedAt != nil {
+				base = state.FinishedAt
+			}
+			next := maxTime(time.Now(), s.nextScheduledRefresh(*base))
+			// A guide's already configured future cadence is not postponed by restart.
+			if !catalog && state.NextRefreshAt != nil && state.NextRefreshAt.After(time.Now()) {
+				next = *state.NextRefreshAt
+			}
+			state.NextRefreshAt = &next
+			state.Error = "Automatic retries stopped. Showing saved data until the next scheduled refresh or manual retry."
+		} else if saved.Configuration == configuration && state.Running {
+			next := time.Now().Add(retryCooldown(nil, max(1, state.Failures)))
+			if !catalog {
+				next = s.nextScheduledRefresh(time.Now())
+			}
+			state.NextRefreshAt = &next
+		}
 		resume := saved.Configuration == configuration && (state.Running || state.Queued)
 		state.Configuration = configuration
 		state.Running, state.Queued = false, false
@@ -112,7 +144,7 @@ func (s *Server) scheduler(catalog bool) {
 		s.stateMu.RUnlock()
 		var timer *time.Timer
 		var due <-chan time.Time
-		if !paused {
+		if !paused || next != nil {
 			wait := time.Duration(0)
 			if next != nil {
 				wait = max(0, time.Until(*next))
@@ -147,12 +179,38 @@ func (s *Server) scheduler(catalog bool) {
 			s.stateMu.Unlock()
 			continue
 		}
+		if !state.Paused && catalog && state.RecoveryAttempts > 0 && state.RecoveryStartedAt != nil && recoveryExhausted(state.RecoveryAttempts, *state.RecoveryStartedAt, recoveryAttemptLimit, recoveryElapsedLimit) {
+			state.Paused = true
+			next := s.nextScheduledRefresh(time.Now())
+			state.NextRefreshAt = &next
+			state.Error = "Automatic retries stopped. Showing saved data until the next scheduled refresh or manual retry."
+			_ = s.saveScheduledRefresh(kind, *state)
+			s.stateMu.Unlock()
+			continue
+		}
 		started := time.Now().UTC()
+		// Only a scheduled cadence or explicit refresh opens a new episode. Reads
+		// cannot reach this reset, and recovery counters persist across restarts.
+		if state.RecoveryStartedAt != nil && recoveryExhausted(state.RecoveryAttempts, *state.RecoveryStartedAt, recoveryAttemptLimit, recoveryElapsedLimit) {
+			state.Failures, state.Paused = 0, false
+			state.RecoveryStartedAt = nil
+			state.RecoveryAttempts = 0
+		}
+		if state.RecoveryStartedAt == nil {
+			state.RecoveryStartedAt = &started
+		}
 		state.Queued, state.Running, state.StartedAt = false, true, &started
+		state.RecoveryAttempts++
 		state.NextRefreshAt = nil
 		if err := s.saveScheduledRefresh(kind, *state); err != nil {
 			state.Running = false
-			next := time.Now().Add(retryCooldown(err, 1))
+			state.Failures++
+			state.Paused = recoveryExhausted(state.RecoveryAttempts, *state.RecoveryStartedAt, recoveryAttemptLimit, recoveryElapsedLimit)
+			state.Error = "Could not save refresh state. Showing saved data."
+			next := time.Now().Add(retryCooldown(err, state.Failures))
+			if state.Paused || !catalog {
+				next = s.nextScheduledRefresh(time.Now())
+			}
 			state.NextRefreshAt = &next
 			s.stateMu.Unlock()
 			slog.Warn("Could not persist refresh start; delaying provider work", "kind", kind, "error", err)
@@ -161,6 +219,13 @@ func (s *Server) scheduler(catalog bool) {
 		s.stateMu.Unlock()
 		err := s.doRefresh(catalog, !catalog)
 		if s.ctx.Err() != nil {
+			s.stateMu.Lock()
+			state.Running = false
+			next := time.Now()
+			state.NextRefreshAt = &next
+
+			_ = s.saveScheduledRefresh(kind, *state)
+			s.stateMu.Unlock()
 			return
 		}
 		finished := time.Now().UTC()
@@ -179,10 +244,17 @@ func (s *Server) scheduler(catalog bool) {
 					delay = max(delay, s.refreshInterval())
 				}
 				next := finished.Add(delay)
+				if catalog && (recoveryExhausted(state.RecoveryAttempts, *state.RecoveryStartedAt, recoveryAttemptLimit, recoveryElapsedLimit) || next.Sub(*state.RecoveryStartedAt) >= recoveryElapsedLimit) {
+					state.Paused = true
+					state.Error = "Automatic retries stopped. Showing saved data until the next scheduled refresh or manual retry."
+					next = s.nextScheduledRefresh(finished)
+				}
 				state.NextRefreshAt = &next
 			}
 		} else {
 			state.Failures, state.Paused, state.Error = 0, false, ""
+			state.RecoveryStartedAt = nil
+			state.RecoveryAttempts = 0
 			state.LastSuccessfulAt = &finished
 			next := s.nextScheduledRefresh(finished)
 			state.NextRefreshAt = &next
@@ -204,4 +276,17 @@ func (s *Server) scheduler(catalog bool) {
 		}
 		s.stateMu.Unlock()
 	}
+}
+
+func (s *Server) scheduledAttemptTimeout(catalog bool) time.Duration {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	state := s.epgSync
+	if catalog {
+		state = s.catalogSync
+	}
+	if state.RecoveryStartedAt == nil {
+		return refreshAttemptTimeout
+	}
+	return min(refreshAttemptTimeout, max(0, time.Until(state.RecoveryStartedAt.Add(recoveryElapsedLimit))))
 }
