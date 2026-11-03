@@ -4,6 +4,7 @@ import { FilmReelIcon } from "@phosphor-icons/react/dist/csr/FilmReel";
 import { MagnifyingGlassIcon } from "@phosphor-icons/react/dist/csr/MagnifyingGlass";
 import { AccountMenu } from "./account-menu";
 import { BrandMark } from "./brand-mark";
+import { Link } from "react-router";
 import "./navigation.css";
 import { Button } from "./ui/button";
 import {
@@ -23,9 +24,11 @@ const destinations = [
 
 export function AppNavigation({
   active,
+  hrefs,
   onNavigate,
 }: {
   active: Destination;
+  hrefs: Record<Exclude<Destination, "settings">, string>;
   onNavigate: (destination: Destination) => void;
 }) {
   const accountMenu = (
@@ -40,20 +43,36 @@ export function AppNavigation({
     icon: Icon,
   }: (typeof destinations)[number]) => (
     <Button
+      asChild
       key={id}
       variant="ghost"
       size="icon-lg"
       className={`navigation-icon${active === id ? " active" : ""}`}
       aria-label={label}
       aria-current={active === id ? "page" : undefined}
-      onClick={() => onNavigate(id)}
     >
-      <Icon
-        className="size-[32px]"
-        size={32}
-        weight={active === id ? "fill" : "duotone"}
-        aria-hidden="true"
-      />
+      <Link
+        to={hrefs[id]}
+        onClick={(event) => {
+          if (
+            event.button !== 0 ||
+            event.metaKey ||
+            event.ctrlKey ||
+            event.shiftKey ||
+            event.altKey
+          )
+            return;
+          event.preventDefault();
+          onNavigate(id);
+        }}
+      >
+        <Icon
+          className="size-[32px]"
+          size={32}
+          weight={active === id ? "fill" : "duotone"}
+          aria-hidden="true"
+        />
+      </Link>
     </Button>
   );
   const desktopLinks = destinations.map((destination) => (
@@ -69,13 +88,29 @@ export function AppNavigation({
       <TooltipProvider delayDuration={400} skipDelayDuration={200}>
         <aside className="app-sidebar">
           <Button
+            asChild
             variant="ghost"
             size="icon-lg"
             className="sidebar-brand"
             aria-label="Restream home"
-            onClick={() => onNavigate("home")}
           >
-            <BrandMark />
+            <Link
+              to="/"
+              onClick={(event) => {
+                if (
+                  event.button !== 0 ||
+                  event.metaKey ||
+                  event.ctrlKey ||
+                  event.shiftKey ||
+                  event.altKey
+                )
+                  return;
+                event.preventDefault();
+                onNavigate("home");
+              }}
+            >
+              <BrandMark />
+            </Link>
           </Button>
           <nav className="side-navigation" aria-label="Library">
             <div className="navigation-main">{desktopLinks}</div>

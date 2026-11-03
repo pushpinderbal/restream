@@ -36,7 +36,7 @@ try {
       name: width <= 820 ? "Primary navigation" : "Library",
       exact: true,
     });
-    await navigation.getByRole("button", { name: "VOD", exact: true }).click();
+    await navigation.getByRole("link", { name: "VOD", exact: true }).click();
     await page.getByRole("tab", { name: "Movies", exact: true }).click();
     await page
       .getByRole("button", { name: "Open Test movie", exact: true })
@@ -221,7 +221,7 @@ try {
     await expect(video).toHaveCount(0);
     if (width === 1440) {
       await navigation
-        .getByRole("button", { name: "Home", exact: true })
+        .getByRole("link", { name: "Home", exact: true })
         .click();
       const resumed = page.waitForResponse(
         (response) =>

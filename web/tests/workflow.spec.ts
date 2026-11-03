@@ -93,7 +93,7 @@ async function navigateLibrary(
         : "Library",
     exact: true,
   });
-  const destination = navigation.getByRole("button", {
+  const destination = navigation.getByRole("link", {
     name: section === "live" ? "Live TV" : "VOD",
     exact: true,
   });
@@ -130,14 +130,14 @@ async function openSearch(page: Page) {
         : "Library",
     exact: true,
   });
-  await nav.getByRole("button", { name: "Search", exact: true }).click();
+  await nav.getByRole("link", { name: "Search", exact: true }).click();
   return page.getByRole("searchbox", { name: "Search library", exact: true });
 }
 
 async function expectHome(page: Page) {
   await expect(page.locator(".discovery-dashboard")).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Home", exact: true }),
+    page.getByRole("link", { name: "Home", exact: true }),
   ).toHaveAttribute("aria-current", "page");
   await expect(
     page.getByRole("heading", { name: "Home", exact: true }),
@@ -163,21 +163,20 @@ async function collapseTitle(page: Page) {
     await stop.click();
     await expect(page.locator("video")).toHaveCount(0);
   }
-  if (
-    ["dashboard", "settings"].includes(
-      new URL(page.url()).searchParams.get("view") || "",
-    )
-  )
-    return;
+  if (["/", "/settings"].includes(new URL(page.url()).pathname)) return;
   const selectedTile = page
     .locator('.media-card[aria-expanded="true"]')
     .first();
   if (await selectedTile.count()) {
     if (!(await selectedTile.isVisible())) {
-      const section = new URL(page.url()).searchParams.get("section");
+      const section = new URL(page.url()).pathname.split("/")[1];
       await navigateLibrary(
         page,
-        section === "movie" || section === "series" ? section : "live",
+        section === "movies"
+          ? "movie"
+          : section === "shows"
+            ? "series"
+            : "live",
       );
     }
     if (!(await selectedTile.isVisible())) return;
@@ -196,9 +195,11 @@ async function navigatePlayer(
   await page.evaluate(
     ({ title, item }) => {
       const url = new URL(location.href);
-      url.searchParams.set("view", "player");
-      url.searchParams.set("item", title.id);
-      url.searchParams.set("section", title.kind);
+      const library = { movie: "movies", series: "shows", live: "live" }[
+        title.kind
+      ];
+      url.pathname = `/${library}/${encodeURIComponent(title.id)}/watch`;
+      url.search = "";
       if (title.kind === "series") {
         url.searchParams.set("season", String(item.season || 1));
         url.searchParams.set("episode", item.id);
@@ -206,7 +207,7 @@ async function navigatePlayer(
         url.searchParams.delete("season");
         url.searchParams.delete("episode");
       }
-      history.pushState({}, "", url);
+      history.pushState({ key: crypto.randomUUID() }, "", url);
       window.dispatchEvent(new PopStateEvent("popstate"));
     },
     { title, item },
@@ -894,7 +895,7 @@ test("LIVE greys behind the stream and jumps to the latest seek point while resu
   page,
 }) => {
   const api = await mockApi(page);
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await page.getByRole("button", { name: "Open North News" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect(
@@ -993,10 +994,10 @@ for (const viewport of [
   }) => {
     const api = await mockApi(page);
     await page.setViewportSize(viewport);
-    await page.goto("/?view=search&section=live&search=North");
+    await page.goto("/search?q=North");
     await page.getByRole("button", { name: "Open North News" }).click();
     await page.getByRole("button", { name: "Play", exact: true }).click();
-    await expect(page).toHaveURL(/view=player/);
+    await expect(page).toHaveURL(/\/watch(?:\?|$)/);
     await expect(page.locator(".primary-control")).toBeEnabled();
     await playableVideo(page);
     const originalVideo = await page.locator("video").elementHandle();
@@ -1020,7 +1021,7 @@ for (const viewport of [
     expect(api.sessionItemIds).toEqual([live.id]);
     await page.getByRole("button", { name: "Play", exact: true }).click();
     await expect.poll(() => api.sessionItemIds).toEqual([live.id, movie.id]);
-    await expect(page).toHaveURL(/view=player/);
+    await expect(page).toHaveURL(/\/watch(?:\?|$)/);
     await expect(page.locator(".dock-title")).toHaveText(movie.name);
     await page
       .getByRole("button", { name: "Stop playback", exact: true })
@@ -1034,7 +1035,7 @@ for (const viewport of [
     await expect
       .poll(() => api.events.filter((event) => event === "DELETE").length)
       .toBe(2);
-    expect(new URL(page.url()).searchParams.get("view")).not.toBe("player");
+    expect(new URL(page.url()).pathname.endsWith("/watch")).toBe(false);
   });
 }
 
@@ -1047,7 +1048,7 @@ for (const viewport of [
   }) => {
     const api = await mockApi(page);
     await page.setViewportSize(viewport);
-    await page.goto("/?view=search&section=live&search=North");
+    await page.goto("/search?q=North");
     await page.getByRole("button", { name: "Open North News" }).click();
     await page.getByRole("button", { name: "Play", exact: true }).click();
     await expect(page.locator(".primary-control")).toBeEnabled();
@@ -1056,7 +1057,7 @@ for (const viewport of [
       .getByRole("button", { name: "Stop playback", exact: true })
       .click();
     await expect(page).toHaveURL(/item=live-1/);
-    expect(new URL(page.url()).searchParams.get("view")).not.toBe("player");
+    expect(new URL(page.url()).pathname.endsWith("/watch")).toBe(false);
     await expect(
       page.getByRole("region", { name: "Expanded title", exact: true }),
     ).toBeVisible();
@@ -1072,12 +1073,12 @@ for (const viewport of [
   }) => {
     const api = await mockApi(page);
     await page.setViewportSize(viewport);
-    await page.goto("/?view=search&section=series&search=Night");
+    await page.goto("/search?q=Night");
     await page.getByRole("button", { name: "Open Night Shift" }).click();
     await page.getByRole("combobox", { name: "Season" }).click();
     await page.getByRole("option", { name: "Season 2" }).click();
     await page.getByRole("button", { name: "Play", exact: true }).click();
-    await expect(page).toHaveURL(/view=player/);
+    await expect(page).toHaveURL(/\/watch(?:\?|$)/);
     await expect(page).toHaveURL(/season=2/);
     await expect(page).toHaveURL(/episode=episode-3/);
     await expect(page.locator(".primary-control")).toBeEnabled();
@@ -1108,7 +1109,7 @@ for (const viewport of [
     await stop.focus();
 
     await details.click();
-    await expect(page).toHaveURL(/section=series/);
+    await expect(page).toHaveURL(/\/shows(?:\/|\?|$)/);
     await expect(page).toHaveURL(/season=2/);
     await expect(page.getByRole("combobox", { name: "Season" })).toHaveText(
       "Season 2",
@@ -1140,7 +1141,7 @@ test(`closing the player releases media and restores its origin with reduced mot
 }) => {
   const api = await mockApi(page);
   await page.emulateMedia({ reducedMotion: "reduce" });
-  await page.goto("/?view=search&section=movie&search=Quiet");
+  await page.goto("/search?q=Quiet");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   const origin = page.url();
   await page.getByRole("button", { name: "Play", exact: true }).click();
@@ -1198,7 +1199,7 @@ for (const item of [live, movie, series]) {
     await expect(page.locator(".primary-control")).toBeEnabled();
     await playableVideo(page);
     expect(new URL(page.url()).searchParams.get("category")).toBeNull();
-    expect(new URL(page.url()).searchParams.get("search")).toBe(item.name);
+    expect(new URL(page.url()).searchParams.get("q")).toBeNull();
     await expect
       .poll(() => api.history.read()[0]?.title)
       .toMatchObject({
@@ -1254,9 +1255,7 @@ for (const viewport of [
     await page.setViewportSize(viewport);
     await page.emulateMedia({ reducedMotion: viewport.reducedMotion });
     await page.goto(
-      viewport.search
-        ? "/?view=search&section=movie&search=Coast"
-        : "/?section=movie&category=drama-movie",
+      viewport.search ? "/search?q=Coast" : "/movies?category=drama-movie",
     );
     const title = titles[30];
     await page
@@ -1354,7 +1353,7 @@ test("player supports pause, keyboard resume, and fullscreen", async ({
   page,
 }) => {
   const api = await mockApi(page);
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect(page.locator(".primary-control")).toBeEnabled();
@@ -1386,7 +1385,7 @@ test("native playback without a known duration recovers from a rejected speed ch
   page,
 }) => {
   const api = await mockApi(page, { sessionDuration: 0 });
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect(page.locator(".primary-control")).toBeEnabled();
@@ -1443,7 +1442,7 @@ test("watch workspace fits responsive screens without replacing its decoder", as
 }) => {
   const api = await mockApi(page, { sessionDuration: 7808 });
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect(page.locator(".primary-control")).toBeEnabled();
@@ -1463,7 +1462,7 @@ test("watch workspace fits responsive screens without replacing its decoder", as
     { width: 844, height: 390 },
   ]) {
     await page.setViewportSize(viewport);
-    await expect(page).toHaveURL(/view=player/);
+    await expect(page).toHaveURL(/\/watch(?:\?|$)/);
     await expect(player).toBeVisible();
     await expect(
       page.getByRole("region", { name: "Movies library", exact: true }),
@@ -1511,7 +1510,7 @@ test.describe("touch playback", () => {
     page,
   }) => {
     await mockApi(page);
-    await page.goto("/?section=movie");
+    await page.goto("/movies");
     await page.getByRole("button", { name: "Open The Quiet Coast" }).tap();
     await page.getByRole("button", { name: "Play", exact: true }).tap();
     await expect(page.locator(".primary-control")).toBeEnabled();
@@ -1568,7 +1567,7 @@ test("server snapshot fills library without a client refresh and filters EPG cha
   const api = await mockApi(page, { initialEmpty: true });
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.clock.install();
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await expect(page.getByText("No channels yet")).toBeVisible();
   await expect(page.getByRole("button", { name: "Refresh now" })).toHaveCount(
     0,
@@ -1608,7 +1607,7 @@ test("All movies automatically passes empty provider pages and preserves the cur
       };
     },
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await navigateLibrary(page, "movie");
   await expect(
     page.getByRole("button", { name: "Open The Quiet Coast" }),
@@ -1624,7 +1623,7 @@ test("All movies automatically passes empty provider pages and preserves the cur
 
 test("episode list can retry without starting a stream", async ({ page }) => {
   const api = await mockApi(page, { episodesFailureOnce: true });
-  await page.goto("/?section=series");
+  await page.goto("/shows");
   await page.getByRole("button", { name: "Open Night Shift" }).click();
   await expect(
     page
@@ -1644,7 +1643,7 @@ test("season selection chooses its episode before opening the watch workspace", 
   page,
 }) => {
   const api = await mockApi(page);
-  await page.goto("/?section=series");
+  await page.goto("/shows");
   await page.getByRole("button", { name: "Open Night Shift" }).click();
   const season = page.getByRole("combobox", { name: "Season" });
   await expect(season).toHaveText("Season 1");
@@ -1654,7 +1653,7 @@ test("season selection chooses its episode before opening the watch workspace", 
   expect(api.sessionItemIds).toHaveLength(0);
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect.poll(() => api.sessionItemIds).toEqual(["episode-3"]);
-  await expect(page).toHaveURL(/view=player/);
+  await expect(page).toHaveURL(/\/watch(?:\?|$)/);
   await expect(page).toHaveURL(/episode=episode-3/);
   await page
     .getByRole("button", { name: "Stop playback", exact: true })
@@ -1670,8 +1669,8 @@ test("season selection chooses its episode before opening the watch workspace", 
   await expect
     .poll(() => api.sessionItemIds)
     .toEqual(["episode-3", "episode-2"]);
-  await expect(page).toHaveURL(/view=player/);
-  await expect(page).toHaveURL(/item=series-1/);
+  await expect(page).toHaveURL(/\/watch(?:\?|$)/);
+  await expect(page).toHaveURL(/\/shows\/series-1\/watch/);
   await expect(page).toHaveURL(/episode=episode-2/);
   await expect(page.getByRole("region", { name: "Player" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Stop playback" })).toHaveCount(
@@ -1697,7 +1696,7 @@ test("opening details allocates no stream and player Back and Forward release th
   page,
 }) => {
   const api = await mockApi(page);
-  await page.goto("/?view=search&section=live&search=North");
+  await page.goto("/search?q=North");
   await page.getByRole("button", { name: "Open North News" }).click();
   const origin = page.url();
   await expect(page).toHaveURL(/item=live-1/);
@@ -1706,7 +1705,7 @@ test("opening details allocates no stream and player Back and Forward release th
   ).toBeVisible();
   expect(api.events).not.toContain("POST");
   await page.getByRole("button", { name: "Play", exact: true }).click();
-  await expect(page).toHaveURL(/view=player/);
+  await expect(page).toHaveURL(/\/watch(?:\?|$)/);
   await expect.poll(() => api.sessionItemIds).toEqual([live.id]);
   await expect(
     page.getByRole("region", { name: "Player", exact: true }),
@@ -1721,7 +1720,7 @@ test("opening details allocates no stream and player Back and Forward release th
     .poll(() => api.events.filter((event) => event === "DELETE").length)
     .toBe(1);
   await page.goForward();
-  await expect(page).toHaveURL(/view=player/);
+  await expect(page).toHaveURL(/\/watch(?:\?|$)/);
   await expect(
     page.getByRole("region", { name: "Player", exact: true }),
   ).toBeVisible();
@@ -1744,7 +1743,7 @@ test("live keyword search matches nonadjacent words and deep links resolve", asy
       { ...live, id: "live-colors", name: "Colors India 4K", level: 1 },
     ],
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await (await openSearch(page)).fill("colors 4k");
   await expect(
     page.getByRole("button", { name: "Open Colors India 4K" }),
@@ -1762,7 +1761,7 @@ test("episode switch releases previous session before creating next", async ({
   page,
 }) => {
   const api = await mockApi(page);
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await navigateLibrary(page, "series");
   await page.getByRole("button", { name: "Open Night Shift" }).click();
   expect(api.events).not.toContain("POST");
@@ -1796,7 +1795,7 @@ test("rapid episode switch releases a late session response", async ({
   page,
 }) => {
   const api = await mockApi(page, { createDelayMs: 300 });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await navigateLibrary(page, "series");
   await page.getByRole("button", { name: "Open Night Shift" }).click();
   await page.getByRole("button", { name: /First Light/ }).click();
@@ -1830,7 +1829,7 @@ test("producer ended state keeps player available", async ({ page }) => {
   });
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.clock.install();
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await navigateLibrary(page, "movie");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   const firstPoll = page.waitForResponse(
@@ -1872,7 +1871,7 @@ test("browse batches only the selected section and retries a failed page", async
       };
     },
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   expect(
     api.events.filter((event) => event.startsWith("BROWSE:")),
   ).toHaveLength(0);
@@ -1929,7 +1928,7 @@ test("global Search debounces every kind, streams groups and discards stale work
   const clockStart = Date.now();
   await page.clock.install({ time: clockStart });
   await page.setViewportSize({ width, height: 900 });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   const search = await openSearch(page);
   // Pause after navigation settles so action scheduling cannot consume the debounce.
   await page.clock.pauseAt(clockStart + 60_000);
@@ -2075,7 +2074,7 @@ test("global Search retries one failed group and scrolls through remaining pages
       };
     },
   });
-  await page.goto("/?view=search&search=North");
+  await page.goto("/search?q=North");
   const movies = page.getByRole("region", {
     name: "Movies results",
     exact: true,
@@ -2133,10 +2132,10 @@ test("search query and selected result survive navigation and browser back", asy
   page,
 }) => {
   await mockApi(page);
-  await page.goto("/?view=search&section=live&category=news&search=Night");
+  await page.goto("/search?q=Night");
   await page.getByRole("button", { name: "Open Night Shift" }).click();
   await expect(page).toHaveURL(
-    (url) => url.searchParams.get("section") === "series",
+    (url) => url.searchParams.get("kind") === "series",
   );
   const origin = page.url();
   await navigateLibrary(page, "live");
@@ -2158,7 +2157,7 @@ test("mobile navigation and category filters remain accessible", async ({
 }) => {
   await mockApi(page);
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await navigateLibrary(page, "movie");
   await expect(
     page.getByRole("button", { name: "Open The Quiet Coast" }),
@@ -2177,7 +2176,7 @@ test("switching watch workspace routes waits for a late stream session to be rel
     createDelayMs: 600,
     catalogItems: [movie, { ...movie, id: "movie-other", name: "Other Film" }],
   });
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect.poll(() => api.events.includes("POST")).toBe(true);
@@ -2225,7 +2224,7 @@ test("cached thumbnails reveal after repeated section switches and failed artwor
       { ...series, image },
     ],
   });
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   const checkTop = async () => {
     for (let index = 0; index < 4; index++)
       await expect(
@@ -2340,7 +2339,7 @@ test("history artwork falls through TMDB and library failures and resets when di
       body: broken ? "" : svg,
     });
   });
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const continuing = page.getByRole("region", {
     name: "Continue watching",
     exact: true,
@@ -2448,7 +2447,7 @@ test("playing a library title retains its versioned artwork in history", async (
       body: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="180"/>',
     }),
   );
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page
     .getByRole("button", { name: `Open ${title.name}`, exact: true })
     .click();
@@ -2459,7 +2458,7 @@ test("playing a library title retains its versioned artwork in history", async (
   await page
     .getByRole("button", { name: "Stop playback", exact: true })
     .click();
-  await page.getByRole("button", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   for (const name of ["Continue watching", "Recently played"])
     await expect(
       page.getByRole("region", { name, exact: true }).locator("img"),
@@ -2482,7 +2481,7 @@ test("channel details contain the full guide with a static cinema background", a
       },
     ],
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await expect(page.locator(".card-live-icon")).toHaveCount(1);
   await expect(page.locator(".header-status")).toHaveCount(0);
   await expect(
@@ -2529,7 +2528,7 @@ test("channel schedule scrolls without a scrollbar and is restored after watchin
       })),
     ],
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await page.getByRole("button", { name: "Open North News" }).click();
   const guide = page.getByRole("region", { name: "On this channel" });
   const schedule = guide.locator(".channel-schedule");
@@ -2657,7 +2656,7 @@ for (const item of [live, movie, series]) {
     await expect(search).toBeFocused();
     await expect(page).toHaveURL(
       (url) =>
-        url.searchParams.get("search") === "Search result" &&
+        url.searchParams.get("q") === "Search result" &&
         !url.searchParams.has("item"),
     );
   });
@@ -2692,7 +2691,7 @@ test("live tiles show only the current programme when the provider supplies one"
       },
     ],
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   const current = page.getByRole("button", { name: "Open North News" });
   await expect(current.locator(".card-programme")).toHaveText("Morning Report");
   await expect(current).not.toContainText("City Desk");
@@ -2716,7 +2715,7 @@ test("channel details require Play again after leaving the watch workspace, incl
     catalogItems: [live, other],
     releaseDelayMs: 200,
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await page.getByRole("button", { name: "Open North News" }).click();
   await page.getByRole("button", { name: "Open World Report" }).click();
   await expect(
@@ -2736,7 +2735,7 @@ test("channel details require Play again after leaving the watch workspace, incl
   await expect(
     page.getByLabel(`${live.name} video`, { exact: true }),
   ).toBeVisible();
-  await expect(page).toHaveURL(/view=player/);
+  await expect(page).toHaveURL(/\/watch(?:\?|$)/);
   expect(
     api.events
       .filter((event) => event === "POST" || event === "DELETE")
@@ -2770,7 +2769,7 @@ test("rapid channel changes skip an intermediate tune and wait for a late stream
     createGate,
     releaseDelayMs: 150,
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await page.getByRole("button", { name: "Open North News" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect.poll(() => api.sessionItemIds).toEqual([live.id]);
@@ -2823,7 +2822,7 @@ test("library refresh discovers new series and episodes after leaving playback f
     }),
     episodeItems: () => (published ? [...episodes, newEpisode] : episodes),
   });
-  await page.goto("/?section=series");
+  await page.goto("/shows");
   await page.getByRole("button", { name: "Open Night Shift" }).click();
   await page.getByRole("combobox", { name: "Season" }).click();
   await page.getByRole("option", { name: "Season 2" }).click();
@@ -2867,7 +2866,7 @@ test("Settings keyboard controls retain independent drafts", async ({
   page,
 }) => {
   const api = await mockApi(page, { providerEnvironment: ["deviceId"] });
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   const device = page.getByRole("button", {
     name: "Device identity",
     exact: true,
@@ -2907,7 +2906,7 @@ test("Settings section navigation preserves drafts on desktop and mobile", async
   page,
 }) => {
   const api = await mockApi(page);
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   const settingsURL = page.url();
   await page.getByText("Device identity", { exact: true }).click();
   const serial = page.getByLabel("Serial number", { exact: true });
@@ -2967,7 +2966,7 @@ test("Settings actions support keyboard submission and prevent duplicate pending
     releaseSave = resolve;
   });
   const api = await mockApi(page, { settingsSaveGate, refreshDelayMs: 1000 });
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   const save = page.getByRole("button", { name: "Save changes", exact: true });
   await page
     .getByLabel("Maximum simultaneous streams", { exact: true })
@@ -3025,7 +3024,7 @@ test("Settings saves modified sections together and restores saved values", asyn
   page,
 }) => {
   const api = await mockApi(page, { guideHours: 6 });
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   await expect(
     page.getByLabel("Guide coverage in hours", { exact: true }),
   ).toHaveValue("6");
@@ -3127,7 +3126,7 @@ test("Settings discards all drafts without saving and preserves drafts during re
   const width = 390;
   await page.setViewportSize({ width, height: 900 });
   const api = await mockApi(page, { refreshDelayMs: 500 });
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   await expect(
     page.getByText(/The library and guide use the selected refresh interval/),
   ).toBeVisible();
@@ -3198,7 +3197,7 @@ test("Settings preserves and removes unavailable category rules on mobile", asyn
       },
     },
   });
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   await page
     .getByRole("button", {
       name: "Remove movie:Archived category with a long name from Home categories",
@@ -3234,7 +3233,7 @@ test("Settings edits remaining provider fields with environment overrides at 390
   await page.setViewportSize({ width, height: 900 });
   const managed = ["portalUrl", "mac", "timezone"] as const;
   const api = await mockApi(page, { providerEnvironment: [...managed] });
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   for (const label of ["Portal URL", "MAC address", "Timezone"]) {
     const input = page.getByLabel(label, { exact: true });
     await expect(input).toBeDisabled();
@@ -3288,7 +3287,7 @@ test("Settings locks a fully environment-managed provider and still saves playba
       "deviceId2",
     ],
   });
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   await page.getByText("Device identity", { exact: true }).click();
   for (const label of [
     "Portal URL",
@@ -3326,7 +3325,7 @@ test("Settings completes provider setup when only the portal URL is managed by e
     unconfigured: true,
     providerEnvironment: ["portalUrl"],
   });
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   await expect(page.getByLabel("Portal URL", { exact: true })).toBeDisabled();
   await expect(
     page.getByRole("button", { name: "Refresh now", exact: true }),
@@ -3359,7 +3358,7 @@ for (const width of [1440, 320]) {
       ],
       tmdbTokenConfigured: true,
     });
-    await page.goto("/?view=settings");
+    await page.goto("/settings");
     for (const label of ["Portal URL", "MAC address", "Timezone"]) {
       const input = page.getByLabel(label, { exact: true });
       await expect(input).toHaveAttribute(
@@ -3455,7 +3454,7 @@ test("Settings keeps failed drafts and masks, retains and clears the TMDB token"
 }) => {
   let fail = true;
   const api = await mockApi(page, { settingsSaveFailure: () => fail });
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   const token = page.getByLabel("TMDB read access token", { exact: true });
   await expect(token).toHaveAttribute("type", "password");
   await expect(token).toHaveAttribute(
@@ -3541,7 +3540,7 @@ test("Settings releases playback and refreshes metadata without changing saved c
 }) => {
   await page.setViewportSize({ width: 1440, height: 1024 });
   const api = await mockApi(page, { refreshDelayMs: 1500 });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await page.getByRole("button", { name: "Open North News" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect(page.locator(".primary-control")).toBeEnabled();
@@ -3584,7 +3583,7 @@ test("Settings releases playback and refreshes metadata without changing saved c
   await expect(page.locator("video")).toHaveCount(0);
 
   await page.goBack();
-  await expect(page).toHaveURL(/view=player/);
+  await expect(page).toHaveURL(/\/watch(?:\?|$)/);
   await expect(page.locator("video")).toBeVisible();
   await expect.poll(() => api.sessionItemIds).toEqual([live.id, live.id]);
 });
@@ -3597,7 +3596,7 @@ test("Settings reports configuration and refresh failures and respects provider 
     refreshFailure: true,
     preferencesFailure: () => configurationUnavailable,
   });
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   await expect(
     page.getByRole("alert").filter({ hasText: "Settings unavailable." }),
   ).toBeVisible();
@@ -3660,11 +3659,11 @@ test("Settings first-run setup protects every route and fits responsive layouts"
   // mounted notice to cover both mobile widths without repeating registration.
   for (const [name, url] of [
     ["home", "/"],
-    ["live", "/?section=live"],
-    ["movies", "/?section=movie"],
-    ["shows", "/?section=series"],
-    ["search", "/?view=search&search=North"],
-    ["player", "/?view=player&section=movie&item=movie-1"],
+    ["live", "/live"],
+    ["movies", "/movies"],
+    ["shows", "/shows"],
+    ["search", "/search?q=North"],
+    ["player", "/movies/movie-1/watch"],
   ]) {
     await page.goto(url);
     await expectSetupNotice(1440);
@@ -3729,7 +3728,7 @@ test("Settings first-run setup protects every route and fits responsive layouts"
       name: width <= 820 ? "Primary navigation" : "Library",
       exact: true,
     });
-    await navigation.getByRole("button", { name: "Home", exact: true }).click();
+    await navigation.getByRole("link", { name: "Home", exact: true }).click();
     await expect(
       page.getByRole("region", { name: "Home", exact: true }),
     ).toBeVisible();
@@ -3746,7 +3745,7 @@ test("native HLS plays and seeks locally without loading the decoder or worker",
     if (/\/assets\/hls(?:[.-])/.test(new URL(request.url()).pathname))
       decoderRequests.push(request.url());
   });
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   expect(decoderRequests).toEqual([]);
   await page.getByRole("button", { name: "Play", exact: true }).click();
@@ -3820,7 +3819,7 @@ test("server seek polls readiness immediately and preserves an explicit pause", 
       },
     });
   });
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   const firstPoll = page.waitForResponse(
     (response) =>
@@ -3882,7 +3881,7 @@ test("HLS.js is preferred even when the browser advertises native HLS", async ({
       manifestRequests.push(request.resourceType());
   });
   page.on("pageerror", (error) => errors.push(error.message));
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   // The invalid fixture reaches HLS.js without a failed native media request.
@@ -3930,7 +3929,7 @@ test("closing while the HLS decoder downloads prevents a late media attachment",
     await downloadHeld;
     await route.continue();
   });
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await requested;
@@ -3964,7 +3963,7 @@ test("season episodes load on demand and returning shows cached results while ch
       }),
     });
   });
-  await page.goto("/?section=series");
+  await page.goto("/shows");
   await page.getByRole("button", { name: "Open Night Shift" }).click();
   await expect(page.getByRole("button", { name: /First Light/ })).toBeVisible();
   expect(requested).toEqual(["first"]);
@@ -4008,12 +4007,12 @@ test("an empty Home offers a VOD entry point and responsive navigation", async (
   await expect(
     page
       .getByRole("navigation", { name: "Library" })
-      .getByRole("button", { name: "VOD", exact: true }),
+      .getByRole("link", { name: "VOD", exact: true }),
   ).toHaveAttribute("aria-current", "page");
   await expect(
     page.getByRole("button", { name: "Open The Quiet Coast", exact: true }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   await expect(page.getByRole("button", { name: "Clear history" })).toHaveCount(
     0,
   );
@@ -4027,12 +4026,13 @@ test("an empty Home offers a VOD entry point and responsive navigation", async (
     ).toBe(false);
   }
   const mobile = page.getByRole("navigation", { name: "Primary navigation" });
-  await expect(mobile.getByRole("button")).toHaveCount(5);
+  await expect(mobile.getByRole("link")).toHaveCount(4);
+  await expect(mobile.getByRole("button")).toHaveCount(1);
   await navigateLibrary(page, "movie");
   await expect(
     page.getByRole("button", { name: "Open The Quiet Coast" }),
   ).toBeVisible();
-  await mobile.getByRole("button", { name: "Home", exact: true }).click();
+  await mobile.getByRole("link", { name: "Home", exact: true }).click();
   await expect(
     page.getByRole("region", { name: "Recently played" }),
   ).toHaveCount(0);
@@ -4043,9 +4043,9 @@ test("dashboard history records playing media, survives reloads, reopens a seaso
 }) => {
   test.setTimeout(60000);
   const api = await mockApi(page);
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await page.getByRole("button", { name: "Open North News" }).click();
-  await page.getByRole("button", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   await expect(
     page.getByRole("region", { name: "Recently played" }),
   ).toHaveCount(0);
@@ -4064,7 +4064,7 @@ test("dashboard history records playing media, survives reloads, reopens a seaso
     await playableVideo(page);
     await playableVideo(page); // Buffer recovery must not duplicate history.
     await page.getByRole("button", { name: "Stop playback" }).click();
-    await page.getByRole("button", { name: "Home", exact: true }).click();
+    await page.getByRole("link", { name: "Home", exact: true }).click();
     await expect(
       page
         .getByRole("region", { name: "Recently played" })
@@ -4080,7 +4080,7 @@ test("dashboard history records playing media, survives reloads, reopens a seaso
   await expect(page.locator("video")).toHaveAttribute("src", /index\.m3u8/);
   await playableVideo(page);
   await page.getByRole("button", { name: "Stop playback" }).click();
-  await page.getByRole("button", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   await page.reload();
   await expect(
     page
@@ -4142,7 +4142,7 @@ test("series history updates to the latest episode without duplicating the show"
   page,
 }) => {
   await mockApi(page);
-  await page.goto("/?section=series");
+  await page.goto("/shows");
   for (const name of ["First Light", "After Hours"]) {
     const expanded = page.getByRole("region", { name: "Expanded title" });
     if (!(await expanded.isVisible()))
@@ -4152,7 +4152,7 @@ test("series history updates to the latest episode without duplicating the show"
     await playableVideo(page);
     await page.getByRole("button", { name: "Stop playback" }).click();
   }
-  await page.getByRole("button", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   await expect(
     page
       .getByRole("region", { name: "Recently played" })
@@ -4170,7 +4170,7 @@ test("failed playback is not recorded in dashboard history", async ({
   page,
 }) => {
   const api = await mockApi(page, { capacity: true });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await page.getByRole("button", { name: "Open North News" }).click();
   expect(api.events).not.toContain("POST");
   await page.getByRole("button", { name: "Play", exact: true }).click();
@@ -4182,7 +4182,7 @@ test("failed playback is not recorded in dashboard history", async ({
   await expect(
     page.getByRole("button", { name: "Open North News", exact: true }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   await expect(
     page.getByRole("region", { name: "Recently played" }),
   ).toHaveCount(0);
@@ -4228,7 +4228,7 @@ test("playback queued after an initial history failure recovers its server lease
         response.url().endsWith("/api/watch-history") &&
         response.status() === 503,
     );
-    await page.goto("/?section=movie");
+    await page.goto("/movies");
     await failedRead;
     await page
       .getByRole("button", { name: "Open The Quiet Coast", exact: true })
@@ -4252,7 +4252,7 @@ test("playback queued after an initial history failure recovers its server lease
     await page
       .getByRole("button", { name: "Stop playback", exact: true })
       .click();
-    await page.getByRole("button", { name: "Home", exact: true }).click();
+    await page.getByRole("link", { name: "Home", exact: true }).click();
     api.history.seed([
       { ...api.history.read()[0], position: 120, playbackId: "other-device" },
     ]);
@@ -4296,7 +4296,7 @@ test("history sync failures retain saved entries and recover on focus", async ({
       });
     return route.fallback();
   });
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const continuing = page.getByRole("region", { name: "Continue watching" });
   await expect(continuing).toBeVisible();
   failed = true;
@@ -4350,7 +4350,7 @@ test("dashboard safely handles unavailable titles in server history", async ({
       completed: false,
     },
   ]);
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   await expect(
     page
       .getByRole("region", { name: "Recently played" })
@@ -4381,13 +4381,13 @@ test("dashboard remains usable when browser storage is blocked", async ({
       },
     });
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await page.getByRole("button", { name: "Open North News" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect(page.locator("video")).toHaveAttribute("src", /index\.m3u8/);
   await playableVideo(page);
   await page.getByRole("button", { name: "Stop playback" }).click();
-  await page.getByRole("button", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "Open North News" }),
   ).toBeVisible();
@@ -4417,13 +4417,13 @@ test("dashboard resumes the full source position and Play again starts at zero",
       completed: false,
     },
   ]);
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const continuing = page.getByRole("region", { name: "Continue watching" });
   await expect(continuing).toBeVisible();
   await continuing
     .getByRole("button", { name: /Resume The Quiet Coast/ })
     .click();
-  await expect(page).toHaveURL(/view=player/);
+  await expect(page).toHaveURL(/\/watch(?:\?|$)/);
   await expect(page.getByRole("button", { name: /^Back to / })).toHaveCount(0);
   await expect(continuing).not.toBeVisible();
   await expect.poll(() => api.sessionStarts).toEqual([300]);
@@ -4444,7 +4444,7 @@ test("dashboard resumes the full source position and Play again starts at zero",
   await page.getByRole("button", { name: "Play again" }).click();
   await expect.poll(() => api.sessionStarts).toEqual([300, 0]);
   await page.getByRole("button", { name: "Stop playback" }).click();
-  await expect(page).toHaveURL(/view=dashboard/);
+  await expect(page).toHaveURL(/\/$/);
   await expectHome(page);
 });
 
@@ -4487,7 +4487,7 @@ test("Up next includes shows outside Home categories and plays the next season a
       completed: true,
     },
   ]);
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const next = page.getByRole("region", { name: "Up next" });
   await expect(next).toContainText("Fresh Start");
   await expect(
@@ -4508,7 +4508,7 @@ test("server history syncs progress, removals and clear across devices and isola
   await page.setViewportSize({ width: 1440, height: 900 });
   const history = createHistoryFixture();
   const desktop = await mockApi(page, { history, user: "alice" });
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   const origin = new URL(page.url()).origin;
   const phoneContext = await browser.newContext({
     viewport: { width: 390, height: 844 },
@@ -4552,7 +4552,7 @@ test("server history syncs progress, removals and clear across devices and isola
       .poll(() => history.read("alice")[0])
       .toMatchObject({ position: 125, playbackId: phonePlayback });
     await page.getByRole("button", { name: "Stop playback" }).click();
-    await page.getByRole("button", { name: "Home", exact: true }).click();
+    await page.getByRole("link", { name: "Home", exact: true }).click();
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
     const desktopContinue = page.getByRole("region", {
       name: "Continue watching",
@@ -4658,7 +4658,7 @@ test("hero rotates Trending and saved titles and resumes the right source", asyn
       exploreSeries: [],
     },
   });
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const hero = page.getByRole("region", {
     name: "Featured titles",
     exact: true,
@@ -4666,7 +4666,7 @@ test("hero rotates Trending and saved titles and resumes the right source", asyn
   const heading = hero.getByRole("heading");
   const advance = async () => {
     const before = await heading.textContent();
-    await page.getByRole("button", { name: "Home", exact: true }).focus();
+    await page.getByRole("link", { name: "Home", exact: true }).focus();
     await page.mouse.move(0, 0);
     await expect(heading).not.toHaveText(before!);
   };
@@ -4764,7 +4764,7 @@ test("hero crossfades without repeating or jumping on refresh and pauses during 
     exploreSeries: [],
   };
   await mockApi(page, { discoveryResponse: discovery });
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const hero = page.getByRole("region", {
     name: "Featured titles",
     exact: true,
@@ -4801,7 +4801,7 @@ test("hero crossfades without repeating or jumping on refresh and pauses during 
   current = (await heading.textContent())!;
   await tick();
   await expect(heading).toHaveText(current);
-  await page.getByRole("button", { name: "Home", exact: true }).focus();
+  await page.getByRole("link", { name: "Home", exact: true }).focus();
   await page.mouse.move(0, 0);
   await tick(true);
   await expect(heading).not.toHaveText(current);
@@ -4884,7 +4884,7 @@ test("hero keeps automatic rotation off for reduced motion without extra control
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.clock.install();
   await mockApi(page);
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const hero = page.getByRole("region", {
     name: "Featured titles",
     exact: true,
@@ -4903,9 +4903,7 @@ test("a direct series player route resolves its episode and reload resumes progr
   page,
 }) => {
   const api = await mockApi(page);
-  await page.goto(
-    "/?view=player&section=series&item=series-1&season=2&episode=episode-3",
-  );
+  await page.goto("/shows/series-1/watch?season=2&episode=episode-3");
   await expect(
     page.getByRole("region", { name: "Player", exact: true }),
   ).toBeVisible();
@@ -4931,7 +4929,7 @@ test("a direct series player route resolves its episode and reload resumes progr
     .poll(() => api.events.filter((event) => event === "DELETE").length)
     .toBe(1);
   await page.reload();
-  await expect(page).toHaveURL(/view=player/);
+  await expect(page).toHaveURL(/\/watch(?:\?|$)/);
   await expect(page.locator(".dock-title")).toHaveText(series.name);
   await expect(
     page
@@ -4950,7 +4948,7 @@ test("a direct series player route resolves its episode and reload resumes progr
     .getByRole("button", { name: "Stop playback", exact: true })
     .click();
   await expect(page.locator("video")).toHaveCount(0);
-  expect(new URL(page.url()).searchParams.get("view")).not.toBe("player");
+  expect(new URL(page.url()).pathname.endsWith("/watch")).toBe(false);
   await expect(
     page.getByRole("combobox", { name: "Season", exact: true }),
   ).toHaveText("Season 2");
@@ -4966,7 +4964,7 @@ test("closing the workspace saves the latest movie position and Forward resumes 
   page,
 }) => {
   const api = await mockApi(page, { releaseDelayMs: 100 });
-  await page.goto("/?view=search&section=movie&search=Quiet");
+  await page.goto("/search?q=Quiet");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   const origin = page.url();
   await page.getByRole("button", { name: "Play", exact: true }).click();
@@ -4989,14 +4987,14 @@ test("closing the workspace saves the latest movie position and Forward resumes 
     .toBe(1);
   await expect.poll(() => api.history.read()[0]?.position).toBe(120);
   await page.goForward();
-  await expect(page).toHaveURL(/view=player/);
+  await expect(page).toHaveURL(/\/watch(?:\?|$)/);
   await expect.poll(() => api.sessionItemIds).toEqual([movie.id, movie.id]);
   await expect.poll(() => api.sessionStarts).toEqual([0, 120]);
   await expect(page.locator("video")).toHaveCount(1);
   expect(
     api.events.filter((event) => event === "POST" || event === "DELETE"),
   ).toEqual(["POST", "DELETE", "POST"]);
-  await page.getByRole("button", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   await expectHome(page);
   await expect(page.locator("video")).toHaveCount(0);
   await expect
@@ -5027,7 +5025,7 @@ test("a pending Dashboard Play request cannot reopen the player after leaving", 
       .catch(() => {});
   });
   try {
-    await page.goto("/?view=dashboard");
+    await page.goto("/");
     await page
       .getByRole("button", { name: `Play ${movie.name}`, exact: true })
       .click();
@@ -5038,7 +5036,7 @@ test("a pending Dashboard Play request cannot reopen the player after leaving", 
     ).toBeVisible();
     releaseMetadata();
     await page.waitForTimeout(500);
-    await expect(page).toHaveURL(/view=settings/);
+    await expect(page).toHaveURL(/\/settings$/);
     await expect(page.locator("video")).toHaveCount(0);
     await expect(
       page.getByRole("region", { name: "Player", exact: true }),
@@ -5060,7 +5058,7 @@ test("hidden playback batches frequent history updates within the progress inter
     return route.fallback();
   });
   await page.clock.install();
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page
     .getByRole("button", { name: "Open The Quiet Coast", exact: true })
     .click();
@@ -5097,7 +5095,7 @@ test("hidden playback batches frequent history updates within the progress inter
   await page
     .getByRole("button", { name: "Stop playback", exact: true })
     .click();
-  await page.getByRole("button", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   await expectHome(page);
 });
 
@@ -5105,7 +5103,7 @@ test("persisted pageshow restores a pagehidden player at its saved source offset
   page,
 }) => {
   const api = await mockApi(page);
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect(page.locator("video")).toHaveAttribute("src", /index\.m3u8/);
@@ -5152,7 +5150,7 @@ test("workspace side episodes keep the current stream while browsing seasons and
   page,
 }) => {
   const api = await mockApi(page, { releaseDelayMs: 150 });
-  await page.goto("/?section=series");
+  await page.goto("/shows");
   await page.getByRole("button", { name: "Open Night Shift" }).click();
   await page.getByRole("button", { name: /First Light/ }).click();
   await expect.poll(() => api.sessionItemIds).toEqual([episodes[0].id]);
@@ -5205,7 +5203,7 @@ test("workspace channel suggestions retain the active channel and release before
     catalogItems: [live, other],
     releaseDelayMs: 150,
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await page
     .getByRole("button", { name: "Open North News", exact: true })
     .click();
@@ -5226,7 +5224,7 @@ test("workspace channel suggestions retain the active channel and release before
     .getByRole("button", { name: "Watch World Report", exact: true })
     .click();
   await expect.poll(() => api.sessionItemIds).toEqual([live.id, other.id]);
-  await expect(page).toHaveURL(/item=live-2/);
+  await expect(page).toHaveURL(/\/live\/live-2\/watch/);
   await expect(page.locator("video")).toHaveCount(1);
   await expect(
     channels.getByRole("button", { name: "Watch World Report", exact: true }),
@@ -5266,7 +5264,7 @@ test("dashboard discovery preserves playback metadata and sidebar movies switch 
       exploreSeries: [{ item: series, name: series.name }],
     },
   });
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   await page
     .getByRole("button", { name: `Play ${movie.name}`, exact: true })
     .click();
@@ -5414,7 +5412,7 @@ test("Home categories filter discovery while personal history respects blocked c
   const discoveryReady = page.waitForResponse(
     (response) => new URL(response.url()).pathname === "/api/discovery",
   );
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const recent = page.getByRole("region", {
     name: "Recently played",
     exact: true,
@@ -5511,12 +5509,11 @@ test("Home categories filter discovery while personal history respects blocked c
   ).toHaveCount(0);
   await expect(page).toHaveURL(
     (url) =>
-      url.searchParams.get("view") === "search" &&
-      url.searchParams.get("search") === personal.name,
+      url.pathname === "/search" && url.searchParams.get("q") === personal.name,
   );
   await expect(search).toBeVisible();
   await expect(search).toHaveValue(personal.name);
-  await navigation.getByRole("button", { name: "Home", exact: true }).click();
+  await navigation.getByRole("link", { name: "Home", exact: true }).click();
   await expect(recent).not.toContainText(personal.name);
   for (const title of [hidden, blocked]) {
     await page.goto(`/?view=player&section=movie&item=${title.id}`);
@@ -5629,7 +5626,7 @@ test("Dashboard applies saved category rules to stale and mixed-case history wit
       exploreSeries: [],
     },
   });
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const recent = page.getByRole("region", {
     name: "Recently played",
     exact: true,
@@ -5754,8 +5751,8 @@ for (const base of [movie, series, live]) {
     await expect(page).toHaveURL(
       (url) =>
         url.searchParams.get("category") === "other" &&
-        !url.searchParams.has("search") &&
-        url.searchParams.get("view") !== "player",
+        !url.searchParams.has("q") &&
+        !url.pathname.endsWith("/watch"),
     );
   });
 
@@ -5781,7 +5778,7 @@ for (const base of [movie, series, live]) {
       results.getByRole("region", { name: "Expanded title", exact: true }),
     ).toBeVisible();
     await expect(page).toHaveURL(
-      (url) => url.searchParams.get("section") === base.kind,
+      (url) => url.searchParams.get("kind") === base.kind,
     );
     const origin = new URL(page.url());
     if (base.kind === "series") {
@@ -5828,10 +5825,10 @@ test("category dropdown supports keyboard selection and retains scoped VOD contr
   page,
 }) => {
   await mockApi(page);
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   const vod = page
     .getByRole("navigation", { name: "Library", exact: true })
-    .getByRole("button", { name: "VOD", exact: true });
+    .getByRole("link", { name: "VOD", exact: true });
   await expect(vod.locator("svg")).toHaveCount(1);
   await expect(vod).toHaveAttribute("aria-current", "page");
   const movies = page
@@ -5893,9 +5890,13 @@ for (const width of [1440, 320]) {
       exact: true,
     });
     await expectHome(page);
-    await expect(navigation.getByRole("button")).toHaveCount(5);
+    await expect(navigation.getByRole("link")).toHaveCount(4);
+    await expect(navigation.getByRole("button")).toHaveCount(1);
     for (const name of ["Home", "Search", "VOD", "Live TV", "Account"]) {
-      const button = navigation.getByRole("button", { name, exact: true });
+      const button = navigation.getByRole(
+        name === "Account" ? "button" : "link",
+        { name, exact: true },
+      );
       await expect(button).toBeVisible();
       await expect(button.locator("svg")).toHaveCount(1);
       await expect(button.locator(".navigation-label")).toHaveCount(0);
@@ -5903,10 +5904,10 @@ for (const width of [1440, 320]) {
       await expect(button).toHaveAttribute("aria-label", name);
     }
     await expect(
-      navigation.getByRole("button", { name: "Home", exact: true }),
+      navigation.getByRole("link", { name: "Home", exact: true }),
     ).toHaveAttribute("aria-current", "page");
     if (width > 820) {
-      const searchDestination = navigation.getByRole("button", {
+      const searchDestination = navigation.getByRole("link", {
         name: "Search",
         exact: true,
       });
@@ -5929,12 +5930,12 @@ for (const width of [1440, 320]) {
       page.getByRole("button", { name: "Open Night Shift", exact: true }),
     ).toBeVisible();
     await navigation
-      .getByRole("button", { name: "Live TV", exact: true })
+      .getByRole("link", { name: "Live TV", exact: true })
       .click();
     await expect(
       page.getByRole("button", { name: "Open North News", exact: true }),
     ).toBeVisible();
-    await navigation.getByRole("button", { name: "VOD", exact: true }).click();
+    await navigation.getByRole("link", { name: "VOD", exact: true }).click();
     await expect(
       page
         .getByRole("tablist", { name: "VOD type", exact: true })
@@ -5944,7 +5945,7 @@ for (const width of [1440, 320]) {
     await expect(
       page.getByRole("heading", { name: "Settings", exact: true }),
     ).toBeVisible();
-    await navigation.getByRole("button", { name: "Home", exact: true }).click();
+    await navigation.getByRole("link", { name: "Home", exact: true }).click();
     await expectHome(page);
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth),
@@ -5965,13 +5966,13 @@ test("sidebar destinations remain reachable after rotation and in short windows"
     name: "Library",
     exact: true,
   });
-  const brand = page.getByRole("button", { name: "Restream home" });
+  const brand = page.getByRole("link", { name: "Restream home" });
   const account = navigation.getByRole("button", { name: "Account" });
   await expect(navigation).toBeVisible();
   for (const height of [390, 280]) {
     await page.setViewportSize({ width: 844, height });
     for (const name of ["Search", "Home", "VOD", "Live TV"]) {
-      const button = navigation.getByRole("button", { name, exact: true });
+      const button = navigation.getByRole("link", { name, exact: true });
       // Focusing also exercises scrolling when the window cannot fit all links.
       await button.focus();
       await expect(button).toBeInViewport({ ratio: 1 });
@@ -5984,7 +5985,7 @@ test("sidebar destinations remain reachable after rotation and in short windows"
     await expect(brand).toBeInViewport({ ratio: 1 });
     await expect(account).toBeInViewport({ ratio: 1 });
   }
-  await navigation.getByRole("button", { name: "Search", exact: true }).click();
+  await navigation.getByRole("link", { name: "Search", exact: true }).click();
   await page.getByRole("searchbox", { name: "Search library" }).fill("Coast");
   await expect(
     page.getByRole("button", { name: "Open The Quiet Coast" }),
@@ -5996,7 +5997,7 @@ test("sidebar destinations remain reachable after rotation and in short windows"
   await page.setViewportSize({ width: 390, height: 844 });
   await page
     .getByRole("navigation", { name: "Primary navigation" })
-    .getByRole("button", { name: "Home", exact: true })
+    .getByRole("link", { name: "Home", exact: true })
     .click();
   await expectHome(page);
 });
@@ -6016,7 +6017,7 @@ test.describe("Chrome iPad viewport recovery", () => {
   }) => {
     await page.emulateMedia({ reducedMotion: "reduce" });
     const api = await mockApi(page);
-    await page.goto("/?view=search&section=movie&search=Coast");
+    await page.goto("/search?q=Coast");
     await page.getByRole("button", { name: "Open The Quiet Coast" }).click();
     await expect(
       page
@@ -6109,7 +6110,7 @@ test.describe("Chrome iPad viewport recovery", () => {
           // Read viewport and element coordinates together: mobile browser
           // panning can move the visible origin without scrolling the document.
           const { top, bottom, buttons } = await page
-            .locator(".app-sidebar button[aria-label]")
+            .locator(".app-sidebar :is(a, button)[aria-label]")
             .evaluateAll((elements) => ({
               top: visualViewport!.offsetTop,
               bottom: visualViewport!.offsetTop + visualViewport!.height,
@@ -6251,7 +6252,7 @@ test.describe("tablet rotation", () => {
     }));
     const api = await mockApi(page, { catalogItems: [...movies, ...channels] });
     await page.setViewportSize({ width: 768, height: 1024 });
-    await page.goto("/?section=movie");
+    await page.goto("/movies");
     const main = await page.locator("#main-content").elementHandle();
 
     for (const section of ["movie", "live", "search"] as const) {
@@ -6332,7 +6333,7 @@ for (const width of [1440, 320]) {
     }));
     await mockApi(page, { categories, catalogItems: titles });
     await page.setViewportSize({ width, height: 900 });
-    await page.goto("/?section=movie");
+    await page.goto("/movies");
     const category = page.getByRole("combobox", {
       name: "Category",
       exact: true,
@@ -6445,7 +6446,7 @@ for (const title of [movie, series, live]) {
     await expect(
       page.getByRole("combobox", { name: "Category", exact: true }),
     ).toContainText("All categories");
-    await expect(page).toHaveURL(/view=player/);
+    await expect(page).toHaveURL(/\/watch(?:\?|$)/);
     expect(
       await originalVideo!.evaluate(
         (element) => element === document.querySelector("video"),
@@ -6458,7 +6459,7 @@ for (const title of [movie, series, live]) {
     await page
       .getByRole("button", { name: "Stop playback", exact: true })
       .click();
-    expect(new URL(page.url()).searchParams.get("search")).toBeNull();
+    expect(new URL(page.url()).searchParams.get("q")).toBeNull();
     expect(new URL(page.url()).searchParams.get("category")).toBeNull();
   });
 }
@@ -6470,7 +6471,7 @@ for (const width of [390, 320]) {
     await mockApi(page);
     await page.setViewportSize({ width, height: 844 });
     await page.emulateMedia({ reducedMotion: "reduce" });
-    await page.goto("/?view=search&search=Quiet");
+    await page.goto("/search?q=Quiet");
     const results = page.getByRole("region", {
       name: "Movies results",
       exact: true,
@@ -6554,8 +6555,7 @@ for (const width of [1440, 320]) {
     ).toBeVisible();
     await expect(page).toHaveURL(
       (url) =>
-        url.searchParams.get("view") === "search" &&
-        url.searchParams.get("search") === "North",
+        url.pathname === "/search" && url.searchParams.get("q") === "North",
     );
     await page.reload();
     await expect(search).toHaveValue("North");
@@ -6564,14 +6564,14 @@ for (const width of [1440, 320]) {
       .click();
     const origin = page.url();
     await page.getByRole("button", { name: "Play", exact: true }).click();
-    await expect(page).toHaveURL(/view=player/);
+    await expect(page).toHaveURL(/\/watch(?:\?|$)/);
     await expect(search).toBeHidden();
     const navigation = page.getByRole("navigation", {
       name: width <= 820 ? "Primary navigation" : "Library",
       exact: true,
     });
     await expect(
-      navigation.getByRole("button", { name: "Search", exact: true }),
+      navigation.getByRole("link", { name: "Search", exact: true }),
     ).toHaveAttribute("aria-current", "page");
     await expect.poll(() => api.sessionItemIds).toEqual([live.id]);
     await page.goBack();
@@ -6579,7 +6579,7 @@ for (const width of [1440, 320]) {
     await expect(page.locator("video")).toHaveCount(0);
     await expect(search).toHaveValue("North");
     await page.goForward();
-    await expect(page).toHaveURL(/view=player/);
+    await expect(page).toHaveURL(/\/watch(?:\?|$)/);
     await expect.poll(() => api.sessionItemIds).toEqual([live.id, live.id]);
     await page
       .getByRole("button", { name: "Stop playback", exact: true })
@@ -6590,12 +6590,12 @@ for (const width of [1440, 320]) {
     await expect(
       page.getByRole("heading", { name: "Settings", exact: true }),
     ).toBeVisible();
-    await navigation.getByRole("button", { name: "VOD", exact: true }).click();
+    await navigation.getByRole("link", { name: "VOD", exact: true }).click();
     await expect(
       page.getByRole("button", { name: "Open The Quiet Coast", exact: true }),
     ).toBeVisible();
     await expect(page.getByRole("searchbox")).toHaveCount(0);
-    expect(new URL(page.url()).searchParams.get("search")).toBeNull();
+    expect(new URL(page.url()).searchParams.get("q")).toBeNull();
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth),
     ).toBeLessThanOrEqual(width);
@@ -6622,7 +6622,7 @@ for (const width of [1440, 320]) {
       },
     });
     await page.setViewportSize({ width, height: 900 });
-    await page.goto("/?section=movie");
+    await page.goto("/movies");
     await expect(
       page.getByRole("button", { name: "Open The Quiet Coast", exact: true }),
     ).toBeVisible();
@@ -6763,7 +6763,7 @@ test("cached browse results update in place and stop polling at 1440px", async (
     },
   });
   await page.clock.install();
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await expect(
     page.getByRole("button", { name: "Open The Quiet Coast" }),
   ).toBeVisible();
@@ -6830,7 +6830,7 @@ test("search replaces shifted cached pages together at 1440px", async ({
       return { items: [b], page: 3, total: 3, hasMore: false, revision: 2 };
     },
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   const search = await openSearch(page);
   await search.fill("Coast");
   await expect(
@@ -6896,7 +6896,7 @@ test("episode revalidation adds seasons while preserving selection at 1440px", a
     },
   });
   await page.clock.install();
-  await page.goto("/?section=series&item=series-1&season=2&episode=episode-3");
+  await page.goto("/shows/series-1?season=2&episode=episode-3");
   await expect(
     page.getByRole("button", { name: "Play Fresh Start", exact: true }),
   ).toBeVisible();
@@ -6938,7 +6938,7 @@ test("leaving a cached listing cancels its background revalidation", async ({
     },
   });
   await page.clock.install();
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await expect(
     page.getByRole("button", { name: "Open The Quiet Coast" }),
   ).toBeVisible();
@@ -6995,7 +6995,7 @@ test("invalidated later pages stay hidden during provider backoff", async ({
     },
   });
   await page.clock.install();
-  await page.goto("/?section=live");
+  await page.goto("/live");
   await (await openSearch(page)).fill("Coast");
   await expect(page.getByRole("alert")).toContainText(
     "This listing could not be refreshed",
@@ -7048,7 +7048,7 @@ test("scheduled library updates retain the loaded search range until revalidatio
       };
     },
   });
-  await page.goto("/?section=live");
+  await page.goto("/live");
   const search = await openSearch(page);
   await search.fill("Coast");
   await expect(
@@ -7086,7 +7086,7 @@ test("search waits for category policy then loads results without duplicate requ
   });
   const api = await mockApi(page, { preferencesGate });
   try {
-    await page.goto("/?view=search&search=Coast");
+    await page.goto("/search?q=Coast");
     const requests = () =>
       api.events.filter((event) => event.startsWith("BROWSE:"));
     await expect(
@@ -7130,7 +7130,7 @@ test("server history undo restores progress and preserves newer playback at 390p
     },
   ]);
   const saved = api.history.read();
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const undo = page.getByRole("button", { name: "Undo", exact: true });
   await page
     .getByRole("button", {
@@ -7196,9 +7196,7 @@ test("direct player retries retain errors while resolving titles and episodes at
     await itemGate;
     return route.fallback();
   });
-  await page.goto(
-    "/?view=player&section=series&item=series-1&season=1&episode=episode-1",
-  );
+  await page.goto("/shows/series-1/watch?season=1&episode=episode-1");
   const alert = page.getByRole("alert");
   const retry = page.getByRole("button", { name: "Try again", exact: true });
   await expect(alert).toContainText("Title temporarily unavailable");
@@ -7436,7 +7434,7 @@ for (const width of [1440, 390]) {
         exploreSeries: [],
       },
     });
-    await page.goto("/?view=dashboard");
+    await page.goto("/");
     const section = page.getByRole("region", {
       name: "Trending now",
       exact: true,
@@ -7561,7 +7559,7 @@ test("Trending retains its rail while refreshing and adds matches in place", asy
     if (gate) await gate;
     await route.fulfill({ json });
   });
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const rail = page.getByRole("region", {
     name: "Trending now",
     exact: true,
@@ -7657,7 +7655,7 @@ test("Trending fills an empty rail progressively", async ({ page }) => {
       },
     });
   });
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   try {
     await expect(page.locator(".discovery-skeleton-grid")).toBeVisible();
   } finally {
@@ -7699,7 +7697,7 @@ test("history undo pauses for hover and focus and expires across navigation", as
     },
   ]);
   await page.clock.install();
-  await page.goto("/?view=dashboard");
+  await page.goto("/");
   const undo = page.getByRole("button", { name: "Undo", exact: true });
   await page
     .getByRole("button", {
@@ -7730,7 +7728,7 @@ test("history undo pauses for hover and focus and expires across navigation", as
   // frames normally rather than using a single jump as above while paused.
   await page.clock.runFor(8500);
   await expect(undo).toHaveCount(0);
-  await page.getByRole("button", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Home", exact: true }).click();
   await expect(undo).toHaveCount(0);
   expect(api.history.read()).toEqual([]);
 });
@@ -7777,7 +7775,7 @@ test("manual library and episode retries reset only failed work and keep cached 
     await route.fulfill({ status: 204 });
   });
   await page.clock.install();
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   const cached = page.getByRole("button", {
     name: "Open The Quiet Coast",
     exact: true,
@@ -7824,7 +7822,7 @@ test("manual library and episode retries reset only failed work and keep cached 
   });
   expect(episodeReads).toBe(settled);
   await page.clock.resume();
-  await page.goto("/?section=live");
+  await page.goto("/live");
 });
 
 test("in-flight listing and episode recovery expires and navigation cancels pending polls", async ({
@@ -7855,7 +7853,7 @@ test("in-flight listing and episode recovery expires and navigation cancels pend
     },
   });
   await page.clock.install();
-  await page.goto("/?section=movie");
+  await page.goto("/movies");
   await expect(
     page.getByRole("button", { name: "Open The Quiet Coast" }),
   ).toBeVisible();
@@ -7904,7 +7902,7 @@ test("fatal session recovery preserves position, releases sessions, and exhausts
       },
     });
   });
-  await page.goto("/?view=player&section=movie&item=movie-1");
+  await page.goto("/movies/movie-1/watch");
   await expect(page.locator("video")).toHaveAttribute("src", /session-1/);
   await playableVideo(page, 42);
   fail = true;
@@ -7958,7 +7956,7 @@ test("paused playback and a cooldown beyond the recovery budget do not restart a
       },
     });
   });
-  await page.goto("/?view=player&section=movie&item=movie-1");
+  await page.goto("/movies/movie-1/watch");
   await expect(page.locator("video")).toHaveAttribute("src", /session-1/);
   await playableVideo(page, 42);
   await page.getByRole("button", { name: "Pause", exact: true }).click();
@@ -7994,7 +7992,7 @@ test("an uncertain session creation failure waits for an explicit retry", async 
       });
     return route.fallback();
   });
-  await page.goto("/?view=player&section=movie&item=movie-1");
+  await page.goto("/movies/movie-1/watch");
   await expect(page.getByRole("alert")).toContainText(
     "Creation outcome unavailable",
   );
@@ -8050,7 +8048,7 @@ test("subtitle failures stop across timeline changes and CC retry restores capti
           });
     },
   );
-  await page.goto("/?view=player&section=movie&item=movie-1");
+  await page.goto("/movies/movie-1/watch");
   await expect(page.locator("video")).toHaveAttribute("src", /session-1/);
   await playableVideo(page, 42);
   await page.locator("video").evaluate((video) =>
@@ -8118,7 +8116,7 @@ test("subtitle failures stop across timeline changes and CC retry restores capti
     .poll(() => api.events.filter((event) => event === "DELETE").length)
     .toBe(1);
   await page.clock.resume();
-  await page.goto("/?section=live");
+  await page.goto("/live");
 });
 
 test("a recovery session that starts near the deadline is released when the total budget expires", async ({
@@ -8143,7 +8141,7 @@ test("a recovery session that starts near the deadline is released when the tota
       },
     });
   });
-  await page.goto("/?view=player&section=movie&item=movie-1");
+  await page.goto("/movies/movie-1/watch");
   await expect(page.locator("video")).toHaveAttribute("src", /session-1/);
   await playableVideo(page, 42);
   await page.clock.install();
@@ -8165,5 +8163,196 @@ test("a recovery session that starts near the deadline is released when the tota
   await page.clock.fastForward(60000);
   expect(api.sessionStarts).toHaveLength(2);
   await page.clock.resume();
-  await page.goto("/?section=live");
+  await page.goto("/live");
+});
+
+for (const width of [1440, 390]) {
+  test(`clean routes preserve browsing and remember separate categories at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    const api = await mockApi(page);
+    await page.goto("/?section=movie&category=drama-movie");
+    await expect(page).toHaveURL(/\/movies\?category=drama-movie$/);
+    const category = page.getByRole("combobox", {
+      name: "Category",
+      exact: true,
+    });
+    await expect(category).toContainText("Drama");
+    await page
+      .getByRole("button", { name: "Open The Quiet Coast", exact: true })
+      .click();
+    await expect(page).toHaveURL(/\/movies\/movie-1\?category=drama-movie$/);
+    await page.reload();
+    await expect(
+      page.getByRole("heading", { name: movie.name, level: 1 }),
+    ).toBeVisible();
+    await expect(page).toHaveTitle(`${movie.name} · Restream`);
+    await page.getByRole("link", { name: "Home", exact: true }).click();
+    await expect(page).toHaveURL(/\/$/);
+    await page.goBack();
+    await expect(
+      page.getByRole("heading", { name: movie.name, level: 1 }),
+    ).toBeVisible();
+    await navigateLibrary(page, "series");
+    await chooseCategory(page, "Drama");
+    await expect(page).toHaveURL(/\/shows\?category=drama-series$/);
+    await navigateLibrary(page, "live");
+    await chooseCategory(page, "News");
+    await expect(page).toHaveURL(/\/live\?category=news$/);
+    await openSettings(page);
+    await expect(page).toHaveURL(/\/settings$/);
+    await navigateLibrary(page, "movie");
+    await expect(category).toContainText("Drama");
+    await expect(page).toHaveURL(/\/movies\?category=drama-movie$/);
+    const length = await page.evaluate(() => history.length);
+    await page.getByRole("link", { name: "VOD", exact: true }).click();
+    expect(await page.evaluate(() => history.length)).toBe(length);
+    await navigateLibrary(page, "series");
+    await expect(category).toContainText("Drama");
+    await expect(page).toHaveURL(/\/shows\?category=drama-series$/);
+    await page.reload();
+    await navigateLibrary(page, "live");
+    await expect(category).toContainText("News");
+    const search = await openSearch(page);
+    await search.fill("Coast");
+    await expect(
+      page.getByRole("button", { name: "Open The Quiet Coast", exact: true }),
+    ).toBeVisible();
+    await expect(page).toHaveURL(/\/search\?q=Coast$/);
+    await page.getByRole("link", { name: "Home", exact: true }).click();
+    await expect(page).toHaveURL(/\/$/);
+    await page.reload();
+    await expect(
+      page.getByRole("link", { name: "VOD", exact: true }),
+    ).toHaveAttribute("href", "/movies?category=drama-movie");
+    await navigateLibrary(page, "movie");
+    await expect(category).toContainText("Drama");
+    // An explicit unfiltered link wins over a saved category, including after reload.
+    await page.goto("/movies");
+    await expect(category).toContainText("All categories");
+    await page.getByRole("link", { name: "Home", exact: true }).click();
+    await navigateLibrary(page, "movie");
+    await expect(category).toContainText("All categories");
+    await page.reload();
+    await expect(category).toContainText("All categories");
+    expect(api.events).not.toContain("POST");
+    await expect(
+      page.getByRole("button", { name: "Open The Quiet Coast", exact: true }),
+    ).toBeVisible();
+    await page.screenshot({
+      path: test.info().outputPath("browsing.png"),
+      animations: "disabled",
+    });
+  });
+}
+
+test("legacy search and player bookmarks normalize without losing their destination", async ({
+  page,
+}) => {
+  const api = await mockApi(page);
+  await page.goto(
+    "/?view=search&section=series&search=Night&item=series-1&season=2&episode=episode-3",
+  );
+  await expect(page).toHaveURL(
+    /\/search\?q=Night&item=series-1&kind=series&season=2&episode=episode-3$/,
+  );
+  await expect(
+    page.getByRole("heading", { name: series.name, level: 1 }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("searchbox", { name: "Search library", exact: true }),
+  ).toHaveValue("Night");
+  await page.goto(
+    "/?view=player&section=series&item=series-1&season=2&episode=episode-3",
+  );
+  await expect(page).toHaveURL(
+    /\/shows\/series-1\/watch\?season=2&episode=episode-3$/,
+  );
+  await expect.poll(() => api.sessionItemIds).toEqual([episodes[2].id]);
+  await page
+    .getByRole("button", { name: "Stop playback", exact: true })
+    .click();
+  await expect(page).toHaveURL(
+    /\/shows\/series-1\?season=2&episode=episode-3$/,
+  );
+  await page.goto(
+    "/?view=dashboard&section=movie&category=drama-movie&search=stale",
+  );
+  await expect(page).toHaveURL(/\/$/);
+  await expectHome(page);
+});
+
+for (const storage of ["corrupt", "unavailable", "removed-category"] as const) {
+  test(`category remembering falls back safely with ${storage} storage`, async ({
+    page,
+  }) => {
+    await page.addInitScript((mode) => {
+      const key = "restream:browse-categories:anonymous";
+      if (mode === "unavailable") {
+        for (const method of ["getItem", "setItem"] as const) {
+          const original = Storage.prototype[method];
+          Object.defineProperty(Storage.prototype, method, {
+            value: function (name: string, value?: string) {
+              if (name.startsWith("restream:browse-categories:"))
+                throw new DOMException("Unavailable", "SecurityError");
+              return original.call(this, name, value!);
+            },
+          });
+        }
+      } else {
+        localStorage.setItem(
+          key,
+          mode === "corrupt"
+            ? "{broken"
+            : JSON.stringify({ movie: "removed", series: 123, live: "news" }),
+        );
+      }
+    }, storage);
+    await mockApi(page);
+    await page.goto("/");
+    await expectHome(page);
+    await navigateLibrary(page, "movie");
+    await expect(page).toHaveURL(/\/movies$/);
+    await chooseCategory(page, "Drama");
+    await navigateLibrary(page, "live");
+    await navigateLibrary(page, "movie");
+    await expect(
+      page.getByRole("combobox", { name: "Category", exact: true }),
+    ).toContainText("Drama");
+  });
+}
+
+test("remembered categories stay separate for signed-in accounts and anonymous browsing", async ({
+  page,
+  context,
+}) => {
+  await mockApi(page, { user: "alice" });
+  await page.goto("/movies");
+  const sameAccount = await context.newPage();
+  await mockApi(sameAccount, { user: "alice" });
+  await sameAccount.goto("/live");
+  await chooseCategory(page, "Drama");
+  await chooseCategory(sameAccount, "News");
+  await sameAccount.close();
+  for (const user of ["bob", undefined]) {
+    const other = await context.newPage();
+    await mockApi(other, { user });
+    await other.goto("/");
+    await navigateLibrary(other, "movie");
+    await expect(
+      other.getByRole("combobox", { name: "Category", exact: true }),
+    ).toContainText("All categories");
+    await other.close();
+  }
+  await page.goto("/");
+  await navigateLibrary(page, "movie");
+  await expect(
+    page.getByRole("combobox", { name: "Category", exact: true }),
+  ).toContainText("Drama");
+  await navigateLibrary(page, "live");
+  await expect(
+    page.getByRole("combobox", { name: "Category", exact: true }),
+  ).toContainText("News");
 });

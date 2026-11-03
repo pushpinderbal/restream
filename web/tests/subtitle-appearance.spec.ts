@@ -68,7 +68,7 @@ for (const width of [1440, 320]) {
     const errors: string[] = [];
     page.on("pageerror", (error) => errors.push(error.message));
     const mutations = await mockSettings(page);
-    await page.goto("/?view=settings");
+    await page.goto("/settings");
     const section = page.getByRole("region", {
       name: "Subtitles",
       exact: true,
@@ -144,10 +144,10 @@ test("subtitle appearance synchronizes across tabs, including changes made while
   context,
 }) => {
   await mockSettings(page);
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   const other = await context.newPage();
   await mockSettings(other);
-  await other.goto("/?view=settings");
+  await other.goto("/settings");
   await choose(page, "Text color", "Cyan");
   await expect(
     other.getByRole("combobox", { name: "Text color", exact: true }),
@@ -160,7 +160,7 @@ test("subtitle appearance synchronizes across tabs, including changes made while
   // Unmount settings without reloading the application/module store.
   await other
     .getByRole("navigation", { name: "Library", exact: true })
-    .getByRole("button", { name: "Home", exact: true })
+    .getByRole("link", { name: "Home", exact: true })
     .click();
   await expect(
     other.getByRole("combobox", { name: "Text color", exact: true }),
@@ -187,14 +187,14 @@ test("subtitle appearance remains usable when browser storage is unavailable", a
     });
   });
   await mockSettings(page);
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   const preview = page.locator(".subtitle-preview-caption");
   await expect(page.getByText(/Browser storage is unavailable/)).toBeVisible();
   await choose(page, "Text color", "Cyan");
   await expect(preview).toHaveCSS("color", "rgb(128, 237, 255)");
   await page
     .getByRole("navigation", { name: "Library", exact: true })
-    .getByRole("button", { name: "Home", exact: true })
+    .getByRole("link", { name: "Home", exact: true })
     .click();
   await page
     .getByRole("button", { name: "Account", exact: true })
@@ -221,7 +221,7 @@ test("invalid stored subtitle preferences fall back to safe defaults", async ({
     );
   }, preferenceKey);
   await mockSettings(page);
-  await page.goto("/?view=settings");
+  await page.goto("/settings");
   await expect(
     page.getByRole("combobox", { name: "Font", exact: true }),
   ).toContainText("Serif");

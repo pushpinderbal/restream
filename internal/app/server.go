@@ -235,11 +235,17 @@ func (s *Server) static() http.Handler {
 			w.WriteHeader(405)
 			return
 		}
-		if r.URL.Path == "/" {
+		parts := strings.Split(strings.Trim(r.URL.EscapedPath(), "/"), "/")
+		library := parts[0] == "movies" || parts[0] == "shows" || parts[0] == "live"
+		page := r.URL.Path == "/" || r.URL.Path == "/search" || r.URL.Path == "/settings" ||
+			library && (len(parts) == 1 || len(parts) == 2 && parts[1] != "" || len(parts) == 3 && parts[1] != "" && parts[2] == "watch")
+		if page {
 			if _, err := os.Stat(filepath.Join(root, "index.html")); err != nil {
 				http.Error(w, "Web interface files are missing.", http.StatusServiceUnavailable)
 				return
 			}
+			http.ServeFile(w, r, filepath.Join(root, "index.html"))
+			return
 		}
 		files.ServeHTTP(w, r)
 	})

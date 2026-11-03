@@ -165,7 +165,7 @@ test("login gate prevents protected requests and reports callback errors", async
   page,
 }) => {
   const state = await mock(page, { mode: "oidc", user: null });
-  await page.goto("/?view=settings&auth_error=access_denied");
+  await page.goto("/settings?auth_error=access_denied");
   await expect(
     page.getByRole("link", { name: "Sign in", exact: true }),
   ).toHaveAttribute("href", "/auth/login");
@@ -204,7 +204,8 @@ for (const width of [1440, 320]) {
       width <= 820
         ? page.getByRole("navigation", { name: "Primary navigation" })
         : navigation(page);
-    await expect(nav.getByRole("button")).toHaveCount(5);
+    await expect(nav.getByRole("link")).toHaveCount(4);
+    await expect(nav.getByRole("button")).toHaveCount(1);
     await expect(
       nav.getByRole("button", { name: "Settings", exact: true }),
     ).toHaveCount(0);
@@ -321,11 +322,11 @@ test("viewer setup guidance protects every route and fits mobile widths", async 
   // The route authorization behavior is identical at every breakpoint.
   for (const [name, url] of [
     ["home", "/"],
-    ["live", "/?section=live"],
-    ["movies", "/?section=movie"],
-    ["shows", "/?section=series"],
-    ["search", "/?view=search&search=North"],
-    ["player", "/?view=player&section=movie&item=movie-1"],
+    ["live", "/live"],
+    ["movies", "/movies"],
+    ["shows", "/shows"],
+    ["search", "/search?q=North"],
+    ["player", "/movies/movie-1/watch"],
   ]) {
     await page.goto(url);
     await expectViewerNotice();
@@ -348,7 +349,7 @@ for (const width of [1440, 320]) {
     await page.setViewportSize({ width, height: 900 });
     await page.emulateMedia({ reducedMotion: "reduce" });
     const state = await mock(page, viewer);
-    await page.goto("/?view=settings");
+    await page.goto("/settings");
     await expect(
       page.getByRole("heading", { name: "Status", exact: true }),
     ).toBeVisible();
@@ -380,7 +381,7 @@ for (const width of [1440, 320]) {
         ? page.getByRole("navigation", { name: "Primary navigation" })
         : navigation(page);
     await expect(nav.getByRole("button", { name: "Settings" })).toHaveCount(0);
-    await nav.getByRole("button", { name: "Home", exact: true }).click();
+    await nav.getByRole("link", { name: "Home", exact: true }).click();
     const menu = await openAccount(page);
     await expect(menu.getByText("Alice", { exact: true })).toBeVisible();
     await menu.getByRole("menuitem", { name: "Settings", exact: true }).click();
@@ -457,7 +458,7 @@ test("expired sessions remove the signed-in private app", async ({ page }) => {
   ).toHaveCount(0);
   state.expire();
   await navigation(page)
-    .getByRole("button", { name: "VOD", exact: true })
+    .getByRole("link", { name: "VOD", exact: true })
     .click();
   await expect(
     page.getByRole("link", { name: "Sign in", exact: true }),
@@ -545,7 +546,7 @@ test("permission loss rechecks the role while content denial keeps the current a
     }),
   );
   await navigation(page)
-    .getByRole("button", { name: "VOD", exact: true })
+    .getByRole("link", { name: "VOD", exact: true })
     .click();
   await expect(
     page.getByText("Category blocked", { exact: true }),
@@ -591,8 +592,9 @@ test("admin navigation fits 320px with accessible controls", async ({
   await mock(page, admin);
   await page.goto("/");
   const nav = page.getByRole("navigation", { name: "Primary navigation" });
-  await expect(nav.getByRole("button")).toHaveCount(5);
-  for (const button of await nav.getByRole("button").all()) {
+  const controls = nav.getByRole("button").or(nav.getByRole("link"));
+  await expect(controls).toHaveCount(5);
+  for (const button of await controls.all()) {
     const box = await button.boundingBox();
     expect(box).not.toBeNull();
     expect(box!.width).toBeGreaterThanOrEqual(44);

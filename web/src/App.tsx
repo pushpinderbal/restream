@@ -10,6 +10,15 @@ import {
   type RefObject,
 } from "react";
 import { useAuth } from "./auth";
+import { useLocation, useNavigate } from "react-router";
+import { useBrowsePreferences } from "./browse-preferences";
+import {
+  locationSelection,
+  selectionURL,
+  type Tab,
+  type Selection,
+  type EpisodeDestination,
+} from "./routing";
 import { appScroller } from "./lib/app-scroll";
 import type Hls from "hls.js";
 import hlsWorkerUrl from "hls.js/dist/hls.worker.js?url";
@@ -81,11 +90,12 @@ function hasMediaSource() {
   );
 }
 
-type Tab = "live" | "movie" | "series";
 type PlaybackSelection = { item: Item; title: Item; start?: number };
 type PlayerOrigin = { url: string; scroll: number; initialURL?: string };
 function playerOriginFromHistory(): PlayerOrigin | null {
-  const origin = window.history.state?.restreamPlayerOrigin;
+  const origin =
+    window.history.state?.usr?.restreamPlayerOrigin ||
+    window.history.state?.restreamPlayerOrigin;
   if (!origin || typeof origin.url !== "string") return null;
   try {
     if (
@@ -103,108 +113,15 @@ function playerOriginFromHistory(): PlayerOrigin | null {
     return null;
   }
 }
-type EpisodeDestination = {
-  titleId: string;
-  season: number;
-  episodeId: string;
-};
+
 type PlaybackDestination = "library" | "category" | "title" | "season";
-function locationSelection(href = window.location.href) {
-  const params = new URL(href, window.location.href).searchParams;
-  const kind = params.get("section");
-  const season = Number(params.get("season"));
-  return {
-    tab: (kind === "movie" || kind === "series" ? kind : "live") as Tab,
-    category:
-      params.get("view") === "search" ? "*" : params.get("category") || "*",
-    search: params.get("search") || "",
-    item: params.get("item") || "",
-    settings: params.get("view") === "settings",
-    searchView: params.get("view") === "search",
-    dashboard:
-      params.get("view") === "dashboard" ||
-      (!params.has("view") &&
-        !["section", "category", "search", "item"].some((key) =>
-          params.has(key),
-        )),
-    player: params.get("view") === "player",
-    episodeDestination:
-      params.get("item") && Number.isInteger(season) && season > 0
-        ? {
-            titleId: params.get("item")!,
-            season,
-            episodeId: params.get("episode") || "",
-          }
-        : null,
-  };
-}
+
 function browseSelectionForLocation() {
   const current = locationSelection();
   const origin = current.player ? playerOriginFromHistory() : null;
   return origin ? locationSelection(origin.url) : current;
 }
-function writeLocation(
-  tab: Tab,
-  category: string,
-  search: string,
-  replace = false,
-  item = "",
-  settings = false,
-  episodeDestination: EpisodeDestination | null = null,
-  dashboard = false,
-  player = false,
-  searchView = false,
-) {
-  window.history[replace ? "replaceState" : "pushState"](
-    {},
-    "",
-    selectionURL(
-      tab,
-      category,
-      search,
-      item,
-      settings,
-      episodeDestination,
-      dashboard,
-      player,
-      searchView,
-    ),
-  );
-}
-function selectionURL(
-  tab: Tab,
-  category: string,
-  search: string,
-  item = "",
-  settings = false,
-  episodeDestination: EpisodeDestination | null = null,
-  dashboard = false,
-  player = false,
-  searchView = false,
-) {
-  const url = new URL(window.location.href);
-  if (player) url.searchParams.set("view", "player");
-  else if (settings) url.searchParams.set("view", "settings");
-  else if (dashboard) url.searchParams.set("view", "dashboard");
-  else if (searchView) url.searchParams.set("view", "search");
-  else url.searchParams.delete("view");
-  if (searchView && !item) url.searchParams.delete("section");
-  else url.searchParams.set("section", tab);
-  if (searchView || category === "*") url.searchParams.delete("category");
-  else url.searchParams.set("category", category);
-  if (search) url.searchParams.set("search", search);
-  else url.searchParams.delete("search");
-  if (item) url.searchParams.set("item", item);
-  else url.searchParams.delete("item");
-  if (item && episodeDestination) {
-    url.searchParams.set("season", String(episodeDestination.season));
-    url.searchParams.set("episode", episodeDestination.episodeId);
-  } else {
-    url.searchParams.delete("season");
-    url.searchParams.delete("episode");
-  }
-  return url;
-}
+
 const noRoom = "All streaming slots are in use.";
 function formatTime(value: string) {
   const date = new Date(value);
@@ -241,6 +158,38 @@ function normalizeSearch(text: string) {
 
 function App() {
   const { canAdmin, user } = useAuth();
+  const location = useLocation();
+  const navigate = useNavigate();
+  // Event handlers update the workspace together; history navigation restores it.
+  const internalDestination = useRef<string | null>(null);
+  const lastLocationKey = useRef(location.key);
+  const navigateURL = useCallback(
+    (
+      destination: URL | string,
+      options: {
+        replace?: boolean;
+        state?: Record<string, unknown>;
+        restore?: boolean;
+      } = {},
+    ) => {
+      const url = new URL(destination, window.location.href);
+      const href = url.pathname + url.search;
+      const same = url.href === window.location.href;
+      if (same && !options.state && !options.restore) return;
+      internalDestination.current = options.restore ? null : href;
+      void navigate(href, {
+        replace: options.replace || same,
+        state: options.state,
+      });
+    },
+    [navigate],
+  );
+  const writeLocation = useCallback(
+    (selection: Partial<Selection>, replace = false) =>
+      navigateURL(selectionURL(selection), { replace }),
+    [navigateURL],
+  );
+  const browsePreferences = useBrowsePreferences(user?.id);
   const [status, setStatus] = useState<Status | null>(null);
   const [statusError, setStatusError] = useState("");
   const statusLoaded = useRef(false);
@@ -283,6 +232,14 @@ function App() {
   const [managedCategories, setManagedCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const rememberedCategory = (kind: Tab) => {
+    const saved = browsePreferences.categories[kind] || "*";
+    return saved === "*" ||
+      loading ||
+      categories.some((value) => value.kind === kind && value.id === saved)
+      ? saved
+      : "*";
+  };
   const [tab, setTab] = useState<Tab>(() => browseSelectionForLocation().tab);
   const [category, setCategory] = useState(
     () => browseSelectionForLocation().category,
@@ -354,6 +311,16 @@ function App() {
   const searchContext = searchOpen || (playerOpen && playerSource.searchView);
   const discoveryContext =
     dashboardOpen || (playerOpen && playerContext === "dashboard");
+  useEffect(() => {
+    const section = settingsOpen
+      ? "Settings"
+      : dashboardOpen
+        ? "Home"
+        : searchContext
+          ? "Search"
+          : { live: "Live TV", movie: "Movies", series: "Shows" }[tab];
+    document.title = `${selected && !settingsOpen && !dashboardOpen ? displayTitle(selected) : section}${playerOpen ? " — Watching" : ""} · Restream`;
+  }, [tab, settingsOpen, dashboardOpen, searchContext, playerOpen, selected]);
   const providerSetupRequired = status?.configured === false;
   const contentPolicy = useMemo(
     () => createContentPolicy(preferences, managedCategories),
@@ -406,16 +373,8 @@ function App() {
     setSelectedId("");
     setEpisodeDestination(null);
     writeLocation(
-      tab,
-      category,
-      search,
+      { tab, category, search, searchView: playerSource.searchView },
       true,
-      "",
-      false,
-      null,
-      false,
-      false,
-      playerSource.searchView,
     );
   }, [
     preferences,
@@ -483,49 +442,56 @@ function App() {
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [settingsOpen]);
-  useEffect(() => {
-    const restore = () => {
-      cancelPlaybackIntent();
-      const next = locationSelection();
-      const browse = browseSelectionForLocation();
-      const previousOrigin = playerOrigin.current;
-      const returningToOrigin =
-        previousOrigin &&
-        new URL(previousOrigin.url, window.location.href).href ===
-          window.location.href;
-      if (!next.player && returningToOrigin && next.item && previousOrigin)
-        originScrollToRestore.current = previousOrigin.scroll;
-      playerOpenRef.current = next.player;
-      playerOrigin.current = next.player ? playerOriginFromHistory() : null;
+  useLayoutEffect(() => {
+    const href = location.pathname + location.search;
+    const next = locationSelection();
+    const canonical = selectionURL(next);
+    if (canonical.pathname + canonical.search !== href)
+      navigateURL(canonical, { replace: true, state: location.state });
+    const changed = lastLocationKey.current !== location.key;
+    lastLocationKey.current = location.key;
+    if (!changed || internalDestination.current === href) {
+      if (internalDestination.current === href)
+        internalDestination.current = null;
+      return;
+    }
+    cancelPlaybackIntent();
+    const browse = browseSelectionForLocation();
+    const previousOrigin = playerOrigin.current;
+    const returningToOrigin =
+      previousOrigin &&
+      selectionURL(locationSelection(previousOrigin.url)).href ===
+        canonical.href;
+    if (!next.player && returningToOrigin && next.item && previousOrigin)
+      originScrollToRestore.current = previousOrigin.scroll;
+    playerOpenRef.current = next.player;
+    playerOrigin.current = next.player ? playerOriginFromHistory() : null;
 
-      setTab(browse.tab);
-      setSettingsOpen(next.settings);
-      setDashboardOpen(next.dashboard);
-      setSearchOpen(next.searchView);
-      setPlayerOpen(next.player);
-      setPlayback(null);
-      setPlayerError("");
-      setCategory(browse.category);
-      setSearch(browse.search);
+    setTab(browse.tab);
+    setSettingsOpen(next.settings);
+    setDashboardOpen(next.dashboard);
+    setSearchOpen(next.searchView);
+    setPlayerOpen(next.player);
+    setPlayback(null);
+    setPlayerError("");
+    setCategory(browse.category);
+    setSearch(browse.search);
 
-      setSelectedId(next.item);
-      setPlaybackDetailsId("");
-      setEpisodeDestination(next.episodeDestination);
-      setSelected((old) => (old?.id === next.item ? old : null));
-      window.requestAnimationFrame(() =>
-        appScroller().scrollTo({
-          behavior: "instant",
-          top: next.player
-            ? 0
-            : returningToOrigin && previousOrigin
-              ? previousOrigin.scroll
-              : libraryScroll.current,
-        }),
-      );
-    };
-    window.addEventListener("popstate", restore);
-    return () => window.removeEventListener("popstate", restore);
-  }, [cancelPlaybackIntent]);
+    setSelectedId(next.item);
+    setPlaybackDetailsId("");
+    setEpisodeDestination(next.episodeDestination);
+    setSelected((old) => (old?.id === next.item ? old : null));
+    window.requestAnimationFrame(() =>
+      appScroller().scrollTo({
+        behavior: "instant",
+        top: next.player
+          ? 0
+          : returningToOrigin && previousOrigin
+            ? previousOrigin.scroll
+            : libraryScroll.current,
+      }),
+    );
+  }, [location, navigateURL, cancelPlaybackIntent]);
   useLayoutEffect(() => {
     if (!playerOpen) restoreOriginScroll();
   }, [playerOpen, selectedId, selected, restoreOriginScroll]);
@@ -769,30 +735,21 @@ function App() {
       setSelectedId(playback.title.id);
       const origin = playerOrigin.current;
       if (origin)
-        origin.url = selectionURL(
-          nextTab,
-          nextCategory,
-          nextSearch.trim(),
-          "",
-          false,
-          null,
-          false,
-          false,
-          nextSearchView,
-        ).href;
-      window.history.replaceState(
-        { restreamPlayerOrigin: origin },
-        "",
-        selectionURL(
-          nextTab,
-          nextCategory,
-          nextSearch.trim(),
-          playback.title.id,
-          false,
+        origin.url = selectionURL({
+          tab: nextTab,
+          category: nextCategory,
+          search: nextSearch.trim(),
+          searchView: nextSearchView,
+        }).href;
+      navigateURL(
+        selectionURL({
+          tab: nextTab,
+          category: nextCategory,
+          item: playback.title.id,
           episodeDestination,
-          false,
-          true,
-        ),
+          player: true,
+        }),
+        { replace: true, state: { restreamPlayerOrigin: origin } },
       );
       return;
     }
@@ -807,16 +764,13 @@ function App() {
     setSearchOpen(nextSearchView);
 
     writeLocation(
-      nextTab,
-      nextCategory,
-      nextSearch.trim(),
+      {
+        tab: nextTab,
+        category: nextCategory,
+        search: nextSearch.trim(),
+        searchView: nextSearchView,
+      },
       replace,
-      "",
-      false,
-      null,
-      false,
-      false,
-      nextSearchView,
     );
     setTab(nextTab);
     setCategory(nextCategory);
@@ -854,7 +808,7 @@ function App() {
     } else if (next === "dashboard") {
       if (dashboardOpen) return;
 
-      writeLocation(tab, category, search, false, "", false, null, true);
+      writeLocation({ tab, category, search, dashboard: true });
       setDashboardOpen(true);
       setSettingsOpen(false);
       setSearchOpen(false);
@@ -867,13 +821,52 @@ function App() {
     } else if (next === "settings") {
       if (settingsOpen) return;
       libraryScroll.current = appScroller().scrollTop;
-      writeLocation(tab, category, search, false, selectedId, true);
+      writeLocation({
+        tab,
+        category,
+        search,
+        item: selectedId,
+        settings: true,
+      });
       setSettingsOpen(true);
       setDashboardOpen(false);
       setSearchOpen(false);
       appScroller().scrollTo({ top: 0 });
-    } else selectCategory(next);
+    } else selectCategory(next, rememberedCategory(next));
   };
+  useEffect(() => {
+    if (
+      loading ||
+      error ||
+      !status?.configured ||
+      settingsOpen ||
+      dashboardOpen ||
+      searchOpen ||
+      playerOpen
+    )
+      return;
+    if (
+      category === "*" ||
+      categories.some((value) => value.kind === tab && value.id === category)
+    ) {
+      browsePreferences.rememberCategory(tab, category);
+    } else if (browsePreferences.categories[tab] === category) {
+      browsePreferences.rememberCategory(tab, "*");
+      selectCategory(tab, "*", { replace: true });
+    }
+  }, [
+    loading,
+    error,
+    status?.configured,
+    settingsOpen,
+    dashboardOpen,
+    searchOpen,
+    playerOpen,
+    tab,
+    category,
+    categories,
+    browsePreferences,
+  ]);
   const openDetails = (
     title: Item,
     episodeItem: Item | null = null,
@@ -895,7 +888,15 @@ function App() {
     setSelected(title);
     setSelectedId(title.id);
     setEpisodeDestination(episodeTarget);
-    writeLocation(nextTab, "*", "", true, title.id, false, episodeTarget);
+    writeLocation(
+      {
+        tab: nextTab,
+        category: "*",
+        item: title.id,
+        episodeDestination: episodeTarget,
+      },
+      true,
+    );
   };
   const openHistory = (entry: WatchHistoryEntry, title: Item) =>
     openDetails(title, entry.item);
@@ -955,18 +956,15 @@ function App() {
           current.item === title.id &&
           episodeTarget
         ) {
-          url = selectionURL(
-            current.tab,
-            current.category,
-            current.search,
-            title.id,
-            false,
-            episodeTarget,
-            false,
-            false,
-            current.searchView,
-          ).href;
-          window.history.replaceState(window.history.state, "", url);
+          url = selectionURL({
+            tab: current.tab,
+            category: current.category,
+            search: current.search,
+            item: title.id,
+            episodeDestination: episodeTarget,
+            searchView: current.searchView,
+          }).href;
+          navigateURL(url, { replace: true, state: location.state });
         }
         playerOrigin.current = {
           url,
@@ -986,19 +984,18 @@ function App() {
         ? originSelection.category
         : categoryID || "*";
       const browseSearch = libraryOrigin ? originSelection.search : "";
-      window.history[alreadyOnPlayer ? "replaceState" : "pushState"](
-        { restreamPlayerOrigin: playerOrigin.current },
-        "",
-        selectionURL(
-          browseTab,
-          browseCategory,
-          browseSearch,
-          title.id,
-          false,
-          episodeTarget,
-          false,
-          true,
-        ),
+      navigateURL(
+        selectionURL({
+          tab: title.kind as Tab,
+          category: browseCategory,
+          item: title.id,
+          episodeDestination: episodeTarget,
+          player: true,
+        }),
+        {
+          replace: alreadyOnPlayer,
+          state: { restreamPlayerOrigin: playerOrigin.current },
+        },
       );
 
       setPlayerError("");
@@ -1020,7 +1017,16 @@ function App() {
       });
       setPlaybackDuration(0);
     },
-    [liveItems, browseItems, categories, tab, category, cancelPlaybackIntent],
+    [
+      liveItems,
+      browseItems,
+      categories,
+      tab,
+      category,
+      cancelPlaybackIntent,
+      navigateURL,
+      location.state,
+    ],
   );
   const closePlayer = useCallback(() => {
     cancelPlaybackIntent();
@@ -1038,18 +1044,7 @@ function App() {
     setSelectedId("");
     setDetailError("");
     scrolledExpansion.current = "";
-    writeLocation(
-      tab,
-      category,
-      search,
-      true,
-      "",
-      false,
-      null,
-      false,
-      false,
-      searchContext,
-    );
+    writeLocation({ tab, category, search, searchView: searchContext }, true);
     window.requestAnimationFrame(() => {
       const target = opener.current?.isConnected
         ? opener.current
@@ -1071,6 +1066,7 @@ function App() {
     playerOpen,
     playback,
     searchContext,
+    writeLocation,
   ]);
   const stopPlayback = () => {
     if (!playerOpenRef.current) return;
@@ -1082,10 +1078,9 @@ function App() {
     // Let route restoration close the player and reveal its origin together.
     // Closing it before asynchronous history.back() temporarily unmounts Search.
     if (origin && origin.initialURL && origin.url !== origin.initialURL) {
-      window.history.replaceState({}, "", origin.url);
-      window.dispatchEvent(new PopStateEvent("popstate"));
+      navigateURL(origin.url, { replace: true, restore: true });
     } else if (origin && playerOriginFromHistory() && window.history.length > 1)
-      window.history.back();
+      void navigate(-1);
     else if (title) openDetails(title, episode, true);
     else selectCategory(tab, "*", { replace: true });
   };
@@ -1286,13 +1281,13 @@ function App() {
           : null;
       setEpisodeDestination(episodeTarget);
       writeLocation(
-        nextTab,
-        nextCategory,
-        "",
+        {
+          tab: nextTab,
+          category: nextCategory,
+          item: playback.title.id,
+          episodeDestination: episodeTarget,
+        },
         true,
-        playback.title.id,
-        false,
-        episodeTarget,
       );
     } else {
       appScroller().scrollTo({ top: 0, behavior: "smooth" });
@@ -1330,18 +1325,13 @@ function App() {
     setEpisodeDestination(null);
     setSelectedId(item.id);
     if (!playerOpen)
-      writeLocation(
-        searchContext ? (item.kind as Tab) : tab,
-        searchContext ? "*" : category,
+      writeLocation({
+        tab: searchContext ? (item.kind as Tab) : tab,
+        category: searchContext ? "*" : category,
         search,
-        false,
-        item.id,
-        false,
-        null,
-        false,
-        false,
-        searchContext,
-      );
+        item: item.id,
+        searchView: searchContext,
+      });
   };
   const selectedIndex = displayedItems.findIndex(
     (item) => item.id === selectedId,
@@ -1452,6 +1442,15 @@ function App() {
         : navigationContext === "live"
           ? "live"
           : "vod";
+  const liveURL = selectionURL({
+    tab: "live",
+    category: rememberedCategory("live"),
+  });
+  const vodTab = tab === "live" ? lastVodTab.current : tab;
+  const vodURL = selectionURL({
+    tab: vodTab,
+    category: rememberedCategory(vodTab),
+  });
   return (
     <MotionConfig reducedMotion="user">
       <div
@@ -1462,6 +1461,12 @@ function App() {
         </a>
         <AppNavigation
           active={activeNavigation}
+          hrefs={{
+            home: "/",
+            search: "/search",
+            live: liveURL.pathname + liveURL.search,
+            vod: vodURL.pathname + vodURL.search,
+          }}
           onNavigate={(destination) => {
             const next =
               destination === "home"
@@ -1666,15 +1671,12 @@ function App() {
                     scrolledExpansion.current = "";
                     opener.current = null;
                     writeLocation(
-                      tab,
-                      "*",
-                      value.trim(),
-                      true,
-                      "",
-                      false,
-                      null,
-                      false,
-                      false,
+                      {
+                        tab,
+                        category: "*",
+                        search: value.trim(),
+                        searchView: true,
+                      },
                       true,
                     );
                   }}
@@ -1703,10 +1705,13 @@ function App() {
                   categories={sectionCategories}
                   category={category}
                   playerActive={playerOpen}
-                  onTabChange={(nextTab) => selectCategory(nextTab)}
-                  onCategoryChange={(value) =>
-                    selectCategory(tab, value, { retainPlayback: true })
+                  onTabChange={(nextTab) =>
+                    selectCategory(nextTab, rememberedCategory(nextTab))
                   }
+                  onCategoryChange={(value) => {
+                    browsePreferences.rememberCategory(tab, value);
+                    selectCategory(tab, value, { retainPlayback: true });
+                  }}
                 >
                   {loading ? (
                     <div

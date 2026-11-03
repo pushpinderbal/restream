@@ -1,5 +1,6 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
+import { BrowserRouter } from "react-router";
 import App from "./App";
 import { AuthGate } from "./auth";
 import { trackInputModality } from "./lib/input-modality";
@@ -17,8 +18,10 @@ if (import.meta.hot)
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <AuthGate>
-      <App />
-    </AuthGate>
+    <BrowserRouter>
+      <AuthGate>
+        <App />
+      </AuthGate>
+    </BrowserRouter>
   </React.StrictMode>,
 );
