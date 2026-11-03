@@ -87,7 +87,7 @@ const navigateLibrary = async (kind) => {
   const types = page.getByRole("tablist", { name: "VOD type", exact: true });
   if (kind === "live" || !(await types.isVisible()))
     await navigation
-      .getByRole("button", {
+      .getByRole("link", {
         name: kind === "live" ? "Live TV" : "VOD",
         exact: true,
       })
@@ -122,7 +122,7 @@ const checkReleasedPlayback = async () => {
 };
 const playTestMovie = async ({ fromSearch = false } = {}) => {
   if (fromSearch) {
-    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await page.getByRole("link", { name: "Search", exact: true }).click();
     await expect(
       page.getByRole("searchbox", { name: "Search library", exact: true }),
     ).toHaveValue("");

@@ -10,6 +10,7 @@ Restream brings your IPTV subscription to the browser. Host it on your own compu
 
 - 📺 **Live TV and programme guide**: browse channels and see what's on now and next.
 - 🎬 **Movies and shows**: explore searchable categories or search across your whole library.
+- 🔖 **Remember your categories**: Movies, Shows, and Live TV each remember your last category in this browser. Bookmark or share a page to return to its selected category or title.
 - ▶️ **Pick up where you left off**: Continue watching, Up next, and Recently played, with history and progress saved on your server and shared across devices for each signed-in account. Without sign-in, everyone shares one history.
 - 🧭 **Discovery**: browse Explore and optional TMDB Trending side by side on Home, matched to titles your provider carries.
 - ⚡ **Shared library cache**: cached listings stay available while the server refreshes them in the background, reducing repeated requests to your provider.
