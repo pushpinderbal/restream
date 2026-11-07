@@ -22,7 +22,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # Alpine's FFmpeg package trails upstream; use the current static release.
 FROM mwader/static-ffmpeg:9.0.2-1 AS media-tools
 
-FROM alpine:3.24.3 AS runtime
+FROM alpine:3.24.4 AS runtime
 LABEL org.opencontainers.image.title="Restream" \
     org.opencontainers.image.description="A shared browser player for Stalker IPTV portals" \
     org.opencontainers.image.source="https://github.com/pushpinderbal/restream" \
