@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.28.0
+# syntax=docker/dockerfile:1.29.0
 FROM --platform=$BUILDPLATFORM oven/bun:1.4.4 AS frontend
 WORKDIR /build/web
 COPY web/package.json web/bun.lock ./
@@ -8,7 +8,7 @@ COPY web/src/ ./src/
 COPY web/public/ ./public/
 RUN bun run build
 
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24 AS backend
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine3.24 AS backend
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
@@ -22,7 +22,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # Alpine's FFmpeg package trails upstream; use the current static release.
 FROM mwader/static-ffmpeg:9.0.2-1 AS media-tools
 
-FROM alpine:3.24.3 AS runtime
+FROM alpine:3.24.4 AS runtime
 LABEL org.opencontainers.image.title="Restream" \
     org.opencontainers.image.description="A shared browser player for Stalker IPTV portals" \
     org.opencontainers.image.source="https://github.com/pushpinderbal/restream" \
